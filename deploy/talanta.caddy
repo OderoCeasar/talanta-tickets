@@ -1,0 +1,37 @@
+# Site block for the EXISTING Caddy container (the `caddy` service in /opt/sherehe, whose
+# config lives in the ShereheConnect/event-vendors-platform repo at deploy/Caddyfile).
+#
+# This file is NOT deployed from here. That repo's deploy overwrites the server's Caddyfile on
+# every backend push, so the block below has to be added THERE, by pull request — a hand edit
+# on the server is silently lost. Keep this copy in sync as the reference.
+#
+# The same pull request must add this mount to the caddy service in that repo's
+# deploy/docker-compose.prod.yml:
+#       - ./talanta-admin:/srv/talanta-admin:ro
+# and /opt/sherehe/talanta-admin must already exist on the server, owned by the deploy user,
+# before it merges (Docker would otherwise create it root-owned and the rsync would fail).
+#
+# TLS: reuses the vendorsoko Cloudflare Origin cert, which covers *.vendorsoko.com and is
+# already mounted. An Origin cert is trusted only by Cloudflare, so this host's DNS record must
+# be PROXIED (orange cloud) with SSL mode "Full (strict)".
+
+talanta.vendorsoko.com {
+	encode gzip
+
+	tls /etc/caddy/vendorsoko-origin.pem /etc/caddy/vendorsoko-origin-key.pem
+
+	# API + health → the Go container, over the shared docker network.
+	handle /v1/* {
+		reverse_proxy talanta-api:8080
+	}
+	handle /healthz {
+		reverse_proxy talanta-api:8080
+	}
+
+	# Everything else → the admin web build (SPA: fall back to index.html).
+	handle {
+		root * /srv/talanta-admin
+		try_files {path} /index.html
+		file_server
+	}
+}

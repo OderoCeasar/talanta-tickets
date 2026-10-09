@@ -1,0 +1,27 @@
+# Node
+node_modules/
+dist/
+build/
+.expo/
+expo-env.d.ts
+*.tsbuildinfo
+.pnpm-store/
+
+# Go
+/backend/bin/
+/backend/tmp/
+*.out
+
+# Env & secrets
+.env
+.env.local
+*.local
+# TLS certs/keys — live only on the server, never commit
+*.pem
+*.key
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

@@ -1,0 +1,51 @@
+# Local development: Postgres + migrations + the API + Adminer. `make dev` starts all of it.
+# Postgres is published on 5434 so it does not clash with other local databases on 5432.
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: talanta
+      POSTGRES_PASSWORD: talanta
+      POSTGRES_DB: talanta
+    ports:
+      - "5434:5432"
+    volumes:
+      - talanta_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talanta -d talanta"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: apply migrations, then exit. The api waits for it to succeed.
+  migrate:
+    image: migrate/migrate:v4.17.1
+    command: ["-path=/migrations", "-database", "postgres://talanta:talanta@db:5432/talanta?sslmode=disable", "up"]
+    volumes:
+      - ./backend/migrations:/migrations:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: ./backend
+    environment:
+      ADDR: ":8080"
+      DATABASE_URL: postgres://talanta:talanta@db:5432/talanta?sslmode=disable
+    ports:
+      - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Database browser at http://localhost:8081 (server: db, user/password/database: talanta).
+  adminer:
+    image: adminer:4
+    ports:
+      - "8081:8080"
+    depends_on:
+      - db
+
+volumes:
+  talanta_pgdata:

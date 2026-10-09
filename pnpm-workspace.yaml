@@ -1,0 +1,15 @@
+packages:
+  - "mobile"
+  - "admin"
+  - "packages/*"
+
+# React and react-dom are pinned to ONE version for the whole workspace. `.npmrc` sets
+# `node-linker=hoisted` (Expo/Metro requires it), so admin and mobile share a single copy of
+# react, and React refuses to boot on a mismatched react/react-dom pair. The mismatch is a
+# runtime assertion, not a build error, so verify by rendering the app after any Expo SDK bump.
+#
+# Mirrored in the root package.json's `pnpm.overrides`: pnpm 9 reads only that field,
+# pnpm 10+ reads only this file. Change both together.
+overrides:
+  react: "19.2.3"
+  react-dom: "19.2.3"

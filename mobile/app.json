@@ -1,0 +1,25 @@
+{
+  "expo": {
+    "name": "Talanta Tickets",
+    "slug": "talanta-tickets",
+    "version": "1.0.0",
+    "scheme": "talanta",
+    "orientation": "portrait",
+    "userInterfaceStyle": "automatic",
+    "android": {
+      "package": "co.ke.vendorsoko.talanta"
+    },
+    "ios": {
+      "bundleIdentifier": "co.ke.vendorsoko.talanta"
+    },
+    "plugins": [
+      "expo-router",
+      "expo-status-bar"
+    ],
+    "experiments": {
+      "typedRoutes": true
+    },
+    "backgroundColor": "#F8E7C9",
+    "primaryColor": "#064E3B"
+  }
+}

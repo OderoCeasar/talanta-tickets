@@ -1,0 +1,23 @@
+{
+  "name": "talanta-tickets",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Talanta Stadium ticketing — seat-map booking, M-Pesa payments, offline gate scanning",
+  "packageManager": "pnpm@9.12.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "admin": "pnpm --filter @talanta/admin dev",
+    "mobile": "pnpm --filter @talanta/mobile start",
+    "build": "pnpm --filter @talanta/admin build",
+    "typecheck": "pnpm -r typecheck"
+  },
+  "_comment_pnpm_overrides": "Mirrored in pnpm-workspace.yaml: pnpm 9 reads only this field, pnpm 10+ reads only the yaml. Change both together.",
+  "pnpm": {
+    "overrides": {
+      "react": "19.2.3",
+      "react-dom": "19.2.3"
+    }
+  }
+}

@@ -1,0 +1,95 @@
+# Runs on the Hetzner server at /opt/talanta. Secrets live in ./.env (never committed).
+# CI pushes a new image, then runs `docker compose pull && docker compose up -d`.
+#
+# TLS is handled by the pre-existing Caddy container already running on this server (the
+# `caddy` service in /opt/sherehe — there is NO Caddy here). The API joins that Caddy's docker
+# network so Caddy can reverse_proxy to it by name — see deploy/talanta.caddy.
+# Set CADDY_NETWORK in ./.env to that network's name (sherehe_default).
+#
+# NAMING: a service name doubles as a DNS alias on every network the container joins, and the
+# shared Caddy network already has containers aliased `api` and `db` (Sherehe's). Nothing here
+# may reuse those names: a second `api` would make Caddy round-robin Sherehe traffic to this
+# service, and a second `db` would make this API's DATABASE_URL resolve to Sherehe's Postgres
+# half the time. Hence `talanta-api` and `talanta-db`.
+name: talanta
+
+services:
+  # This stack's own Postgres, kept apart from the shared production database in /opt/sherehe
+  # so load tests and experimental migrations here cannot touch Sherehe or Twende data. Only on
+  # the default network: nothing outside this stack can reach it, and no host port is published.
+  #
+  # Sized small on purpose — the host is 2 vCPU / 4 GB and already runs another Postgres, two
+  # Go APIs, Redis and Caddy.
+  talanta-db:
+    image: postgres:16-alpine
+    # Deliberately NOT env_file: ./.env — that would hand the database every app secret.
+    environment:
+      POSTGRES_USER: talanta
+      POSTGRES_DB: talanta
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    command:
+      - postgres
+      - -c
+      - max_connections=50
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - log_min_duration_statement=500
+      - -c
+      - timezone=UTC
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talanta -d talanta"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - default
+    # The docker daemon on this host has NO global log cap, so every service bounds its own.
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    restart: unless-stopped
+
+  # One-shot: apply DB migrations, then exit. The api waits for it to succeed.
+  migrate:
+    image: migrate/migrate:v4.17.1
+    command: ["-path=/migrations", "-database", "${DATABASE_URL}", "up"]
+    volumes:
+      - ./migrations:/migrations:ro
+    depends_on:
+      talanta-db:
+        condition: service_healthy
+    networks:
+      - default
+    restart: "no"
+
+  talanta-api:
+    image: ${API_IMAGE}
+    container_name: talanta-api # stable name the shared Caddy proxies to
+    env_file: ./.env
+    expose:
+      - "8080" # reachable as talanta-api:8080 on the shared Caddy network
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    networks:
+      - default
+      - caddy
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }
+    restart: unless-stopped
+
+volumes:
+  # All ticketing data. Never prune this.
+  pgdata:
+
+networks:
+  default:
+  # The existing Caddy container's network — created outside this stack.
+  caddy:
+    external: true
+    name: ${CADDY_NETWORK}

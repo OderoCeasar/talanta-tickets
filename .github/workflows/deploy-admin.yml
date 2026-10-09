@@ -1,0 +1,44 @@
+name: Deploy admin
+
+on:
+  push:
+    branches: [master, main]
+    paths:
+      - "admin/**"
+      - "packages/shared/**"
+      - ".github/workflows/deploy-admin.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-admin
+  cancel-in-progress: true
+
+jobs:
+  build-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - name: Build admin
+        working-directory: admin
+        # The admin talks to /v1 on its own origin (Caddy proxies it), so no API URL is needed.
+        run: pnpm build
+      # The shared Caddy in /opt/sherehe serves this directory straight off disk, so the new
+      # build is live as soon as the rsync finishes — no reload or restart.
+      - name: Rsync dist to server
+        uses: burnett01/rsync-deployments@7.0.1
+        with:
+          switches: -avzr --delete
+          path: admin/dist/
+          remote_path: /opt/sherehe/talanta-admin/
+          remote_host: ${{ secrets.HETZNER_HOST }}
+          remote_user: ${{ secrets.HETZNER_USER }}
+          remote_key: ${{ secrets.HETZNER_SSH_KEY }}
+          remote_port: ${{ secrets.HETZNER_SSH_PORT || 22 }}
