@@ -2,6 +2,7 @@
   "expo": {
     "name": "Talanta Tickets",
     "slug": "talanta-tickets",
+    "owner": "talanta-team",
     "version": "1.0.0",
     "scheme": "talanta",
     "orientation": "portrait",
@@ -20,6 +21,12 @@
       "typedRoutes": true
     },
     "backgroundColor": "#F8E7C9",
-    "primaryColor": "#064E3B"
+    "primaryColor": "#064E3B",
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "5e8ce0c6-6016-45c4-a423-87d476bfcf65"
+      }
+    }
   }
 }
