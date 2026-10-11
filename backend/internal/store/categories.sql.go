@@ -9,6 +9,40 @@ import (
 	"context"
 )
 
+const blockIDsNotInVenue = `-- name: BlockIDsNotInVenue :many
+SELECT ids.id::bigint AS id
+FROM unnest($1::bigint[]) AS ids(id)
+WHERE NOT EXISTS (
+    SELECT 1 FROM blocks b JOIN stands st ON st.id = b.stand_id
+    WHERE b.id = ids.id AND st.venue_id = $2)
+`
+
+type BlockIDsNotInVenueParams struct {
+	BlockIds []int64
+	VenueID  int64
+}
+
+// The given block ids that do not exist or belong to another venue.
+func (q *Queries) BlockIDsNotInVenue(ctx context.Context, arg BlockIDsNotInVenueParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, blockIDsNotInVenue, arg.BlockIds, arg.VenueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const clearBlockCategories = `-- name: ClearBlockCategories :execrows
 DELETE FROM event_block_categories
 WHERE event_id = $1 AND block_id = ANY($2::bigint[])
@@ -45,6 +79,43 @@ func (q *Queries) ClearRowCategories(ctx context.Context, arg ClearRowCategories
 	return result.RowsAffected(), nil
 }
 
+const countCategoryUse = `-- name: CountCategoryUse :one
+SELECT
+    (SELECT count(*) FROM event_seats es
+      WHERE es.event_id = $1 AND es.category_id = $2)::bigint AS seats,
+    (SELECT count(*) FROM event_seats es
+      WHERE es.event_id = $1 AND es.category_id = $2 AND es.status = 'SOLD')::bigint AS sold,
+    (SELECT count(*) FROM event_seats es
+      WHERE es.event_id = $1 AND es.category_id = $2 AND es.status = 'HELD'
+        AND es.hold_expires_at > now())::bigint AS held,
+    (SELECT count(*) FROM booking_items bi WHERE bi.category_id = $2)::bigint AS booked
+`
+
+type CountCategoryUseParams struct {
+	EventID    int64
+	CategoryID *int64
+}
+
+type CountCategoryUseRow struct {
+	Seats  int64
+	Sold   int64
+	Held   int64
+	Booked int64
+}
+
+// How much of the event's inventory and bookings points at one category.
+func (q *Queries) CountCategoryUse(ctx context.Context, arg CountCategoryUseParams) (CountCategoryUseRow, error) {
+	row := q.db.QueryRow(ctx, countCategoryUse, arg.EventID, arg.CategoryID)
+	var i CountCategoryUseRow
+	err := row.Scan(
+		&i.Seats,
+		&i.Sold,
+		&i.Held,
+		&i.Booked,
+	)
+	return i, err
+}
+
 const countUnpaintedActiveSeats = `-- name: CountUnpaintedActiveSeats :one
 SELECT count(*)
 FROM events e
@@ -63,6 +134,47 @@ func (q *Queries) CountUnpaintedActiveSeats(ctx context.Context, id int64) (int6
 	var count int64
 	err := row.Scan(&count)
 	return count, err
+}
+
+const countUnpaintedActiveSeatsByBlock = `-- name: CountUnpaintedActiveSeatsByBlock :many
+SELECT b.id AS block_id, b.code AS block_code, count(*)::bigint AS seats
+FROM events e
+JOIN stands st ON st.venue_id = e.venue_id
+JOIN blocks b ON b.stand_id = st.id
+JOIN seats s ON s.block_id = b.id AND s.is_active
+LEFT JOIN event_row_categories erc ON erc.event_id = e.id AND erc.row_id = s.row_id
+LEFT JOIN event_block_categories ebc ON ebc.event_id = e.id AND ebc.block_id = s.block_id
+WHERE e.id = $1 AND erc.category_id IS NULL AND ebc.category_id IS NULL
+GROUP BY b.id, b.code, st.display_order
+ORDER BY st.display_order, b.code
+`
+
+type CountUnpaintedActiveSeatsByBlockRow struct {
+	BlockID   int64
+	BlockCode string
+	Seats     int64
+}
+
+// Readiness: per block, the active seats that neither a row override nor a block assignment
+// gives a category.
+func (q *Queries) CountUnpaintedActiveSeatsByBlock(ctx context.Context, id int64) ([]CountUnpaintedActiveSeatsByBlockRow, error) {
+	rows, err := q.db.Query(ctx, countUnpaintedActiveSeatsByBlock, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountUnpaintedActiveSeatsByBlockRow{}
+	for rows.Next() {
+		var i CountUnpaintedActiveSeatsByBlockRow
+		if err := rows.Scan(&i.BlockID, &i.BlockCode, &i.Seats); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const createEventCategory = `-- name: CreateEventCategory :one
@@ -142,6 +254,25 @@ func (q *Queries) GetEventCategory(ctx context.Context, arg GetEventCategoryPara
 	return i, err
 }
 
+const getEventCategoryByID = `-- name: GetEventCategoryByID :one
+SELECT id, event_id, name, price_cents, currency, color_hex, description FROM event_categories WHERE id = $1
+`
+
+func (q *Queries) GetEventCategoryByID(ctx context.Context, id int64) (EventCategory, error) {
+	row := q.db.QueryRow(ctx, getEventCategoryByID, id)
+	var i EventCategory
+	err := row.Scan(
+		&i.ID,
+		&i.EventID,
+		&i.Name,
+		&i.PriceCents,
+		&i.Currency,
+		&i.ColorHex,
+		&i.Description,
+	)
+	return i, err
+}
+
 const listEventBlockCategories = `-- name: ListEventBlockCategories :many
 SELECT event_id, block_id, category_id FROM event_block_categories WHERE event_id = $1 ORDER BY block_id
 `
@@ -198,6 +329,38 @@ func (q *Queries) ListEventCategories(ctx context.Context, eventID int64) ([]Eve
 	return items, nil
 }
 
+const listEventCategoriesCheapestFirst = `-- name: ListEventCategoriesCheapestFirst :many
+SELECT id, event_id, name, price_cents, currency, color_hex, description FROM event_categories WHERE event_id = $1 ORDER BY price_cents, name, id
+`
+
+func (q *Queries) ListEventCategoriesCheapestFirst(ctx context.Context, eventID int64) ([]EventCategory, error) {
+	rows, err := q.db.Query(ctx, listEventCategoriesCheapestFirst, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []EventCategory{}
+	for rows.Next() {
+		var i EventCategory
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventID,
+			&i.Name,
+			&i.PriceCents,
+			&i.Currency,
+			&i.ColorHex,
+			&i.Description,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listEventRowCategories = `-- name: ListEventRowCategories :many
 SELECT event_id, row_id, category_id FROM event_row_categories WHERE event_id = $1 ORDER BY row_id
 `
@@ -215,6 +378,73 @@ func (q *Queries) ListEventRowCategories(ctx context.Context, eventID int64) ([]
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventRowCategoriesWithBlock = `-- name: ListEventRowCategoriesWithBlock :many
+SELECT erc.row_id, r.block_id, erc.category_id
+FROM event_row_categories erc
+JOIN rows r ON r.id = erc.row_id
+WHERE erc.event_id = $1
+ORDER BY r.block_id, r.row_index
+`
+
+type ListEventRowCategoriesWithBlockRow struct {
+	RowID      int64
+	BlockID    int64
+	CategoryID int64
+}
+
+func (q *Queries) ListEventRowCategoriesWithBlock(ctx context.Context, eventID int64) ([]ListEventRowCategoriesWithBlockRow, error) {
+	rows, err := q.db.Query(ctx, listEventRowCategoriesWithBlock, eventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListEventRowCategoriesWithBlockRow{}
+	for rows.Next() {
+		var i ListEventRowCategoriesWithBlockRow
+		if err := rows.Scan(&i.RowID, &i.BlockID, &i.CategoryID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const rowIDsNotInVenue = `-- name: RowIDsNotInVenue :many
+SELECT ids.id::bigint AS id
+FROM unnest($1::bigint[]) AS ids(id)
+WHERE NOT EXISTS (
+    SELECT 1 FROM rows r JOIN blocks b ON b.id = r.block_id JOIN stands st ON st.id = b.stand_id
+    WHERE r.id = ids.id AND st.venue_id = $2)
+`
+
+type RowIDsNotInVenueParams struct {
+	RowIds  []int64
+	VenueID int64
+}
+
+func (q *Queries) RowIDsNotInVenue(ctx context.Context, arg RowIDsNotInVenueParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, rowIDsNotInVenue, arg.RowIds, arg.VenueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err

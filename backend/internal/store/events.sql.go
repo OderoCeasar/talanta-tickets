@@ -10,6 +10,18 @@ import (
 	"time"
 )
 
+const cancelUnpaidBookingsOfEvent = `-- name: CancelUnpaidBookingsOfEvent :execrows
+UPDATE bookings SET status = 'CANCELLED' WHERE event_id = $1 AND status = 'PENDING_PAYMENT'
+`
+
+func (q *Queries) CancelUnpaidBookingsOfEvent(ctx context.Context, eventID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, cancelUnpaidBookingsOfEvent, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createEvent = `-- name: CreateEvent :one
 INSERT INTO events (
     venue_id, title, competition, home_team, away_team, kickoff_at, gates_open_at,
@@ -82,6 +94,22 @@ func (q *Queries) DeleteDraftEvent(ctx context.Context, id int64) (int64, error)
 	return result.RowsAffected(), nil
 }
 
+const freeHeldSeatsOfEvent = `-- name: FreeHeldSeatsOfEvent :execrows
+UPDATE event_seats
+SET status = 'AVAILABLE', hold_id = NULL, hold_expires_at = NULL, version = version + 1
+WHERE event_id = $1 AND status = 'HELD'
+`
+
+// Cancel: seats of the holds just released go back to AVAILABLE, so a payment that lands
+// afterwards finds no held seat to sell (correction 5) and is refunded.
+func (q *Queries) FreeHeldSeatsOfEvent(ctx context.Context, eventID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, freeHeldSeatsOfEvent, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getEvent = `-- name: GetEvent :one
 SELECT id, venue_id, title, competition, home_team, away_team, kickoff_at, gates_open_at, poster_url, status, sales_open_at, sales_close_at, max_tickets_per_user, created_at, updated_at, published_at FROM events WHERE id = $1
 `
@@ -108,6 +136,126 @@ func (q *Queries) GetEvent(ctx context.Context, id int64) (Event, error) {
 		&i.PublishedAt,
 	)
 	return i, err
+}
+
+const getEventWithVenue = `-- name: GetEventWithVenue :one
+SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kickoff_at, e.gates_open_at, e.poster_url, e.status, e.sales_open_at, e.sales_close_at, e.max_tickets_per_user, e.created_at, e.updated_at, e.published_at, v.name AS venue_name
+FROM events e
+JOIN venues v ON v.id = e.venue_id
+WHERE e.id = $1
+`
+
+type GetEventWithVenueRow struct {
+	Event     Event
+	VenueName string
+}
+
+func (q *Queries) GetEventWithVenue(ctx context.Context, id int64) (GetEventWithVenueRow, error) {
+	row := q.db.QueryRow(ctx, getEventWithVenue, id)
+	var i GetEventWithVenueRow
+	err := row.Scan(
+		&i.Event.ID,
+		&i.Event.VenueID,
+		&i.Event.Title,
+		&i.Event.Competition,
+		&i.Event.HomeTeam,
+		&i.Event.AwayTeam,
+		&i.Event.KickoffAt,
+		&i.Event.GatesOpenAt,
+		&i.Event.PosterUrl,
+		&i.Event.Status,
+		&i.Event.SalesOpenAt,
+		&i.Event.SalesCloseAt,
+		&i.Event.MaxTicketsPerUser,
+		&i.Event.CreatedAt,
+		&i.Event.UpdatedAt,
+		&i.Event.PublishedAt,
+		&i.VenueName,
+	)
+	return i, err
+}
+
+const listAdminEvents = `-- name: ListAdminEvents :many
+SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kickoff_at, e.gates_open_at, e.poster_url, e.status, e.sales_open_at, e.sales_close_at, e.max_tickets_per_user, e.created_at, e.updated_at, e.published_at, v.name AS venue_name
+FROM events e
+JOIN venues v ON v.id = e.venue_id
+WHERE ($1::timestamptz IS NULL OR e.kickoff_at >= $1::timestamptz)
+  AND ($2::timestamptz IS NULL OR e.kickoff_at < $2::timestamptz)
+  AND ($3::text IS NULL OR $3::text =
+       CASE WHEN e.status IN ('PUBLISHED', 'ON_SALE') THEN
+                CASE WHEN (e.sales_open_at IS NULL OR e.sales_open_at <= $4::timestamptz)
+                      AND (e.sales_close_at IS NULL OR $4::timestamptz < e.sales_close_at)
+                     THEN 'ON_SALE' ELSE 'PUBLISHED' END
+            ELSE e.status END)
+  AND (NOT $5::boolean
+       OR (e.kickoff_at, e.id) < ($6::timestamptz, $7::bigint))
+ORDER BY e.kickoff_at DESC, e.id DESC
+LIMIT $8
+`
+
+type ListAdminEventsParams struct {
+	FromAt          *time.Time
+	ToAt            *time.Time
+	EffectiveStatus *string
+	NowAt           time.Time
+	HasCursor       bool
+	CursorKickoffAt time.Time
+	CursorID        int64
+	PageLimit       int32
+}
+
+type ListAdminEventsRow struct {
+	Event     Event
+	VenueName string
+}
+
+// The organiser's list: every status, latest kickoff first, keyset-paged on (kickoff_at, id).
+// The status filter uses the same effective status as ListPublicEvents.
+func (q *Queries) ListAdminEvents(ctx context.Context, arg ListAdminEventsParams) ([]ListAdminEventsRow, error) {
+	rows, err := q.db.Query(ctx, listAdminEvents,
+		arg.FromAt,
+		arg.ToAt,
+		arg.EffectiveStatus,
+		arg.NowAt,
+		arg.HasCursor,
+		arg.CursorKickoffAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListAdminEventsRow{}
+	for rows.Next() {
+		var i ListAdminEventsRow
+		if err := rows.Scan(
+			&i.Event.ID,
+			&i.Event.VenueID,
+			&i.Event.Title,
+			&i.Event.Competition,
+			&i.Event.HomeTeam,
+			&i.Event.AwayTeam,
+			&i.Event.KickoffAt,
+			&i.Event.GatesOpenAt,
+			&i.Event.PosterUrl,
+			&i.Event.Status,
+			&i.Event.SalesOpenAt,
+			&i.Event.SalesCloseAt,
+			&i.Event.MaxTicketsPerUser,
+			&i.Event.CreatedAt,
+			&i.Event.UpdatedAt,
+			&i.Event.PublishedAt,
+			&i.VenueName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listEvents = `-- name: ListEvents :many
@@ -196,6 +344,190 @@ func (q *Queries) ListEventsByStatus(ctx context.Context, statuses []string) ([]
 	return items, nil
 }
 
+const listPublicEvents = `-- name: ListPublicEvents :many
+SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kickoff_at, e.gates_open_at, e.poster_url, e.status, e.sales_open_at, e.sales_close_at, e.max_tickets_per_user, e.created_at, e.updated_at, e.published_at, v.name AS venue_name
+FROM events e
+JOIN venues v ON v.id = e.venue_id
+WHERE e.status IN ('PUBLISHED', 'ON_SALE', 'SOLD_OUT')
+  AND e.kickoff_at >= $1::timestamptz
+  AND ($2::timestamptz IS NULL OR e.kickoff_at < $2::timestamptz)
+  AND ($3::text IS NULL OR $3::text =
+       CASE WHEN e.status IN ('PUBLISHED', 'ON_SALE') THEN
+                CASE WHEN (e.sales_open_at IS NULL OR e.sales_open_at <= $4::timestamptz)
+                      AND (e.sales_close_at IS NULL OR $4::timestamptz < e.sales_close_at)
+                     THEN 'ON_SALE' ELSE 'PUBLISHED' END
+            ELSE e.status END)
+  AND (NOT $5::boolean
+       OR (e.kickoff_at, e.id) > ($6::timestamptz, $7::bigint))
+ORDER BY e.kickoff_at, e.id
+LIMIT $8
+`
+
+type ListPublicEventsParams struct {
+	FromAt          time.Time
+	ToAt            *time.Time
+	EffectiveStatus *string
+	NowAt           time.Time
+	HasCursor       bool
+	CursorKickoffAt time.Time
+	CursorID        int64
+	PageLimit       int32
+}
+
+type ListPublicEventsRow struct {
+	Event     Event
+	VenueName string
+}
+
+// The fan's list: published events only, soonest kickoff first, keyset-paged on
+// (kickoff_at, id). The CASE is domain.EffectiveEventStatus in SQL: a published event is
+// ON_SALE exactly while sqlc.arg(now_at) is inside its sales window. Change both together.
+func (q *Queries) ListPublicEvents(ctx context.Context, arg ListPublicEventsParams) ([]ListPublicEventsRow, error) {
+	rows, err := q.db.Query(ctx, listPublicEvents,
+		arg.FromAt,
+		arg.ToAt,
+		arg.EffectiveStatus,
+		arg.NowAt,
+		arg.HasCursor,
+		arg.CursorKickoffAt,
+		arg.CursorID,
+		arg.PageLimit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListPublicEventsRow{}
+	for rows.Next() {
+		var i ListPublicEventsRow
+		if err := rows.Scan(
+			&i.Event.ID,
+			&i.Event.VenueID,
+			&i.Event.Title,
+			&i.Event.Competition,
+			&i.Event.HomeTeam,
+			&i.Event.AwayTeam,
+			&i.Event.KickoffAt,
+			&i.Event.GatesOpenAt,
+			&i.Event.PosterUrl,
+			&i.Event.Status,
+			&i.Event.SalesOpenAt,
+			&i.Event.SalesCloseAt,
+			&i.Event.MaxTicketsPerUser,
+			&i.Event.CreatedAt,
+			&i.Event.UpdatedAt,
+			&i.Event.PublishedAt,
+			&i.VenueName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockEvent = `-- name: LockEvent :one
+SELECT id, venue_id, title, competition, home_team, away_team, kickoff_at, gates_open_at, poster_url, status, sales_open_at, sales_close_at, max_tickets_per_user, created_at, updated_at, published_at FROM events WHERE id = $1 FOR UPDATE
+`
+
+// Locks: the one events row, FOR UPDATE, until the transaction ends.
+// Why: an event's inventory is a copy of its painting, made at publish. Publish and
+// everything that edits what publish copies (assign-category, category create/update/delete,
+// applying a template, editing the event, cancel) take this lock first and then check the
+// status they just read. So a paint either commits before publish reads the painting, or
+// waits, sees the event is no longer DRAFT and is refused; event_seats.category_id can never
+// differ from the painting. Two publishes of one event also queue here, and the second finds
+// the event already published.
+func (q *Queries) LockEvent(ctx context.Context, id int64) (Event, error) {
+	row := q.db.QueryRow(ctx, lockEvent, id)
+	var i Event
+	err := row.Scan(
+		&i.ID,
+		&i.VenueID,
+		&i.Title,
+		&i.Competition,
+		&i.HomeTeam,
+		&i.AwayTeam,
+		&i.KickoffAt,
+		&i.GatesOpenAt,
+		&i.PosterUrl,
+		&i.Status,
+		&i.SalesOpenAt,
+		&i.SalesCloseAt,
+		&i.MaxTicketsPerUser,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.PublishedAt,
+	)
+	return i, err
+}
+
+const markPaidBookingsRefundRequired = `-- name: MarkPaidBookingsRefundRequired :execrows
+UPDATE bookings SET status = 'REFUND_REQUIRED' WHERE event_id = $1 AND status = 'PAID'
+`
+
+// Cancel: a paid booking of a cancelled event is owed its money back.
+func (q *Queries) MarkPaidBookingsRefundRequired(ctx context.Context, eventID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, markPaidBookingsRefundRequired, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const queueRefundsForEvent = `-- name: QueueRefundsForEvent :many
+INSERT INTO refunds (booking_id, payment_id, amount_cents, reason)
+SELECT p.booking_id, p.id, p.amount_cents, $1::text
+FROM payments p
+JOIN bookings b ON b.id = p.booking_id
+WHERE b.event_id = $2 AND p.status = 'SUCCESS' AND p.amount_cents > 0
+ON CONFLICT (payment_id) DO NOTHING
+RETURNING amount_cents
+`
+
+type QueueRefundsForEventParams struct {
+	Reason  string
+	EventID int64
+}
+
+// Cancel: one refund per successful payment of the event. payment_id is unique in refunds,
+// so a payment that already has a refund (queued by the payment flow) is skipped.
+func (q *Queries) QueueRefundsForEvent(ctx context.Context, arg QueueRefundsForEventParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, queueRefundsForEvent, arg.Reason, arg.EventID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var amount_cents int64
+		if err := rows.Scan(&amount_cents); err != nil {
+			return nil, err
+		}
+		items = append(items, amount_cents)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const releaseHoldsOfEvent = `-- name: ReleaseHoldsOfEvent :execrows
+UPDATE holds SET status = 'RELEASED' WHERE event_id = $1 AND status = 'ACTIVE'
+`
+
+// Cancel: every live hold of the event ends.
+func (q *Queries) ReleaseHoldsOfEvent(ctx context.Context, eventID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseHoldsOfEvent, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setEventStatus = `-- name: SetEventStatus :execrows
 UPDATE events
 SET status = $1,
@@ -220,6 +552,18 @@ func (q *Queries) SetEventStatus(ctx context.Context, arg SetEventStatusParams) 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const touchEvent = `-- name: TouchEvent :exec
+UPDATE events SET updated_at = clock_timestamp() WHERE id = $1
+`
+
+// Stamps events.updated_at (the trigger sets it). The seat map poll answers "full" instead
+// of "delta" when the event changed since the caller's marker, which is how a price or
+// colour change reaches an open block.
+func (q *Queries) TouchEvent(ctx context.Context, id int64) error {
+	_, err := q.db.Exec(ctx, touchEvent, id)
+	return err
 }
 
 const updateEvent = `-- name: UpdateEvent :one
@@ -286,4 +630,16 @@ func (q *Queries) UpdateEvent(ctx context.Context, arg UpdateEventParams) (Event
 		&i.PublishedAt,
 	)
 	return i, err
+}
+
+const voidTicketsOfEvent = `-- name: VoidTicketsOfEvent :execrows
+UPDATE tickets SET status = 'VOID' WHERE event_id = $1 AND status IN ('VALID', 'USED')
+`
+
+func (q *Queries) VoidTicketsOfEvent(ctx context.Context, eventID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, voidTicketsOfEvent, eventID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

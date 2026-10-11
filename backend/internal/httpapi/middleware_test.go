@@ -396,7 +396,9 @@ func TestRealRouterGuardsAdminAndGateEvenWithNoRoutesMounted(t *testing.T) {
 	assert.Equal(t, http.StatusForbidden, call(router, "GET", "/v1/admin/events", "gate").Code)
 	assert.Equal(t, http.StatusNotFound, call(router, "GET", "/v1/gate/events", "gate").Code)
 	assert.Equal(t, http.StatusNotFound, call(router, "GET", "/v1/gate/events", "admin").Code)
-	assert.Equal(t, http.StatusNotFound, call(router, "GET", "/v1/admin/events", "organiser").Code)
+	// /admin/events exists since M4, so the "signed in, right role, no such route" case
+	// uses a path that never will.
+	assert.Equal(t, http.StatusNotFound, call(router, "GET", "/v1/admin/no-such-thing", "organiser").Code)
 	// ADMIN-only routes that do exist refuse an organiser.
 	assert.Equal(t, http.StatusForbidden, call(router, "GET", "/v1/admin/users", "organiser").Code)
 	assert.Equal(t, http.StatusForbidden, call(router, "GET", "/v1/admin/invitations", "organiser").Code)

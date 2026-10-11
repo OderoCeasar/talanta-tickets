@@ -12,7 +12,9 @@ import (
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
 
 // Pinger is the part of the database pool the health check needs.
@@ -35,6 +37,10 @@ type RateLimits struct {
 	InvitationPerIP ratelimit.Rule
 	// SensitivePerUser covers password change and the TOTP settings.
 	SensitivePerUser ratelimit.Rule
+	// PublicReadPerIP covers the public event and seat map reads. An open block is polled
+	// every five seconds by every fan looking at it, so this one is the loosest of all: it
+	// only stops a single client hammering the API. A zero limit switches it off.
+	PublicReadPerIP ratelimit.Rule
 }
 
 // DefaultRateLimits is what production runs.
@@ -47,6 +53,7 @@ func DefaultRateLimits() RateLimits {
 		RefreshPerIP:     ratelimit.Rule{Limit: 1200, Window: time.Minute},
 		InvitationPerIP:  ratelimit.Rule{Limit: 30, Window: 15 * time.Minute},
 		SensitivePerUser: ratelimit.Rule{Limit: 10, Window: 15 * time.Minute},
+		PublicReadPerIP:  ratelimit.Rule{Limit: 12000, Window: time.Minute},
 	}
 }
 
@@ -72,6 +79,15 @@ type Deps struct {
 	RequestTimeout time.Duration
 	// BodyLimit caps request bodies; zero means DefaultBodyLimit.
 	BodyLimit int64
+
+	// Events is the event, inventory, seat map and sales service (M4, M5).
+	Events *events.Service
+	// Venues is the venue layout service (M4).
+	Venues *venue.Service
+	// PublishTimeout bounds POST /admin/events/{id}/publish, which copies one row per seat
+	// and outlasts RequestTimeout. Zero means 55 seconds. It must stay under the server's
+	// write timeout.
+	PublishTimeout time.Duration
 }
 
 // Server holds the dependencies handlers and middleware share. Handlers are its methods.
@@ -82,6 +98,10 @@ type Server struct {
 	tokens  TokenVerifier
 	limiter ratelimit.Limiter
 	limits  RateLimits
+
+	events         *events.Service
+	venues         *venue.Service
+	publishTimeout time.Duration
 }
 
 // NewRouter builds the API. Every route sits under /v1 because the admin web app is served
@@ -107,7 +127,11 @@ func NewRouter(d Deps) http.Handler {
 	if d.BodyLimit <= 0 {
 		d.BodyLimit = DefaultBodyLimit
 	}
+	if d.PublishTimeout <= 0 {
+		d.PublishTimeout = 55 * time.Second
+	}
 	s := &Server{log: d.Logger, db: d.DB, auth: d.Auth, tokens: d.Tokens, limiter: d.Limiter, limits: *d.RateLimits}
+	s.events, s.venues, s.publishTimeout = d.Events, d.Venues, d.PublishTimeout
 
 	r := chi.NewRouter()
 	// Order matters: the ID and the caller's address first so every later line can log
@@ -220,8 +244,9 @@ func (s *Server) signInRoutes(r chi.Router) {
 }
 
 // publicRoutes: paths are relative to /v1.
-func (s *Server) publicRoutes(chi.Router) {
-	// M4/M5: events, categories and the three seat map levels mount here.
+func (s *Server) publicRoutes(r chi.Router) {
+	// M4/M5: events, categories and the three seat map levels.
+	s.publicEventRoutes(r)
 	// M7: the M-Pesa callback and the web ticket page mount here.
 }
 
@@ -247,8 +272,10 @@ func (s *Server) fanRoutes(chi.Router) {
 }
 
 // staffRoutes: ORGANISER and ADMIN. Paths are relative to /v1/admin.
-func (s *Server) staffRoutes(chi.Router) {
-	// M4: venues, blocks, templates, events, categories, assignments, sales, alerts, refunds.
+func (s *Server) staffRoutes(r chi.Router) {
+	// M4: venues, blocks, templates, events, categories, assignments, sales.
+	s.staffEventRoutes(r)
+	// M7: alerts and refunds mount here.
 }
 
 // adminRoutes: ADMIN only. Paths are relative to /v1/admin.

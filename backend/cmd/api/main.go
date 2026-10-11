@@ -12,10 +12,12 @@ import (
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
 
 func main() {
@@ -94,6 +96,17 @@ func run() error {
 		}
 	}
 
+	// Publish copies one inventory row per seat and needs longer than REQUEST_TIMEOUT. Its
+	// limit is tied to the write timeout so the answer is never cut off mid-write; the
+	// publish transaction raises its own statement timeout to match.
+	publishTimeout := max(cfg.WriteTimeout-5*time.Second, cfg.RequestTimeout)
+	eventPolicy := events.DefaultPolicy()
+	eventPolicy.PublishTimeout = publishTimeout
+	eventService, err := events.NewService(events.Config{DB: pool, Logger: logger, Policy: eventPolicy})
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
@@ -104,6 +117,9 @@ func run() error {
 			CORSOrigins:    cfg.CORSOrigins,
 			ClientIP:       httpapi.ClientIPResolver{TrustedProxies: cfg.TrustedProxies, Header: cfg.ClientIPHeader},
 			RequestTimeout: cfg.RequestTimeout,
+			Events:         eventService,
+			Venues:         venue.NewService(pool),
+			PublishTimeout: publishTimeout,
 		}),
 		// Each bound closes one way a slow or silent client can hold a connection open.
 		ReadHeaderTimeout: 10 * time.Second,

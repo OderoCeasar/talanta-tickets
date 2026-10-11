@@ -25,12 +25,14 @@ import (
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi/contracttest"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/testdb"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
 
 // One Postgres for the whole package. Tests never share rows: each makes its own users
@@ -98,7 +100,7 @@ func uncoveredOperations() []string {
 	}
 	seen := contract.Seen()
 	var missing []string
-	for _, op := range m3Operations {
+	for _, op := range append(append([]string{}, m3Operations...), m4m5Operations...) {
 		var success, failure bool
 		for _, s := range seen {
 			name, status, _ := strings.Cut(s, " ")
@@ -232,6 +234,8 @@ type envConfig struct {
 	policy       auth.Policy
 	limits       httpapi.RateLimits
 	mailErr      error
+	// eventPolicy is the events service's policy; zero values mean the defaults.
+	eventPolicy  events.Policy
 	otpCountries []string
 }
 
@@ -257,6 +261,8 @@ func withOTPCountries(codes ...string) envOption {
 type env struct {
 	t        *testing.T
 	router   http.Handler
+	events   *events.Service
+	venues   *venue.Service
 	auth     *auth.Service
 	q        *store.Queries
 	clock    *clock
@@ -304,7 +310,12 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	})
 	require.NoError(t, err)
 	e.auth = svc
+	e.events, err = events.NewService(events.Config{DB: db.Pool, Logger: logger, Policy: cfg.eventPolicy, Now: e.clock.Now})
+	require.NoError(t, err)
+	e.venues = venue.NewService(db.Pool)
 	e.router = httpapi.NewRouter(httpapi.Deps{
+		Events:      e.events,
+		Venues:      e.venues,
 		Logger:      logger,
 		DB:          db.Pool,
 		Auth:        svc,

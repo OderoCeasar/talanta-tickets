@@ -9,6 +9,8 @@ One line each. Updated at the end of every milestone.
 - API contract: `backend/docs/openapi.yaml` (72 operations), lints clean, TypeScript types generate.
 
 - M3 Auth: phone OTP, email + password with optional two-step, rotating refresh tokens with reuse detection, role checks, staff invitations, first admin from env. Integration suite passes; the invite journey was run in a browser against the real API.
+- M4 Events and inventory: event, category, layout, template and painting endpoints; publish creates exactly one inventory row per active seat (59,568) and a second publish changes nothing.
+- M5 Seat map API: three levels plus the changed-since poll. Level 1 is 4,800 B, level 2 at most 6,557 B, level 3 for the largest block (1,312 seats) 43,617 B raw / 14,541 B gzipped; a poll with one change is 110 B.
 - Admin web, first slice (on `main`): login, Team (invite, resend, revoke), set-password page, account page.
 
 ## Partly done
@@ -18,8 +20,6 @@ One line each. Updated at the end of every milestone.
 
 ## Not started
 
-- M4 Events and inventory
-- M5 Seat map API
 - M6 Holds and locking
 - M7 Bookings, payments, tickets
 - M8 Mobile fan flow
@@ -29,7 +29,9 @@ One line each. Updated at the end of every milestone.
 
 ## Known bugs and limits
 
-- Publishing 59,568 seats takes 26–37 s on the dev laptop (four foreign-key checks per row on `postgres:16-alpine`); M4 must run publish outside the 30 s request timeout.
+- Publishing 59,568 seats takes 30–44 s on the dev laptop (four foreign-key checks per row on `postgres:16-alpine`) against a 55 s limit for that route. Past the limit it rolls back and answers 500; a retry is safe. An async publish would remove the limit.
+- Level 3 for the largest block is 43.6 KB raw, over the ~40 KB in §5.1. Shrinking it means changing the seat tuple in the contract.
+- Nothing sets an event to SOLD_OUT or COMPLETED yet.
 - No real SMS provider: in production the OTP is not delivered, so fans cannot sign in there until one is added (M7 adds the interface; a provider account is the owner's).
 - Rate limits (including the per-user TOTP cap and the global SMS caps), TOTP replay protection and MFA-token single use are held in memory per process: a restart resets them, and a second API instance would not share them.
 - TOTP setup and enable do not re-ask for the password: a borrowed signed-in session can turn two-step sign-in on with its own authenticator (turning it off does ask).

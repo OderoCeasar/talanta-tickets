@@ -34,6 +34,16 @@ func newValidator() *validator.Validate {
 		}
 		return name
 	})
+	// The contract's pattern for a block code: capitals, digits and dashes.
+	_ = v.RegisterValidation("blockcode", func(fl validator.FieldLevel) bool {
+		code := fl.Field().String()
+		for _, c := range code {
+			if !(c >= 'A' && c <= 'Z') && !(c >= '0' && c <= '9') && c != '-' {
+				return false
+			}
+		}
+		return code != ""
+	})
 	return v
 }
 
@@ -201,6 +211,8 @@ func ruleMessage(fe validator.FieldError) string {
 		return "Must not repeat a value."
 	case "uuid", "uuid4":
 		return "Must be a UUID."
+	case "blockcode":
+		return "Use capital letters, digits and dashes only, for example N12."
 	case "hexcolor":
 		return "Must be a colour such as #064E3B."
 	}
