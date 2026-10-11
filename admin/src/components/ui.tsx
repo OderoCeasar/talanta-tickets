@@ -7,6 +7,7 @@ import {
   type InputHTMLAttributes,
   type ReactNode,
   type Ref,
+  type SelectHTMLAttributes,
 } from "react";
 import { AlertIcon, CheckIcon, CopyIcon } from "./icons";
 
@@ -95,6 +96,49 @@ export function TextField({ label, error, hint, action, inputRef, className, ...
       )}
     </div>
   );
+}
+
+interface SelectFieldProps extends Omit<SelectHTMLAttributes<HTMLSelectElement>, "id"> {
+  label: string;
+  error?: string | null;
+  hint?: ReactNode;
+}
+
+export function SelectField({ label, error, hint, className, children, ...select }: SelectFieldProps) {
+  const id = useId();
+  const hintId = hint ? `${id}-hint` : undefined;
+  const errorId = error ? `${id}-error` : undefined;
+  return (
+    <div className="field">
+      <label className="field__label" htmlFor={id}>
+        {label}
+      </label>
+      <select
+        {...select}
+        id={id}
+        className={["input", className].filter(Boolean).join(" ")}
+        aria-invalid={error ? true : undefined}
+        aria-describedby={[errorId, hintId].filter(Boolean).join(" ") || undefined}
+      >
+        {children}
+      </select>
+      {error && (
+        <p className="field__error" id={errorId} role="alert">
+          {error}
+        </p>
+      )}
+      {hint && (
+        <div className="field__hint" id={hintId}>
+          {hint}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** A coloured square that stands for a ticket category. The colour comes from the category's data. */
+export function Swatch({ color }: { color: string }) {
+  return <span className="swatch" style={{ background: color }} aria-hidden="true" />;
 }
 
 /** A password field with a Show / Hide button. The button is reachable by keyboard. */

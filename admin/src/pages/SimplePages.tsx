@@ -1,7 +1,15 @@
+import { unwrap } from "@talanta/shared";
+import { useQuery } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { StatusChip } from "../components/EventBits";
 import { AlertIcon, CalendarIcon, ChartIcon, ShieldIcon, StadiumIcon, TeamIcon, UserIcon } from "../components/icons";
-import { Alert, Card, StateBlock } from "../components/ui";
+import { Alert, Card, LoadFailed, SkeletonRows, StateBlock } from "../components/ui";
+import { api } from "../lib/api";
+import { describeError } from "../lib/errors";
+import { formatDateTime } from "../lib/format";
+import { formatCount, formatKes } from "../lib/money";
+import { isPublished, keys, useAdminEvents, type AdminEvent } from "../lib/queries";
 import { useCurrentUser } from "../lib/session";
 
 interface Tile {
@@ -9,17 +17,19 @@ interface Tile {
   title: string;
   text: string;
   icon: ReactNode;
-  soon?: boolean;
   adminOnly?: boolean;
 }
 
 const TILES: Tile[] = [
-  { to: "/events", title: "Events", text: "Create events, set prices and put them on sale.", icon: <CalendarIcon />, soon: true },
-  { to: "/layout", title: "Venue layout", text: "Place the stands, generate seats and paint categories.", icon: <StadiumIcon />, soon: true },
-  { to: "/sales", title: "Sales", text: "Revenue and seats sold, as it happens.", icon: <ChartIcon />, soon: true },
+  { to: "/events", title: "Events", text: "Create events, set prices and put them on sale.", icon: <CalendarIcon /> },
+  { to: "/layout", title: "Venue layout", text: "Place blocks, generate seats and keep templates.", icon: <StadiumIcon /> },
+  { to: "/sales", title: "Sales", text: "Revenue and seats sold, as it happens.", icon: <ChartIcon /> },
   { to: "/team", title: "Team", text: "Invite people and see who has access.", icon: <TeamIcon />, adminOnly: true },
   { to: "/account", title: "Your account", text: "Change your password and set up two-step sign-in.", icon: <UserIcon /> },
 ];
+
+/** How many upcoming events the home page shows; the rest are one click away under Events. */
+const UPCOMING_LIMIT = 6;
 
 export function HomePage() {
   const user = useCurrentUser();
@@ -30,7 +40,7 @@ export function HomePage() {
     <div className="page">
       <header className="page__header">
         <h1>{firstName ? `Welcome, ${firstName}` : "Welcome"}</h1>
-        <p>This is the organiser site for Talanta Stadium. Pick where you want to go.</p>
+        <p>This is the organiser site for Talanta Stadium.</p>
       </header>
 
       {!user.totp_enabled && (
@@ -40,14 +50,13 @@ export function HomePage() {
         </Alert>
       )}
 
+      <UpcomingEvents />
+
       <div className="tiles">
         {tiles.map((tile) => (
           <Link key={tile.to} to={tile.to} className="card tile">
             <span className="tile__icon">{tile.icon}</span>
-            <span className="tile__title">
-              {tile.title}
-              {tile.soon && <span className="chip chip--plain chip--soon">Coming soon</span>}
-            </span>
+            <span className="tile__title">{tile.title}</span>
             <span className="small muted">{tile.text}</span>
           </Link>
         ))}
@@ -56,19 +65,108 @@ export function HomePage() {
   );
 }
 
-/** Stands in for a section that a later slice builds, so the navigation is already real. */
-export function ComingSoonPage({ title, text, icon }: { title: string; text: string; icon: ReactNode }) {
+function UpcomingEvents() {
+  // The list is latest kickoff first; upcoming events are wanted soonest first.
+  const events = useAdminEvents("ALL", 100);
+  const now = Date.now();
+  const upcoming = (events.data?.pages.flatMap((page) => page.items) ?? [])
+    .filter((event) => new Date(event.kickoff_at).getTime() >= now && event.status !== "CANCELLED" && event.status !== "COMPLETED")
+    .sort((a, b) => a.kickoff_at.localeCompare(b.kickoff_at));
+  const shown = upcoming.slice(0, UPCOMING_LIMIT);
+
   return (
-    <div className="page">
-      <header className="page__header">
-        <h1>{title}</h1>
-      </header>
-      <Card>
-        <StateBlock icon={icon} title={`${title} is coming soon`}>
-          <p>{text}</p>
-        </StateBlock>
-      </Card>
-    </div>
+    <section className="stack" aria-labelledby="upcoming-heading">
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h2 id="upcoming-heading">Upcoming events</h2>
+        <Link to="/events" className="small">
+          All events
+        </Link>
+      </div>
+      {events.isPending ? (
+        <Card>
+          <div className="card__body card__body--flush">
+            <SkeletonRows label="Loading upcoming events" />
+          </div>
+        </Card>
+      ) : events.isError ? (
+        <Card>
+          <LoadFailed message={describeError(events.error)} onRetry={() => events.refetch()} retrying={events.isFetching} />
+        </Card>
+      ) : shown.length === 0 ? (
+        <Card>
+          <StateBlock
+            icon={<CalendarIcon />}
+            title="Nothing coming up"
+            action={
+              <Link to="/events/new" className="btn btn--secondary btn--small">
+                Create an event
+              </Link>
+            }
+          >
+            <p>Create an event from your saved venue template, set its prices and publish it.</p>
+          </StateBlock>
+        </Card>
+      ) : (
+        <>
+          <div className="eventcards">
+            {shown.map((event) => (
+              <EventCard key={event.id} event={event} />
+            ))}
+          </div>
+          {upcoming.length > shown.length && (
+            <p className="small muted">
+              And {upcoming.length - shown.length} more under <Link to="/events">Events</Link>.
+            </p>
+          )}
+        </>
+      )}
+    </section>
+  );
+}
+
+function EventCard({ event }: { event: AdminEvent }) {
+  const published = isPublished(event.status);
+  const sales = useQuery({
+    queryKey: [...keys.sales(event.id), "day"],
+    queryFn: () => unwrap(api.GET("/admin/events/{eventId}/sales", { params: { path: { eventId: event.id }, query: { bucket: "day" } } })),
+    enabled: published,
+    refetchInterval: 30_000,
+  });
+
+  return (
+    <Link to={published ? `/events/${event.id}/sales` : `/events/${event.id}`} className="card eventcard">
+      <span className="eventcard__top">
+        <StatusChip status={event.status} />
+        <time className="small muted" dateTime={event.kickoff_at}>
+          {formatDateTime(event.kickoff_at)}
+        </time>
+      </span>
+      <span className="eventcard__title">{event.title}</span>
+      {published ? (
+        <span className="eventcard__figures">
+          <span>
+            <span className="eventcard__number">{sales.data ? formatKes(sales.data.revenue_cents) : sales.isError ? "—" : "…"}</span>
+            <span className="eventcard__label">Revenue</span>
+          </span>
+          <span>
+            <span className="eventcard__number">{sales.data ? formatCount(sales.data.seats.sold) : sales.isError ? "—" : "…"}</span>
+            <span className="eventcard__label">Sold</span>
+          </span>
+          <span>
+            <span className="eventcard__number">{formatCount(event.seats_available)}</span>
+            <span className="eventcard__label">Available</span>
+          </span>
+        </span>
+      ) : (
+        <span className="small muted">Draft: not on sale yet. Open it to set prices, paint seats and publish.</span>
+      )}
+      {sales.data && sales.data.refund_required_count > 0 && (
+        <span className="small eventcard__warn">
+          {formatCount(sales.data.refund_required_count)} {sales.data.refund_required_count === 1 ? "booking needs" : "bookings need"} a refund
+        </span>
+      )}
+      {sales.isError && <span className="small muted">Sales figures did not load.</span>}
+    </Link>
   );
 }
 

@@ -1,13 +1,19 @@
 import type { ReactNode } from "react";
 import { Navigate, Route, Routes, useLocation } from "react-router-dom";
 import { AppLayout } from "./components/AppLayout";
-import { CalendarIcon, ChartIcon, StadiumIcon } from "./components/icons";
 import { Button, Spinner, StateBlock } from "./components/ui";
 import { useCurrentUser, useSession } from "./lib/session";
 import { AcceptInvitePage } from "./pages/AcceptInvitePage";
 import { AccountPage } from "./pages/AccountPage";
 import { LoginPage } from "./pages/LoginPage";
-import { ComingSoonPage, ForbiddenPage, HomePage, NotFoundPage } from "./pages/SimplePages";
+import { EventsPage } from "./pages/EventsPage";
+import { EventCreatePage, EventDetailsTab, EventPage } from "./pages/event/EventPage";
+import { PaintingTab } from "./pages/event/PaintingTab";
+import { PricingTab } from "./pages/event/PricingTab";
+import { PublishTab } from "./pages/event/PublishTab";
+import { SalesPage, SalesTab } from "./pages/SalesPage";
+import { ForbiddenPage, HomePage, NotFoundPage } from "./pages/SimplePages";
+import { VenuePage } from "./pages/VenuePage";
 import { TeamPage } from "./pages/TeamPage";
 
 /** Everything inside needs a signed-in organiser or admin. Anyone else is sent to /login. */
@@ -63,36 +69,17 @@ export function App() {
 
       <Route element={<RequireSession />}>
         <Route index element={<HomePage />} />
-        <Route
-          path="events"
-          element={
-            <ComingSoonPage
-              title="Events"
-              icon={<CalendarIcon />}
-              text="Creating events, setting prices and putting them on sale will be here."
-            />
-          }
-        />
-        <Route
-          path="layout"
-          element={
-            <ComingSoonPage
-              title="Venue layout"
-              icon={<StadiumIcon />}
-              text="Placing stands, generating seats and painting categories will be here."
-            />
-          }
-        />
-        <Route
-          path="sales"
-          element={
-            <ComingSoonPage
-              title="Sales"
-              icon={<ChartIcon />}
-              text="Revenue, seats sold and bookings that need a refund will be here."
-            />
-          }
-        />
+        <Route path="events" element={<EventsPage />} />
+        <Route path="events/new" element={<EventCreatePage />} />
+        <Route path="events/:eventId" element={<EventPage />}>
+          <Route index element={<EventDetailsTab />} />
+          <Route path="pricing" element={<PricingTab />} />
+          <Route path="painting" element={<PaintingTab />} />
+          <Route path="publish" element={<PublishTab />} />
+          <Route path="sales" element={<SalesTab />} />
+        </Route>
+        <Route path="layout" element={<VenuePage />} />
+        <Route path="sales" element={<SalesPage />} />
         <Route
           path="team"
           element={
