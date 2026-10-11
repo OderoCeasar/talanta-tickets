@@ -397,6 +397,11 @@ export interface paths {
          * Upcoming events
          * @description **Role:** public. Only `PUBLISHED`, `ON_SALE` and `SOLD_OUT` events are listed,
          *     ordered by kickoff, soonest first. `from` defaults to now.
+         *
+         *     `status` here and everywhere an event is returned is the status the event has at
+         *     the moment of the request: a published event is `ON_SALE` exactly while now is
+         *     inside `[sales_open_at, sales_close_at)` and `PUBLISHED` outside it. The `status`
+         *     filter matches on that same value.
          */
         get: operations["listEvents"];
         put?: never;
@@ -517,10 +522,18 @@ export interface paths {
          *     example a price), the server answers `kind: "full"` instead; the client replaces
          *     its cached block. Always switch on `kind`.
          *
-         *     The marker is an opaque string. The server derives it from
-         *     `event_seats.updated_at`; clients must not parse it.
+         *     The marker is an opaque string that only the server can read; clients must not
+         *     parse it, and a marker is only good for the event and block it was issued for. A
+         *     delta may repeat a seat the client was already told about (the server looks back a
+         *     little before the marker so that no change is ever missed); a change is the seat's
+         *     status now, so applying it twice is harmless. A marker older than five minutes is
+         *     answered with the full block.
          *
-         *     A hold that has lapsed but not yet been swept is reported as `A`.
+         *     A hold that has lapsed but not yet been swept is reported as `A`, and a seat whose
+         *     hold lapses while the block is open comes back as `A` in the next delta.
+         *
+         *     `since` must be 1 to 128 characters, otherwise 400. A marker of the right size that
+         *     the server cannot read is not an error: it gets `kind: "full"`.
          */
         get: operations["getBlockSeats"];
         put?: never;
@@ -885,7 +898,8 @@ export interface paths {
         /**
          * Remove a block and its seats
          * @description **Role:** ORGANISER, ADMIN. Refused if any event has inventory for the block
-         *     (that is, any event was published with it).
+         *     (that is, any event was published with it), and while an event at the venue is in
+         *     the middle of being published.
          */
         delete: operations["deleteBlock"];
         options?: never;
@@ -894,7 +908,9 @@ export interface paths {
          * Move, rotate, curve or rename a block
          * @description **Role:** ORGANISER, ADMIN. Send only the fields to change. Changing placement
          *     recomputes the outline and every seat's `x`/`y`; seat IDs, rows and numbering stay,
-         *     so existing inventory and tickets are not affected.
+         *     so existing inventory and tickets are not affected. A move that would take the
+         *     block's outline outside the venue plan is 400 with rule `plan_bounds` on the
+         *     placement fields that were sent.
          */
         patch: operations["updateBlock"];
         trace?: never;
@@ -918,7 +934,11 @@ export interface paths {
          *     **replaced** and the answer carries the new IDs. Replacing is refused once any
          *     event has inventory for the block.
          *
-         *     Limits: 200 rows, 500 seats per row.
+         *     Limits: 200 rows, 500 seats per row. The generated outline must stay inside the
+         *     venue plan (`0..plan_width` by `0..plan_height`); if it does not, the answer is 400
+         *     with rule `plan_bounds` on `rows` and `seats_per_row` and nothing is saved. A
+         *     layout the geometry cannot make (for example a row too long for the block's
+         *     `arc_radius`) is 400 with rule `layout`.
          */
         post: operations["generateBlockSeats"];
         delete?: never;
@@ -1021,7 +1041,9 @@ export interface paths {
          * Edit an event's details
          * @description **Role:** ORGANISER, ADMIN. Send only the fields to change; a nullable field is
          *     cleared by sending null. Status is not edited here: use `publish` and `cancel`.
-         *     `CANCELLED` and `COMPLETED` events cannot be edited.
+         *     `CANCELLED` and `COMPLETED` events cannot be edited. The times must still make
+         *     sense together after the change (gates before kickoff, sales closing after they
+         *     open and not after kickoff), otherwise 400.
          */
         patch: operations["updateEvent"];
         trace?: never;
@@ -1060,8 +1082,12 @@ export interface paths {
         /**
          * Publish an event and put its seats on sale
          * @description **Role:** ORGANISER, ADMIN. Creates one inventory row per active seat and moves the
-         *     event from `DRAFT` to `PUBLISHED` (or straight to `ON_SALE` when `sales_open_at`
-         *     has passed). No request body.
+         *     event from `DRAFT` to `ON_SALE` when now is inside `[sales_open_at, sales_close_at)`,
+         *     otherwise to `PUBLISHED`. No request body.
+         *
+         *     This is the one slow call in the API: for the full stadium it can take most of a
+         *     minute, so give it a client timeout of 60 seconds. Painting and category changes
+         *     sent while it runs wait for it and are then answered against the published event.
          *
          *     Safe to repeat: publishing an event that is already `PUBLISHED`, `ON_SALE` or
          *     `SOLD_OUT` changes nothing and answers 200 with `already_published: true`.
@@ -1087,10 +1113,12 @@ export interface paths {
         put?: never;
         /**
          * Cancel an event, void its tickets and queue refunds
-         * @description **Role:** ORGANISER, ADMIN. Moves the event to `CANCELLED`, releases every hold,
-         *     marks every ticket `VOID`, expires unpaid bookings and queues one refund per
-         *     successful payment. No request body. Safe to repeat: cancelling a `CANCELLED`
-         *     event answers 200 with zero counts.
+         * @description **Role:** ORGANISER, ADMIN. Moves the event to `CANCELLED`, releases every hold
+         *     (the held seats go back to `AVAILABLE`), marks every `VALID` or `USED` ticket
+         *     `VOID`, moves unpaid (`PENDING_PAYMENT`) bookings to `CANCELLED`, queues one refund
+         *     per successful payment and moves `PAID` bookings to `REFUND_REQUIRED`, all in one
+         *     transaction. A draft can be cancelled too. No request body. Safe to repeat:
+         *     cancelling a `CANCELLED` event answers 200 with zero counts.
          */
         post: operations["cancelEvent"];
         delete?: never;
@@ -1136,7 +1164,8 @@ export interface paths {
         /**
          * Delete a category
          * @description **Role:** ORGANISER, ADMIN. Removes the category and its block and row
-         *     assignments. Refused once the event is published, because inventory points at it.
+         *     assignments. Refused once inventory or a booking points at it, which for a painted
+         *     category means once the event is published.
          */
         delete: operations["deleteCategory"];
         options?: never;
@@ -1145,9 +1174,11 @@ export interface paths {
          * Rename, recolour or reprice a category
          * @description **Role:** ORGANISER, ADMIN. Send only the fields to change.
          *
-         *     Changing `price_cents` once the event has any held or sold seat needs
-         *     `confirm: true`; without it the answer is 409 `CONFIRMATION_REQUIRED` and nothing
-         *     changes. Past bookings always keep the price they were made at.
+         *     Changing `price_cents` once the event has left `DRAFT` needs `confirm: true`;
+         *     without it the answer is 409 `CONFIRMATION_REQUIRED` and nothing changes. (Fans may
+         *     already be looking at the old price; `details` says how many seats of the category
+         *     are sold or held, which may be none.) Sending the price the category already has is
+         *     not a change. Past bookings always keep the price they were made at.
          */
         patch: operations["updateCategory"];
         trace?: never;
@@ -1210,7 +1241,13 @@ export interface paths {
          *     per-category rows, a per-block heatmap, a time series of paid bookings and the
          *     count of bookings waiting for a refund. Cheap enough to poll every few seconds.
          *
-         *     Revenue counts `PAID` bookings only.
+         *     Revenue counts `PAID` bookings only. Seat counts may lag by a few seconds, and a
+         *     hold that has lapsed counts as available.
+         *
+         *     Time-series buckets start on Africa/Nairobi clock boundaries: a `day` bucket runs
+         *     from Nairobi midnight (21:00 UTC) to the next. `from` is inclusive, `to` exclusive;
+         *     the first and last buckets only count what is inside the range. A range of more
+         *     than 2,000 buckets is refused with 400 on `from`.
          */
         get: operations["getEventSales"];
         put?: never;
@@ -1565,8 +1602,8 @@ export interface components {
         HoldStatus: "ACTIVE" | "CONVERTED" | "EXPIRED" | "RELEASED";
         /**
          * @description `REFUND_REQUIRED` means money arrived but the seats could not be given (the hold
-         *     had lapsed and they were resold, or the amount was wrong). No tickets exist; a
-         *     refund is queued.
+         *     had lapsed and they were resold, or the amount was wrong), or the event was
+         *     cancelled after the booking was paid. No valid tickets exist; a refund is queued.
          * @enum {string}
          */
         BookingStatus: "PENDING_PAYMENT" | "PAID" | "FAILED" | "EXPIRED" | "CANCELLED" | "REFUND_REQUIRED" | "REFUNDED";
@@ -1607,7 +1644,7 @@ export interface components {
          */
         NumberingDirection: "LTR" | "RTL";
         /**
-         * @description `ALPHA`: A to Z, then AA, AB and so on. `NUMERIC`: 1, 2, 3 and so on. Front row first.
+         * @description `ALPHA`: A to Z, then AA, AB and so on; a seat label is the row label and the seat number (`C14`). `NUMERIC`: 1, 2, 3 and so on; a seat label then has a dash between them (`12-14`), because `1214` could be three different seats. Front row first.
          * @enum {string}
          */
         RowLabelScheme: "ALPHA" | "NUMERIC";
@@ -1936,7 +1973,7 @@ export interface components {
             price_from_cents: number | null;
             /** @description Zero before publish. */
             seats_available: number;
-            /** @description Inventory rows for the event. Zero before publish. */
+            /** @description Inventory rows for the event, blocked seats included. Zero before publish. */
             seats_total: number;
             /** Format: date-time */
             published_at: string | null;
@@ -1962,7 +1999,10 @@ export interface components {
              * @description Must be before `kickoff_at`.
              */
             gates_open_at?: string | null;
-            /** Format: uri */
+            /**
+             * Format: uri
+             * @description An `http` or `https` address.
+             */
             poster_url?: string | null;
             /** Format: date-time */
             sales_open_at?: string | null;
@@ -2027,7 +2067,7 @@ export interface components {
             color_hex?: components["schemas"]["ColorHex"];
             description?: string | null;
             /**
-             * @description Must be true to change the price once any seat is held or sold.
+             * @description Must be true to change the price once the event has left `DRAFT`.
              * @default false
              */
             confirm: boolean;
@@ -2176,7 +2216,7 @@ export interface components {
             categories: components["schemas"]["MapCategory"][];
             /** @description Front row first. */
             rows: {
-                /** @description Row label, for example `C`. A seat's label is the row label followed by its number (`C14`). */
+                /** @description Row label, for example `C`. A seat's label is the row label followed by its number (`C14`); when the row label is a number a dash goes between them (`12-14`). */
                 label: string;
                 seats: components["schemas"]["SeatTuple"][];
             }[];
@@ -4856,7 +4896,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `BLOCK_HAS_INVENTORY` - `details.event_ids` lists the events using it. */
+            /** @description `BLOCK_HAS_INVENTORY` - `details.event_ids` lists the events using it. It is empty when the refusal is because an event at the venue is being published right now; try again in a minute. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4950,7 +4990,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `BLOCK_HAS_INVENTORY` - only when `dry_run` is false. */
+            /** @description `BLOCK_HAS_INVENTORY` - only when `dry_run` is false. `details.event_ids` is empty when an event at the venue is being published right now. */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5537,7 +5577,7 @@ export interface operations {
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
             /**
-             * @description - `CONFIRMATION_REQUIRED` - sales have started; resend with `confirm: true`. `details` has the sold and held counts.
+             * @description - `CONFIRMATION_REQUIRED` - the event is published; resend with `confirm: true`. `details` has the sold and held counts.
              *     - `ALREADY_EXISTS` - name taken.
              *     - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
              */
