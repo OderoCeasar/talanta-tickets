@@ -5,9 +5,14 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "generate": "openapi-typescript ../../backend/docs/openapi.yaml -o src/api/schema.d.ts"
   },
   "devDependencies": {
-    "typescript": "^5.5.4"
+    "typescript": "^5.5.4",
+    "openapi-typescript": "7.13.0"
+  },
+  "dependencies": {
+    "openapi-fetch": "0.17.0"
   }
 }

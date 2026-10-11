@@ -16,20 +16,19 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
-	if err := run(logger); err != nil {
-		logger.Error("api exited", "err", err)
+	if err := run(); err != nil {
+		slog.Error("api exited", "err", err)
 		os.Exit(1)
 	}
 }
 
-func run(logger *slog.Logger) error {
-	cfg, err := config.Load()
+func run() error {
+	cfg, err := config.LoadAPI()
 	if err != nil {
 		return err
 	}
+	logger := config.NewLogger(cfg.Base, "api")
+	slog.SetDefault(logger)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

@@ -1,5 +1,11 @@
-# Local development: Postgres + migrations + the API + Adminer. `make dev` starts all of it.
-# Postgres is published on 5434 so it does not clash with other local databases on 5432.
+# Local development: Postgres + migrations + the API + the worker + Adminer.
+# `make dev` starts all of it. Postgres is published on 5434 so it does not clash with other
+# local databases on 5432.
+x-backend-env: &backend-env
+  APP_ENV: development
+  DATABASE_URL: postgres://talanta:talanta@db:5432/talanta?sslmode=disable
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+
 services:
   db:
     image: postgres:16-alpine
@@ -17,7 +23,7 @@ services:
       timeout: 5s
       retries: 10
 
-  # One-shot: apply migrations, then exit. The api waits for it to succeed.
+  # One-shot: apply migrations, then exit. The api and worker wait for it to succeed.
   migrate:
     image: migrate/migrate:v4.17.1
     command: ["-path=/migrations", "-database", "postgres://talanta:talanta@db:5432/talanta?sslmode=disable", "up"]
@@ -29,12 +35,36 @@ services:
     restart: "no"
 
   api:
-    build: ./backend
+    build: &backend-build
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    # backend/.env is optional: it carries secrets for local runs (signing keys, Daraja).
+    env_file:
+      - path: ./backend/.env
+        required: false
     environment:
+      <<: *backend-env
       ADDR: ":8080"
-      DATABASE_URL: postgres://talanta:talanta@db:5432/talanta?sslmode=disable
     ports:
       - "8080:8080"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Hold expiry sweeper and payment reconciliation. Same dev image as the api, different binary.
+  worker:
+    build: *backend-build
+    entrypoint: ["worker"]
+    env_file:
+      - path: ./backend/.env
+        required: false
+    environment:
+      <<: *backend-env
     depends_on:
       migrate:
         condition: service_completed_successfully
