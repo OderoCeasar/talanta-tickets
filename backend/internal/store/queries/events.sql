@@ -144,7 +144,10 @@ SET status = 'AVAILABLE', hold_id = NULL, hold_expires_at = NULL, version = vers
 WHERE event_id = $1 AND status = 'HELD';
 
 -- name: VoidTicketsOfEvent :execrows
-UPDATE tickets SET status = 'VOID' WHERE event_id = $1 AND status IN ('VALID', 'USED');
+-- Cancel: every ticket of the event that may become VOID does. from_statuses comes from
+-- domain.TicketStatusesThatCanBecome(VOID), the same rule a refund's void uses.
+UPDATE tickets SET status = 'VOID'
+WHERE event_id = sqlc.arg(event_id) AND status = ANY(sqlc.arg(from_statuses)::text[]);
 
 -- name: CancelUnpaidBookingsOfEvent :execrows
 UPDATE bookings SET status = 'CANCELLED' WHERE event_id = $1 AND status = 'PENDING_PAYMENT';

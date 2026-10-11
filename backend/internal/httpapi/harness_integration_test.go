@@ -34,6 +34,7 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/testdb"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/ticketing"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
 
@@ -102,7 +103,7 @@ func uncoveredOperations() []string {
 	}
 	seen := contract.Seen()
 	var missing []string
-	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations) {
+	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations, m7TicketOperations) {
 		var success, failure bool
 		for _, s := range seen {
 			name, status, _ := strings.Cut(s, " ")
@@ -245,6 +246,8 @@ type envConfig struct {
 	otpCountries []string
 	// venueLockWait is how long a layout change waits for a publish; zero means the default.
 	venueLockWait time.Duration
+	// ticketKeys is the ticket keyring; nil means a fresh random key with the ID k1.
+	ticketKeys *ticketing.Keyring
 }
 
 type envOption func(*envConfig)
@@ -272,6 +275,7 @@ type env struct {
 	events   *events.Service
 	venues   *venue.Service
 	holds    *booking.Service
+	tickets  *ticketing.Service
 	auth     *auth.Service
 	q        *store.Queries
 	clock    *clock
@@ -281,6 +285,10 @@ type env struct {
 	contract *contracttest.Contract
 	// remoteAddr is the TCP peer of the next requests.
 	remoteAddr string
+	// ticketSeed is the private seed of the ticket signing key when newEnv made the key
+	// itself, so a test can look for it where it must never be.
+	ticketSeed []byte
+	logger     *slog.Logger
 }
 
 func newEnv(t *testing.T, opts ...envOption) *env {
@@ -331,10 +339,19 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	}
 	e.holds, err = booking.NewService(booking.Config{DB: cfg.holdDB, Logger: logger, Policy: cfg.holdPolicy})
 	require.NoError(t, err)
+	e.logger = logger
+	if cfg.ticketKeys == nil {
+		cfg.ticketKeys, e.ticketSeed = newTicketKeys(t, "k1")
+	}
+	e.tickets, err = ticketing.NewService(ticketing.Config{
+		DB: db.Pool, Logger: logger, Keys: cfg.ticketKeys, SMS: e.sms, PublicBaseURL: testPublicBaseURL,
+	})
+	require.NoError(t, err)
 	e.router = httpapi.NewRouter(httpapi.Deps{
 		Events:      e.events,
 		Venues:      e.venues,
 		Holds:       e.holds,
+		Tickets:     e.tickets,
 		Logger:      logger,
 		DB:          db.Pool,
 		Auth:        svc,

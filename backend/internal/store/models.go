@@ -250,6 +250,7 @@ type Ticket struct {
 	GateGroup   string
 	KeyID       string
 	UpdatedAt   time.Time
+	QrToken     string
 }
 
 type User struct {

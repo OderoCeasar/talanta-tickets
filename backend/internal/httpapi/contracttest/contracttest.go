@@ -91,6 +91,12 @@ func load() (*Contract, error) {
 		return nil
 	}))
 
+	// The library decodes JSON, plain text and octet-stream bodies out of the box. The web
+	// ticket page (text/html) and the ticket QR image (image/png) are read the same way as
+	// those two: as a string, which is all their schemas say they are.
+	openapi3filter.RegisterBodyDecoder("text/html", openapi3filter.RegisteredBodyDecoder("text/plain"))
+	openapi3filter.RegisterBodyDecoder("image/png", openapi3filter.RegisteredBodyDecoder("application/octet-stream"))
+
 	loader := openapi3.NewLoader()
 	doc, err := loader.LoadFromFile(SpecPath())
 	if err != nil {

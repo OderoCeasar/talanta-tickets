@@ -182,10 +182,10 @@ export function LoginPage() {
           </Button>
         </form>
 
-        <p className="small muted">
+        {/* <p className="small muted">
           No account yet? Accounts are by invitation: ask a site admin to send you a link. Forgotten your password? A
           site admin can help you get back in.
-        </p>
+        </p> */}
       </Card>
     </AuthLayout>
   );

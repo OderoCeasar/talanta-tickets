@@ -30,7 +30,7 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 ```
 
 `details` is null or one of the fixed shapes below. Exceptions that do not use this shape:
-`GET /healthz` 503 (`{ "status": "degraded" }`), `GET /t/{webToken}` (HTML), and
+`GET /healthz` 503 (`{ "status": "degraded" }`), `GET /t/{webToken}` (HTML, every status), and
 `POST /webhooks/mpesa/callback` (always 200).
 
 ## Error codes
@@ -438,3 +438,43 @@ the 16 random bytes in each UUID.
   `POST /holds/best-available` counted together. Reading and releasing are not limited.
 - **`SOLD_OUT`.** A hold is refused with `EVENT_NOT_ON_SALE` for a stored `SOLD_OUT` event,
   as the contract says. Nothing sets that status yet (see "Not in the contract").
+
+## Tickets behaviour (M7)
+
+- **The token.** `qr_token` is `TLT1.<payload>.<signature>`, always 160 characters; the
+  layout, the offline checks in order and a worked example with a test key are in
+  `docs/TICKET_FORMAT.md`. It is signed once, when the ticket is issued, and stored; the
+  same text comes back on every read, also after the signing key is changed.
+- **QR size.** 160 characters at error correction M is QR version 9: 53 x 53 modules, 61
+  with the quiet zone. The app should draw level M too.
+- **Owner only.** `GET /tickets/{ticketId}` and `/qr` find a ticket only for the fan whose
+  booking it belongs to; anyone else's and a made-up ID are the same 404. `ticketId` that
+  is not a UUID is 400 (field `ticketId`, rule `id`). Staff roles get 403.
+- **`GET /me/tickets`.** Soonest kickoff first, then seat (inventory id). Every status is
+  listed unless `status` is sent. `event.status` is the effective status, as on events.
+  `location.gate_group` is the gate group signed into the token. Answers that carry
+  `qr_token` are sent `Cache-Control: private, no-store`.
+- **`GET /tickets/{ticketId}/qr`.** A black-on-white PNG, `size` x `size` pixels (128 to
+  1024, default 512, about 1.4 KB), with a four-module quiet zone. Modules are a whole
+  number of pixels, so there is a little extra white when `size` is not a multiple of 61.
+  It is drawn for any status: a void ticket's QR is harmless, the manifest refuses it.
+- **Web ticket page, `GET /v1/t/{webToken}`.** HTML for every status (200, 404, 429, 500).
+  Reads no access token. Shows the booking reference, the event (times in Nairobi time)
+  and each seat; a `VALID` ticket with its QR inline, a `USED` or `VOID` one marked so,
+  without a QR. A link of the wrong shape, an unknown link and the link of a booking with
+  no tickets get the same 404 page. Headers: `Cache-Control: private, no-store`,
+  `X-Robots-Tag: noindex, nofollow, noarchive`, `Referrer-Policy: no-referrer`,
+  `X-Frame-Options: DENY`, and a Content-Security-Policy of `default-src 'none'` with only
+  `data:` images and the page's one style block allowed. 3,000 requests a minute per IP.
+- **SMS.** After a payment commits the fan who made the booking gets "Talanta: you're
+  going! Booking TLT-XXXXXX, 2 tickets: `<PUBLIC_BASE_URL>/v1/t/<web token>`" (154
+  characters with the production origin). No provider is wired yet: the mock logs the text
+  in development and only "not sent" in production.
+- **Issue and void are not endpoints.** Tickets are made inside the payment transaction
+  (`ticketing.IssueForBooking`) and voided by a refund (`VoidForBooking`) or an event
+  cancel. Statuses move only as `domain.TransitionTicket` allows: `VALID` to `USED`, `VOID`
+  or `TRANSFERRED`; `USED` to `VOID`; nothing leaves `VOID`.
+- **Contract changes made with this work:** `getWebTicket` declares a 500 (HTML) and its
+  description says what the page shows; `GateManifest.keys[].key_id` has the pattern
+  `^k[1-9][0-9]{0,4}$`; the `uploadScans` example token is the worked example of
+  `docs/TICKET_FORMAT.md`; `Ticket.qr_token` says it is 160 characters.

@@ -1315,7 +1315,10 @@ paths:
         **Role:** public. An HTML page showing every ticket of one booking with its QR, for
         fans without the app. The token is 64 random hex characters, unrelated to the
         booking reference; whoever has the link has the tickets. Sent `no-store` and
-        `noindex`. Unknown tokens get an HTML 404.
+        `noindex`. Unknown tokens get an HTML 404, and so does the link of a booking that
+        has no tickets (it was never paid). A ticket that is `VALID` is shown with its QR
+        code; a `USED` or `VOID` one is shown as such, without a code. No access token is
+        read: an `Authorization` header is ignored. Every answer of this page is HTML.
       security: []
       parameters:
         - name: webToken
@@ -1337,6 +1340,11 @@ paths:
           description: Too many requests from this IP. HTML, not the JSON error shape.
           headers:
             Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            text/html:
+              schema: { type: string }
+        '500':
+          description: Fault on our side. HTML, not the JSON error shape.
           content:
             text/html:
               schema: { type: string }
@@ -2553,7 +2561,7 @@ paths:
                   gate_group: N-LOWER
                   scanned_at: '2026-11-14T11:02:17Z'
                   result: ADMITTED
-                  token: TLT1.CwvzpSfB5NfnmlcMG01eb3AAAAAAAAABAE4tTE9XRVKq3Q.b2s4c2lnbmF0dXJl
+                  token: TLT1.AQABCw86UnweTX6aVwwbTV5vcAAAAAAAAAABTi1MT1dFUgAAAAAAAAAAAKGyw9Tl9gcY.O5024bVFl6fq-rPKjqJ15KNls5q3woLuzPEG33mc1oS0w-FSiCHxQXjhzotnEv0Wpfr78tSzzMR8KmOHMyk4Dg
                 - client_scan_id: 7a2d3e4f-5b6c-4d7e-9f80-91ab2c3d4e5f
                   ticket_id: 5e2d9c1a-3b4f-4a6d-8e7f-1a2b3c4d5e6f
                   event_id: 1
@@ -4125,7 +4133,7 @@ components:
         qr_token:
           type: string
           pattern: '^TLT1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
-          description: The signed string to draw as a QR code. Layout in `docs/TICKET_FORMAT.md`.
+          description: The signed string to draw as a QR code, always 160 characters. Layout in `docs/TICKET_FORMAT.md`.
         issued_at: { type: string, format: date-time }
         used_at: { type: [string, 'null'], format: date-time }
         updated_at: { type: string, format: date-time }
@@ -4795,7 +4803,10 @@ components:
             additionalProperties: false
             required: [key_id, algorithm, public_key]
             properties:
-              key_id: { type: string }
+              key_id:
+                type: string
+                pattern: '^k[1-9][0-9]{0,4}$'
+                description: The letter `k` and the key number a token carries (`k1` to `k65535`).
               algorithm:
                 type: string
                 enum: [Ed25519]

@@ -18,6 +18,7 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/ticketing"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
 
@@ -33,8 +34,23 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// The ticket signing key is read by the package that uses it, straight into a signer:
+	// it is never a field of the config struct, which gets printed and logged.
+	keyLoader := config.NewLoader()
+	ticketKeys := ticketing.LoadKeyring(keyLoader, cfg.Base)
+	if err := keyLoader.Err(); err != nil {
+		return err
+	}
 	logger := config.NewLogger(cfg.Base, "api")
 	slog.SetDefault(logger)
+
+	if ticketKeys.Ephemeral {
+		logger.Warn("TICKET_SIGNING_KEY IS NOT SET: TICKETS ARE SIGNED WITH A KEY MADE UP AT STARTUP. "+
+			"Every ticket issued now stops verifying when this process ends. Set TICKET_SIGNING_KEY to keep tickets across restarts.",
+			"key_id", ticketKeys.Signer.KeyID())
+	} else {
+		logger.Info("ticket signing key loaded", "key_id", ticketKeys.Signer.KeyID(), "verify_keys", len(ticketKeys.Verifier.PublicKeys()))
+	}
 
 	if cfg.JWTSecretIsDevDefault {
 		logger.Warn("JWT_SECRET IS NOT SET: USING THE PUBLIC DEVELOPMENT SECRET. " +
@@ -69,17 +85,19 @@ func run() error {
 	authPolicy.OTPGlobalHourly.Limit = cfg.OTPGlobalHourlyLimit
 	authPolicy.OTPGlobalDaily.Limit = cfg.OTPGlobalDailyLimit
 
+	// No SMS provider yet: messages are written to the log (never their text in production).
+	sms := notify.LogSMS{Logger: logger, Production: cfg.IsProduction()}
+
 	authService, err := auth.NewService(auth.Config{
 		DB:           pool,
 		Logger:       logger,
 		Secret:       cfg.JWTSecret,
 		DevShortcuts: cfg.AllowDevShortcuts(),
 		AdminBaseURL: cfg.AdminBaseURL,
-		// No SMS provider yet (M7): codes are written to the log.
-		SMS:     notify.LogSMS{Logger: logger, Production: cfg.IsProduction()},
-		Mailer:  mailer,
-		Limiter: limiter,
-		Policy:  authPolicy,
+		SMS:          sms,
+		Mailer:       mailer,
+		Limiter:      limiter,
+		Policy:       authPolicy,
 
 		OTPCountryCodes:     cfg.OTPCountryCodes,
 		Argon2MaxConcurrent: cfg.Argon2MaxConcurrent,
@@ -116,6 +134,15 @@ func run() error {
 		return err
 	}
 
+	// The payment flow calls ticketService.IssueForBooking inside its transaction and
+	// ticketService.SendTicketSMS after the commit.
+	ticketService, err := ticketing.NewService(ticketing.Config{
+		DB: pool, Logger: logger, Keys: ticketKeys, SMS: sms, PublicBaseURL: cfg.PublicBaseURL,
+	})
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
@@ -130,6 +157,7 @@ func run() error {
 			Venues:         venue.NewService(pool),
 			PublishTimeout: publishTimeout,
 			Holds:          holdService,
+			Tickets:        ticketService,
 		}),
 		// Each bound closes one way a slow or silent client can hold a connection open.
 		ReadHeaderTimeout: 10 * time.Second,

@@ -29,6 +29,7 @@ func TestClientIP_DefaultConfigIgnoresCFConnectingIP(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
 	t.Setenv("JWT_SECRET", "a-private-secret-that-is-long-enough-123")
 	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+	t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com")
 	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
 	t.Setenv("CLIENT_IP_HEADER", "")
 
