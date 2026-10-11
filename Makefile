@@ -49,8 +49,8 @@ db-reset: ## Wipe the local database and rebuild it from migrations
 seed: ## Build the made-up Talanta venue, two demo events and one user per role
 	cd backend && DATABASE_URL="$(DATABASE_URL)" go run ./cmd/seed
 
-sqlc: ## Regenerate the Go query code from backend/internal/store/queries
-	cd backend && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
+sqlc: ## Regenerate the Go query code (needs the sqlc CLI, v1.31.1)
+	cd backend && sqlc generate
 
 openapi-clients: ## Regenerate the TypeScript API types from backend/docs/openapi.yaml
 	pnpm --filter @talanta/shared generate

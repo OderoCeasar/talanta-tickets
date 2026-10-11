@@ -29,6 +29,9 @@ func Run(ctx context.Context, logger *slog.Logger, jobs ...Job) {
 		}()
 	}
 	wg.Wait()
+	// With no jobs registered the process must still stay up until it is told to stop,
+	// otherwise the container exits and the orchestrator restarts it in a loop.
+	<-ctx.Done()
 }
 
 func loop(ctx context.Context, logger *slog.Logger, job Job) {

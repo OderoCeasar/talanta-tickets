@@ -1,0 +1,4675 @@
+openapi: 3.1.0
+info:
+  title: Talanta Stadium Ticketing API
+  version: 1.0.0
+  summary: One API for the fan app, the organiser site and the gate scanner.
+  description: |
+    Contract for every client. TypeScript types are generated from this file with
+    `openapi-typescript`; Go handlers are written to match it. Change this file first.
+
+    **Conventions**
+
+    - Every path is under `/v1`.
+    - IDs are 64-bit integers sent as JSON numbers. Ticket IDs are UUID strings.
+    - Money is integer cents in fields ending `_cents`, with `currency` always `KES`.
+    - Times are RFC 3339 in UTC. Clients display them in `Africa/Nairobi`.
+    - Lists are paged with `limit` and `cursor`; the answer carries `items` and `next_cursor`
+      (null on the last page). Cursors are opaque.
+    - Every error has the shape `{ "error": { "code", "message", "details" } }`. `code` is
+      stable and machine-readable; `message` is plain English for a person; `details` is null
+      or an object whose shape depends on `code`. The full list is in `docs/API_NOTES.md`.
+    - Roles: `FAN`, `ORGANISER`, `ADMIN`, `GATE_STAFF`. Each operation names who may call it.
+      A signed-in caller with the wrong role gets 403 `FORBIDDEN`. A caller asking for
+      another user's hold, booking, payment or ticket gets 404 `NOT_FOUND`, so IDs cannot be
+      probed.
+    - Responses are gzip-compressed when the client sends `Accept-Encoding: gzip`.
+  contact:
+    name: Talanta Tickets
+    email: oderoceasar@gmail.com
+servers:
+  - url: https://talanta.vendorsoko.com/v1
+    description: Production
+  - url: http://localhost:8080/v1
+    description: Local development
+security:
+  - bearerAuth: []
+tags:
+  - name: Health
+    description: Liveness check.
+  - name: Auth
+    description: Phone OTP for fans and gate staff; email and password (plus TOTP when the user has turned it on) for organisers and admins; invitation acceptance.
+  - name: Me
+    description: The signed-in user, their password and TOTP settings, and their own holds, bookings and tickets.
+  - name: Events
+    description: Public event listing.
+  - name: SeatMap
+    description: The three levels of the seat map and the changed-since poll.
+  - name: Holds
+    description: Temporary seat reservations.
+  - name: Bookings
+    description: Bookings made from a hold.
+  - name: Payments
+    description: M-Pesa STK push, payment status and the Daraja callback.
+  - name: Tickets
+    description: Issued tickets, QR images and the web ticket page.
+  - name: AdminVenues
+    description: Venue layout - blocks, seat generation and templates.
+  - name: AdminEvents
+    description: Event management, categories, painting, publish and cancel.
+  - name: AdminSales
+    description: Sales figures, bookings, alerts and refunds.
+  - name: AdminUsers
+    description: Staff accounts and invitations. ADMIN only.
+  - name: Gate
+    description: Gate manifest download and scan upload.
+
+# Shared by every error answer below so the error body is declared once.
+x-error-content: &err
+  application/json:
+    schema:
+      $ref: '#/components/schemas/Error'
+
+paths:
+  /healthz:
+    get:
+      operationId: getHealth
+      tags: [Health]
+      summary: Health check
+      description: |
+        **Role:** public. Checks the database. Also served at `/healthz` (no prefix) for
+        container health checks. This is the one endpoint whose failure body is not the
+        standard error shape.
+      security: []
+      responses:
+        '200':
+          description: The API can reach its database.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example: { status: ok }
+        '503':
+          description: The database is unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+              example: { status: degraded }
+
+  # ---------------------------------------------------------------------------
+  # Auth
+  # ---------------------------------------------------------------------------
+  /auth/otp/request:
+    post:
+      operationId: requestOtp
+      tags: [Auth]
+      summary: Send a 6-digit sign-in code by SMS
+      description: |
+        **Role:** public. For fans and gate staff. The code lives 5 minutes. The answer is
+        the same whether or not the phone already has an account; a fan account is created
+        on first successful verify.
+
+        Rate limited per phone and per IP (429 `RATE_LIMITED`).
+
+        `dev_code` is present only when `APP_ENV` is not `production`. In production the
+        field is never sent.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpRequest' }
+            example: { phone: '+254712345678' }
+      responses:
+        '200':
+          description: Code sent.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OtpRequested' }
+              example: { expires_in_seconds: 300, resend_after_seconds: 60, dev_code: '482913' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/otp/verify:
+    post:
+      operationId: verifyOtp
+      tags: [Auth]
+      summary: Exchange a phone code for tokens
+      description: |
+        **Role:** public. A code can be used once. After 5 wrong attempts the code is dead
+        and a new one must be requested (429 `OTP_ATTEMPTS_EXCEEDED`).
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OtpVerify' }
+            example: { phone: '+254712345678', code: '482913' }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSession' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`OTP_INVALID` (wrong code, or no code was requested) or `OTP_EXPIRED`.'
+          content: *err
+        '429':
+          description: '`OTP_ATTEMPTS_EXCEEDED` (request a new code) or `RATE_LIMITED`.'
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/login:
+    post:
+      operationId: passwordLogin
+      tags: [Auth]
+      summary: Staff sign-in with email and password
+      description: |
+        **Role:** public. For `ORGANISER` and `ADMIN` accounts. The answer is one of two
+        shapes; switch on `mfa_required`:
+
+        - `mfa_required: false` - the user has no TOTP turned on. The answer is the full
+          session (tokens and user); they are signed in.
+        - `mfa_required: true` - the user has TOTP turned on. The answer carries a
+          short-lived `mfa_token` that is only accepted by `POST /auth/totp/verify`. It is
+          not a bearer token.
+
+        Wrong email and wrong password give the same 401 so accounts cannot be listed.
+        Rate limited per email and per IP.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordLogin' }
+            example: { email: organiser@talanta.test, password: correct-horse-battery }
+      responses:
+        '200':
+          description: Signed in, or a TOTP code is now needed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+              examples:
+                signedIn:
+                  summary: No TOTP - signed in
+                  value:
+                    mfa_required: false
+                    access_token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI3In0.c2ln
+                    token_type: Bearer
+                    expires_in_seconds: 900
+                    refresh_token: rt_5Jq0m1Zb2Xc3Vd4Ne5Mf6Lg7Kh8Ji9
+                    refresh_expires_at: '2026-11-10T09:00:00Z'
+                    user:
+                      id: 7
+                      phone: null
+                      email: organiser@talanta.test
+                      name: Wanjiru Kamau
+                      role: ORGANISER
+                      totp_enabled: false
+                      created_at: '2026-10-01T08:00:00Z'
+                mfaRequired:
+                  summary: TOTP is on - second step needed
+                  value: { mfa_required: true, mfa_token: 'eyJhbGciOiJIUzI1NiJ9.e30.mfa', expires_in_seconds: 300 }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`INVALID_CREDENTIALS`.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/totp/verify:
+    post:
+      operationId: verifyTotp
+      tags: [Auth]
+      summary: Second step of staff sign-in - TOTP code
+      description: |
+        **Role:** public (needs the `mfa_token` from `POST /auth/login`). Only used when
+        that answer had `mfa_required: true`. The `mfa_token` is single-use on success and
+        dies after 5 wrong codes. Rate limited.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TotpVerify' }
+            example: { mfa_token: 'eyJhbGciOiJIUzI1NiJ9.e30.mfa', code: '123456' }
+      responses:
+        '200':
+          description: Signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSession' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`MFA_TOKEN_INVALID` (expired, used or malformed - start again at `/auth/login`) or `TOTP_INVALID` (wrong code, may retry).'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/refresh:
+    post:
+      operationId: refreshTokens
+      tags: [Auth]
+      summary: Swap a refresh token for a new pair
+      description: |
+        **Role:** public (needs a refresh token). Refresh tokens rotate: each one works
+        once and the answer carries its replacement. Presenting a token that was already
+        used is treated as theft: every token from that sign-in is revoked and the answer
+        is 401 `REFRESH_TOKEN_REUSED`. On either 401 the client must sign in again.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '200':
+          description: New access and refresh tokens.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSession' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`REFRESH_TOKEN_INVALID` (unknown, expired or revoked) or `REFRESH_TOKEN_REUSED`.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/logout:
+    post:
+      operationId: logout
+      tags: [Auth]
+      summary: Revoke a refresh token and its whole chain
+      description: |
+        **Role:** public (needs a refresh token; no access token required so an expired
+        session can still sign out). Always 204, including for an unknown token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RefreshRequest' }
+      responses:
+        '204':
+          description: Signed out.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/invitations/{token}:
+    get:
+      operationId: getInvitation
+      tags: [Auth]
+      summary: Who an invitation is for
+      description: |
+        **Role:** public (the token is the secret). Lets the set-password page show the
+        email and role before the invitee types anything. Rate limited per IP.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/InvitationToken'
+      responses:
+        '200':
+          description: The invitation is pending and can be accepted.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationPreview' }
+              example: { email: new.organiser@talanta.test, role: ORGANISER, expires_at: '2026-10-18T09:00:00Z' }
+        '404':
+          description: '`INVITATION_INVALID` - unknown token, or the invitation was revoked or already accepted.'
+          content: *err
+        '410':
+          description: '`INVITATION_EXPIRED` - ask an admin to resend it.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /auth/invitations/{token}/accept:
+    post:
+      operationId: acceptInvitation
+      tags: [Auth]
+      summary: Accept an invitation, set a password and sign in
+      description: |
+        **Role:** public (the token is the secret). Creates the staff account with the
+        invitation's email and role, marks the invitation `ACCEPTED` and signs the new user
+        in. The token works once. Rate limited per IP.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/InvitationToken'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AcceptInvitation' }
+            example: { name: Wanjiru Kamau, password: a-long-pass-phrase }
+      responses:
+        '201':
+          description: Account created and signed in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AuthSession' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404':
+          description: '`INVITATION_INVALID`.'
+          content: *err
+        '409':
+          description: '`EMAIL_ALREADY_REGISTERED` - an account with this email was created since the invitation was sent.'
+          content: *err
+        '410':
+          description: '`INVITATION_EXPIRED`.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Me
+  # ---------------------------------------------------------------------------
+  /me:
+    get:
+      operationId: getMe
+      tags: [Me]
+      summary: The signed-in user
+      description: '**Role:** any signed-in user.'
+      responses:
+        '200':
+          description: The user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+    patch:
+      operationId: updateMe
+      tags: [Me]
+      summary: Change the signed-in user's name
+      description: '**Role:** any signed-in user. The name is printed on tickets issued afterwards.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateMe' }
+            example: { name: Achieng Odhiambo }
+      responses:
+        '200':
+          description: The updated user.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/password:
+    post:
+      operationId: changePassword
+      tags: [Me]
+      summary: Change the caller's password
+      description: |
+        **Role:** ORGANISER, ADMIN. Every other session of the user is signed out (their
+        refresh tokens are revoked); the calling session stays. Rate limited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePassword' }
+      responses:
+        '204':
+          description: Password changed.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422':
+          description: '`PASSWORD_INCORRECT` - `current_password` is wrong.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/totp/setup:
+    post:
+      operationId: setupTotp
+      tags: [Me]
+      summary: Start turning on TOTP - get a secret to scan
+      description: |
+        **Role:** ORGANISER, ADMIN. No request body. Makes a new secret and returns it once,
+        with an `otpauth://` URL to draw as a QR code. TOTP is **not** on yet: it turns on
+        when `POST /me/totp/enable` proves the authenticator works. Calling setup again
+        before enabling replaces the secret.
+      responses:
+        '200':
+          description: The secret to add to an authenticator app.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TotpSetup' }
+              example:
+                secret: JBSWY3DPEHPK3PXP
+                otpauth_url: 'otpauth://totp/Talanta%20Tickets:organiser%40talanta.test?secret=JBSWY3DPEHPK3PXP&issuer=Talanta%20Tickets'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`TOTP_ALREADY_ENABLED` - turn it off first to change authenticator.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/totp/enable:
+    post:
+      operationId: enableTotp
+      tags: [Me]
+      summary: Turn on TOTP by proving a code
+      description: |
+        **Role:** ORGANISER, ADMIN. From the next sign-in, `POST /auth/login` answers
+        `mfa_required: true` for this user. Rate limited.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TotpCode' }
+            example: { code: '123456' }
+      responses:
+        '200':
+          description: 'TOTP is on. The user, with `totp_enabled: true`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`TOTP_ALREADY_ENABLED`, or `TOTP_SETUP_REQUIRED` when `POST /me/totp/setup` was not called first.'
+          content: *err
+        '422':
+          description: '`TOTP_CODE_INCORRECT` - the code does not match the secret; may retry.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/totp/disable:
+    post:
+      operationId: disableTotp
+      tags: [Me]
+      summary: Turn off TOTP
+      description: '**Role:** ORGANISER, ADMIN. Needs the password again. The stored secret is deleted. Rate limited.'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PasswordConfirm' }
+      responses:
+        '200':
+          description: 'TOTP is off. The user, with `totp_enabled: false`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/User' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: '`TOTP_NOT_ENABLED`.'
+          content: *err
+        '422':
+          description: '`PASSWORD_INCORRECT`.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/holds:
+    get:
+      operationId: listMyHolds
+      tags: [Me]
+      summary: The caller's active holds
+      description: |
+        **Role:** FAN. Only `ACTIVE`, unexpired holds. Not paged: the ticket limit keeps it
+        to a handful. Lets the app find a hold again after a restart, to resume checkout or
+        release the seats.
+      parameters:
+        - name: event_id
+          in: query
+          description: Only holds for this event.
+          schema: { $ref: '#/components/schemas/Id' }
+      responses:
+        '200':
+          description: Active holds, newest first.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HoldList' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/bookings:
+    get:
+      operationId: listMyBookings
+      tags: [Me]
+      summary: The caller's bookings
+      description: '**Role:** FAN. Newest first.'
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/BookingStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of bookings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BookingPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /me/tickets:
+    get:
+      operationId: listMyTickets
+      tags: [Me]
+      summary: The caller's tickets
+      description: |
+        **Role:** FAN. Ordered by event kickoff, soonest first, then seat. Every ticket
+        carries all that is needed to show it with no network, including `qr_token`.
+        The app stores this answer on the phone.
+      parameters:
+        - name: event_id
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/TicketStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of tickets.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TicketPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Events (public read)
+  # ---------------------------------------------------------------------------
+  /events:
+    get:
+      operationId: listEvents
+      tags: [Events]
+      summary: Upcoming events
+      description: |
+        **Role:** public. Only `PUBLISHED`, `ON_SALE` and `SOLD_OUT` events are listed,
+        ordered by kickoff, soonest first. `from` defaults to now.
+      security: []
+      parameters:
+        - name: from
+          in: query
+          description: Kickoff at or after this time.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Kickoff before this time.
+          schema: { type: string, format: date-time }
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/PublicEventStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of events.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /events/{eventId}:
+    get:
+      operationId: getEvent
+      tags: [Events]
+      summary: One event
+      description: |
+        **Role:** public. `DRAFT` events answer 404. `CANCELLED` and `COMPLETED` events are
+        still returned here so a ticket holder's deep link keeps working.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /events/{eventId}/categories:
+    get:
+      operationId: listEventCategories
+      tags: [Events]
+      summary: Ticket categories and prices for an event
+      description: '**Role:** public. Cheapest first. Not paged (an event has a handful). `DRAFT` events answer 404.'
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The categories.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CategoryList' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Seat map
+  # ---------------------------------------------------------------------------
+  /events/{eventId}/map:
+    get:
+      operationId: getEventMap
+      tags: [SeatMap]
+      summary: Level 1 - the stadium, one polygon per stand
+      description: |
+        **Role:** public. About 8 stands, target size 4 KB. `price_from_cents` is the
+        cheapest seat that is `AVAILABLE` right now in that stand, or null when none is.
+        Counts may lag by a few seconds. `DRAFT` events answer 404.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The stadium overview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StadiumMap' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /events/{eventId}/stands/{standId}/blocks:
+    get:
+      operationId: listStandBlocks
+      tags: [SeatMap]
+      summary: Level 2 - the blocks of one stand
+      description: |
+        **Role:** public. 10 to 20 blocks, target size 10 KB. Each block has its outline,
+        seat total, available count and a price badge. The category table is sent once and
+        blocks point into it by `category_id`.
+      security: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/StandId'
+      responses:
+        '200':
+          description: The stand and its blocks.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StandBlocks' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /events/{eventId}/blocks/{blockId}/seats:
+    get:
+      operationId: getBlockSeats
+      tags: [SeatMap]
+      summary: Level 3 - the seats of one block, or what changed since a marker
+      description: |
+        **Role:** public; the bearer token is optional. With a FAN token, seats the caller
+        holds come back as `M` (held by you) instead of `H`. Who else holds a seat is never
+        exposed.
+
+        **Without `since`** the answer is the full block (`kind: "full"`): block geometry,
+        the category table (sent once) and rows of seat tuples. No per-seat object keys.
+
+        **With `since=<marker>`** the answer is `kind: "delta"`: only
+        `[event_seat_id, status_code]` pairs for seats whose status changed after the
+        marker, plus a new marker. An empty `changes` array is the normal answer. The app
+        polls this every `poll_interval_seconds` while the block is on screen.
+
+        If the marker is unreadable, too old, or anything other than status changed (for
+        example a price), the server answers `kind: "full"` instead; the client replaces
+        its cached block. Always switch on `kind`.
+
+        The marker is an opaque string. The server derives it from
+        `event_seats.updated_at`; clients must not parse it.
+
+        A hold that has lapsed but not yet been swept is reported as `A`.
+      security:
+        - {}
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - $ref: '#/components/parameters/BlockId'
+        - name: since
+          in: query
+          description: The `marker` from the previous answer for this block.
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        '200':
+          description: The full block, or the changes since the marker.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlockSeats' }
+              examples:
+                full:
+                  summary: Full block (no `since`)
+                  value:
+                    kind: full
+                    marker: 'MTc2MDE3NjgwMDEyMzQ1Ng'
+                    poll_interval_seconds: 5
+                    block:
+                      id: 112
+                      stand_id: 3
+                      code: N12
+                      label: North 12
+                      rotation_deg: 180
+                      seat_pitch_x: 5
+                      seat_pitch_y: 8
+                      bounds: { min_x: 4010, min_y: 590, max_x: 4025, max_y: 606 }
+                    categories:
+                      - { id: 7, name: Regular, price_cents: 50000, color_hex: '#2E7D32' }
+                      - { id: 8, name: VIP, price_cents: 250000, color_hex: '#C9A227' }
+                    rows:
+                      - label: A
+                        seats:
+                          - [910001, 1, 4012.5, 594, 0, 1, A]
+                          - [910002, 2, 4017.5, 594, 1, 1, M]
+                          - [910003, 3, 4022.5, 594, 2, 1, H]
+                      - label: B
+                        seats:
+                          - [910004, 1, 4012.5, 602, 0, 0, S]
+                          - [910005, 2, 4017.5, 602, 3, 0, A]
+                          - [910006, 3, 4022.5, 602, 0, -1, B]
+                delta:
+                  summary: Changes only (`since` given)
+                  value:
+                    kind: delta
+                    marker: 'MTc2MDE3NjgwNTk4NzY1NA'
+                    poll_interval_seconds: 5
+                    changes:
+                      - [910001, H]
+                      - [910004, A]
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Holds
+  # ---------------------------------------------------------------------------
+  /holds:
+    post:
+      operationId: createHold
+      tags: [Holds]
+      summary: Hold specific seats for 10 minutes
+      description: |
+        **Role:** FAN. All or nothing: if any requested seat is not free, none is held and
+        the answer is 409 `SEATS_UNAVAILABLE` with `details.unavailable_seat_ids`. A seat ID
+        that does not belong to the event is reported the same way.
+
+        `seat_ids` are **event seat IDs** (position 0 of the level-3 seat tuple), not
+        physical seat IDs.
+
+        The per-user limit counts seats in the caller's active holds plus seats in their
+        paid bookings for the event. A fan who wants different seats releases the old hold
+        first.
+
+        Rate limited per user and per IP.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateHold' }
+            example: { event_id: 1, seat_ids: [910001, 910005] }
+      responses:
+        '201':
+          description: All requested seats are held.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such event (a `DRAFT` event counts as missing).'
+          content: *err
+        '409':
+          description: |
+            - `SEATS_UNAVAILABLE` - one or more seats are held, sold or blocked. Nothing was held.
+            - `EVENT_NOT_ON_SALE` - the event is not in status `ON_SALE`.
+            - `SALES_NOT_OPEN` - before `sales_open_at`.
+            - `SALES_CLOSED` - after `sales_close_at`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              examples:
+                seatsUnavailable:
+                  summary: One of two seats was taken
+                  value:
+                    error:
+                      code: SEATS_UNAVAILABLE
+                      message: 1 of the 2 seats you chose is no longer available.
+                      details: { unavailable_seat_ids: [910005] }
+                salesClosed:
+                  summary: Sales window is over
+                  value:
+                    error:
+                      code: SALES_CLOSED
+                      message: Ticket sales for this event have closed.
+                      details:
+                        event_status: ON_SALE
+                        sales_open_at: '2026-10-01T06:00:00Z'
+                        sales_close_at: '2026-10-18T12:00:00Z'
+        '422':
+          description: '`TICKET_LIMIT_EXCEEDED` - this hold would take the caller past `max_tickets_per_user`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: TICKET_LIMIT_EXCEEDED
+                  message: You can buy up to 6 tickets for this event. You have 2 left.
+                  details: { allowed: 6, held_or_bought: 4, requested: 3, remaining: 2 }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /holds/best-available:
+    post:
+      operationId: createBestAvailableHold
+      tags: [Holds]
+      summary: Hold the best run of neighbouring seats in a category
+      description: |
+        **Role:** FAN. The server finds `quantity` neighbouring seats in one row of the
+        category and holds them, trying a few runs if others get there first. A group is
+        never split across a gap or an aisle. The answer has the same shape as
+        `POST /holds`; the app shows the seats on the map using `block_id`.
+
+        409 `NO_ADJACENT_SEATS` means no run was found or every attempt lost a race;
+        asking again, or for fewer seats, may succeed.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBestAvailableHold' }
+            example: { event_id: 1, category_id: 7, quantity: 4 }
+      responses:
+        '201':
+          description: A run of neighbouring seats is held.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such event, or the category is not part of it.'
+          content: *err
+        '409':
+          description: '`NO_ADJACENT_SEATS`, `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN` or `SALES_CLOSED`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: NO_ADJACENT_SEATS
+                  message: We could not find 4 seats together in Regular.
+                  details: { category_id: 7, quantity: 4, available: 3 }
+        '422':
+          description: '`TICKET_LIMIT_EXCEEDED`.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /holds/{holdId}:
+    get:
+      operationId: getHold
+      tags: [Holds]
+      summary: One hold, with its expiry
+      description: |
+        **Role:** FAN, owner only. Returned in every status, so the app can tell
+        `EXPIRED` from `RELEASED`. The countdown is computed from `expires_at`;
+        `remaining_seconds` is the server's view at answer time and is there to correct for
+        a wrong phone clock.
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '200':
+          description: The hold.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Hold' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+    delete:
+      operationId: releaseHold
+      tags: [Holds]
+      summary: Give the seats back
+      description: |
+        **Role:** FAN, owner only. Frees the seats now. If the hold has an unpaid booking,
+        that booking becomes `CANCELLED`. Safe to repeat: a hold that is already `RELEASED`
+        or `EXPIRED` answers 204.
+      parameters:
+        - $ref: '#/components/parameters/HoldId'
+      responses:
+        '204':
+          description: Released (or already was).
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `PAYMENT_IN_PROGRESS` - an M-Pesa prompt is live for this hold's booking; wait for it to finish.
+            - `HOLD_NOT_ACTIVE` - the hold is `CONVERTED` (the seats were bought).
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Bookings
+  # ---------------------------------------------------------------------------
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [Bookings]
+      summary: Turn a hold into a booking awaiting payment
+      description: |
+        **Role:** FAN. The hold must be the caller's, `ACTIVE` and unexpired. Prices are
+        copied onto the booking here and never change afterwards.
+
+        `Idempotency-Key` is required. The app makes one key per checkout. Sending the same
+        key again returns the same booking with **200** instead of 201 and creates nothing.
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBooking' }
+            example: { hold_id: 5521 }
+      responses:
+        '200':
+          description: Replay - the booking this key already created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '201':
+          description: Booking created in `PENDING_PAYMENT`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400':
+          description: '`VALIDATION_FAILED`, or `IDEMPOTENCY_KEY_REQUIRED` when the header is missing or malformed.'
+          content: *err
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such hold, or it belongs to someone else.'
+          content: *err
+        '409':
+          description: |
+            - `HOLD_EXPIRED` - the 10 minutes ran out.
+            - `HOLD_NOT_ACTIVE` - the hold was released or already paid for.
+            - `HOLD_ALREADY_BOOKED` - the hold already has a booking made with a different key; `details.booking_reference` names it.
+          content: *err
+        '422':
+          description: '`IDEMPOTENCY_KEY_REUSED` - this key was already used for a different hold.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /bookings/{reference}:
+    get:
+      operationId: getBooking
+      tags: [Bookings]
+      summary: One booking by its reference
+      description: |
+        **Role:** FAN, owner only. This is what the app resumes from after being closed
+        mid-payment: `status`, `latest_payment` and `hold_expires_at` say whether to show
+        tickets, keep polling, offer a retry or go back to the map.
+      parameters:
+        - $ref: '#/components/parameters/BookingReference'
+      responses:
+        '200':
+          description: The booking.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Booking' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Payments
+  # ---------------------------------------------------------------------------
+  /payments/mpesa/stk:
+    post:
+      operationId: startMpesaStkPush
+      tags: [Payments]
+      summary: Send an M-Pesa PIN prompt for a booking
+      description: |
+        **Role:** FAN, booking owner only. The amount is always the booking's
+        `total_cents`; the client cannot set it. Answers 202: the outcome arrives later.
+        Poll `GET /payments/{paymentId}` (about every 2 seconds) until `status` is final.
+
+        Starting the first payment pushes the hold's expiry out once so at least 6 minutes
+        remain; re-read the booking for the new `hold_expires_at`. After a failed payment
+        the fan may retry for as long as the hold is alive.
+
+        **Dev only:** `X-Mock-Outcome` chooses what the mock provider does. Sending the
+        header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`.
+      parameters:
+        - $ref: '#/components/parameters/MockOutcome'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/StartStkPush' }
+            example: { booking_id: 8801, phone: '+254712345678' }
+      responses:
+        '202':
+          description: The prompt was sent; the payment is `PENDING`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`FORBIDDEN` (wrong role) or `MOCK_NOT_ALLOWED` (`X-Mock-Outcome` sent in production).'
+          content: *err
+        '404':
+          description: '`NOT_FOUND` - no such booking, or it belongs to someone else.'
+          content: *err
+        '409':
+          description: |
+            - `BOOKING_NOT_PAYABLE` - the booking is not `PENDING_PAYMENT`; `details.booking_status` says what it is.
+            - `HOLD_EXPIRED` - the seats are no longer held; start again from the map.
+            - `PAYMENT_IN_PROGRESS` - a payment for this booking is still `INITIATED` or `PENDING`; `details.payment_id` names it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: PAYMENT_IN_PROGRESS
+                  message: A payment for this booking is already waiting for your PIN.
+                  details: { payment_id: 4410, payment_status: PENDING }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '500': { $ref: '#/components/responses/Internal' }
+        '502':
+          description: '`PAYMENT_PROVIDER_UNAVAILABLE` - M-Pesa did not accept the request. No payment is left live; the fan may retry.'
+          content: *err
+
+  /payments/{paymentId}:
+    get:
+      operationId: getPayment
+      tags: [Payments]
+      summary: Payment status
+      description: |
+        **Role:** FAN, owner only. `failure_reason` is the stable value to switch on;
+        `result_desc` is the provider's own wording. `booking_status` is included so one
+        poll tells the app both that the money arrived and whether tickets were issued
+        (`PAID`) or the seats were lost and a refund is owed (`REFUND_REQUIRED`).
+      parameters:
+        - $ref: '#/components/parameters/PaymentId'
+      responses:
+        '200':
+          description: The payment.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Payment' }
+              examples:
+                wrongPin:
+                  summary: Failed - wrong PIN
+                  value:
+                    id: 4410
+                    booking_id: 8801
+                    booking_reference: TLT-8H3K2M
+                    booking_status: PENDING_PAYMENT
+                    provider: MPESA
+                    status: FAILED
+                    amount_cents: 100000
+                    currency: KES
+                    phone: '+254712345678'
+                    merchant_request_id: 29115-34620561-1
+                    checkout_request_id: ws_CO_191220191020363925
+                    mpesa_receipt: null
+                    failure_reason: wrong_pin
+                    result_code: 2001
+                    result_desc: The initiator information is invalid.
+                    created_at: '2026-10-11T09:15:02Z'
+                    completed_at: '2026-10-11T09:15:21Z'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /webhooks/mpesa/callback:
+    post:
+      operationId: mpesaCallback
+      tags: [Payments]
+      summary: Daraja STK push result callback
+      description: |
+        **Role:** public; called by Safaricom, not by our clients. No bearer token: the
+        source IP is checked against an allowlist from config.
+
+        The body is never trusted alone. The server finds the payment by
+        `CheckoutRequestID`, checks it is still pending and that the `Amount` equals the
+        booking total. An unknown ID, a repeat, a forged body or a disallowed IP all get
+        the same answer and change nothing.
+
+        Always answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body
+        that cannot be parsed, so Daraja does not retry and nothing is revealed to a
+        prober.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MpesaCallback' }
+            examples:
+              success:
+                summary: Customer paid
+                value:
+                  Body:
+                    stkCallback:
+                      MerchantRequestID: 29115-34620561-1
+                      CheckoutRequestID: ws_CO_191220191020363925
+                      ResultCode: 0
+                      ResultDesc: The service request is processed successfully.
+                      CallbackMetadata:
+                        Item:
+                          - { Name: Amount, Value: 1000.00 }
+                          - { Name: MpesaReceiptNumber, Value: NLJ7RT61SV }
+                          - { Name: Balance }
+                          - { Name: TransactionDate, Value: 20261011121530 }
+                          - { Name: PhoneNumber, Value: 254712345678 }
+              cancelled:
+                summary: Customer cancelled the prompt (no metadata)
+                value:
+                  Body:
+                    stkCallback:
+                      MerchantRequestID: 29115-34620561-1
+                      CheckoutRequestID: ws_CO_191220191020363925
+                      ResultCode: 1032
+                      ResultDesc: Request cancelled by user.
+      responses:
+        '200':
+          description: Always.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MpesaCallbackAck' }
+              example: { ResultCode: 0, ResultDesc: Accepted }
+
+  # ---------------------------------------------------------------------------
+  # Tickets
+  # ---------------------------------------------------------------------------
+  /tickets/{ticketId}:
+    get:
+      operationId: getTicket
+      tags: [Tickets]
+      summary: One ticket
+      description: '**Role:** FAN, owner only.'
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+      responses:
+        '200':
+          description: The ticket.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Ticket' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /tickets/{ticketId}/qr:
+    get:
+      operationId: getTicketQr
+      tags: [Tickets]
+      summary: The ticket's QR code as a PNG
+      description: |
+        **Role:** FAN, owner only. The image encodes the same `TLT1.…` string as
+        `qr_token`. The app normally draws the QR itself from `qr_token`; this endpoint is
+        for sharing and printing. Errors are JSON.
+      parameters:
+        - $ref: '#/components/parameters/TicketId'
+        - name: size
+          in: query
+          description: Width and height in pixels.
+          schema: { type: integer, minimum: 128, maximum: 1024, default: 512 }
+      responses:
+        '200':
+          description: PNG image.
+          headers:
+            Cache-Control:
+              description: '`private, no-store` - a QR must not sit in a shared cache.'
+              schema: { type: string }
+          content:
+            image/png:
+              schema: { type: string, format: binary }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /t/{webToken}:
+    get:
+      operationId: getWebTicket
+      tags: [Tickets]
+      summary: Web ticket page from the SMS link
+      description: |
+        **Role:** public. An HTML page showing every ticket of one booking with its QR, for
+        fans without the app. The token is 64 random hex characters, unrelated to the
+        booking reference; whoever has the link has the tickets. Sent `no-store` and
+        `noindex`. Unknown tokens get an HTML 404.
+      security: []
+      parameters:
+        - name: webToken
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[0-9a-f]{64}$' }
+      responses:
+        '200':
+          description: The ticket page.
+          content:
+            text/html:
+              schema: { type: string }
+        '404':
+          description: Unknown or malformed token. HTML, not the JSON error shape.
+          content:
+            text/html:
+              schema: { type: string }
+        '429':
+          description: Too many requests from this IP. HTML, not the JSON error shape.
+          headers:
+            Retry-After: { $ref: '#/components/headers/RetryAfter' }
+          content:
+            text/html:
+              schema: { type: string }
+
+  # ---------------------------------------------------------------------------
+  # Admin: venues and layout
+  # ---------------------------------------------------------------------------
+  /admin/venues:
+    get:
+      operationId: listVenues
+      tags: [AdminVenues]
+      summary: Venues
+      description: '**Role:** ORGANISER, ADMIN. Not paged (one stadium today).'
+      responses:
+        '200':
+          description: The venues.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VenueList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/venues/{venueId}:
+    get:
+      operationId: getVenue
+      tags: [AdminVenues]
+      summary: A venue's plan - stands and blocks, no seats
+      description: |
+        **Role:** ORGANISER, ADMIN. Everything the layout editor draws before a block is
+        opened: stand polygons and each block's placement, outline and seat count.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      responses:
+        '200':
+          description: The venue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VenueDetail' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/venues/{venueId}/blocks:
+    post:
+      operationId: createBlock
+      tags: [AdminVenues]
+      summary: Place a new block on the plan
+      description: |
+        **Role:** ORGANISER, ADMIN. The block starts with no seats; call
+        `generate-seats` next. `code` is unique within its stand.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateBlock' }
+            example:
+              stand_id: 3
+              code: N12
+              label: North 12
+              origin_x: 4012.5
+              origin_y: 594
+              rotation_deg: 180
+              arc_radius: null
+              seat_pitch_x: 5
+              seat_pitch_y: 8
+      responses:
+        '201':
+          description: The new block.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Block' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such venue, or the stand is not part of it.'
+          content: *err
+        '409':
+          description: '`ALREADY_EXISTS` - the stand already has a block with this code (`details.fields` names `code`).'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/blocks/{blockId}:
+    patch:
+      operationId: updateBlock
+      tags: [AdminVenues]
+      summary: Move, rotate, curve or rename a block
+      description: |
+        **Role:** ORGANISER, ADMIN. Send only the fields to change. Changing placement
+        recomputes the outline and every seat's `x`/`y`; seat IDs, rows and numbering stay,
+        so existing inventory and tickets are not affected.
+      parameters:
+        - $ref: '#/components/parameters/BlockId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateBlock' }
+      responses:
+        '200':
+          description: The updated block.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Block' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`ALREADY_EXISTS` - another block in the stand has this code.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+    delete:
+      operationId: deleteBlock
+      tags: [AdminVenues]
+      summary: Remove a block and its seats
+      description: |
+        **Role:** ORGANISER, ADMIN. Refused if any event has inventory for the block
+        (that is, any event was published with it).
+      parameters:
+        - $ref: '#/components/parameters/BlockId'
+      responses:
+        '204':
+          description: Deleted.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`BLOCK_HAS_INVENTORY` - `details.event_ids` lists the events using it.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/blocks/{blockId}/generate-seats:
+    post:
+      operationId: generateBlockSeats
+      tags: [AdminVenues]
+      summary: Generate a block's rows and seats, or preview them
+      description: |
+        **Role:** ORGANISER, ADMIN. The server makes the rows and seats and computes each
+        seat's position from the block's placement.
+
+        With `dry_run: true` nothing is saved: the answer is the preview and row and seat
+        IDs are null. With `dry_run: false` the block's existing rows and seats are
+        **replaced** and the answer carries the new IDs. Replacing is refused once any
+        event has inventory for the block.
+
+        Limits: 200 rows, 500 seats per row.
+      parameters:
+        - $ref: '#/components/parameters/BlockId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/GenerateSeats' }
+            example:
+              rows: 3
+              seats_per_row: 4
+              row_label_scheme: ALPHA
+              numbering_direction: LTR
+              row_offsets: [0, 0, 2.5]
+              dry_run: true
+      responses:
+        '200':
+          description: The generated layout (saved unless `dry_run`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlockLayout' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`BLOCK_HAS_INVENTORY` - only when `dry_run` is false.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/blocks/{blockId}/seats:
+    get:
+      operationId: getBlockLayout
+      tags: [AdminVenues]
+      summary: A block's physical seats, for the editor
+      description: |
+        **Role:** ORGANISER, ADMIN. The saved rows and seats in the same compact shape as
+        the `generate-seats` answer. Row IDs here are what `assign-category` takes in
+        `row_ids`.
+      parameters:
+        - $ref: '#/components/parameters/BlockId'
+      responses:
+        '200':
+          description: The block's layout.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/BlockLayout' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/venues/{venueId}/templates:
+    get:
+      operationId: listVenueTemplates
+      tags: [AdminVenues]
+      summary: Saved category-and-painting templates for a venue
+      description: '**Role:** ORGANISER, ADMIN. Not paged.'
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      responses:
+        '200':
+          description: The templates.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TemplateList' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+    post:
+      operationId: createVenueTemplate
+      tags: [AdminVenues]
+      summary: Save an event's categories and painting as a named template
+      description: |
+        **Role:** ORGANISER, ADMIN. Copies the event's categories (name, colour, price,
+        description) and its block and row assignments. Later changes to the event do not
+        change the template.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateTemplate' }
+            example: { name: League match, event_id: 1 }
+      responses:
+        '201':
+          description: The saved template.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Template' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such venue or event.'
+          content: *err
+        '409':
+          description: '`ALREADY_EXISTS` - the venue already has a template with this name.'
+          content: *err
+        '422':
+          description: '`VENUE_MISMATCH` - the event is at a different venue.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Admin: events
+  # ---------------------------------------------------------------------------
+  /admin/events:
+    get:
+      operationId: listAdminEvents
+      tags: [AdminEvents]
+      summary: Events in every status
+      description: '**Role:** ORGANISER, ADMIN. Ordered by kickoff, latest first.'
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/EventStatus' }
+        - name: from
+          in: query
+          description: Kickoff at or after this time.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: Kickoff before this time.
+          schema: { type: string, format: date-time }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of events.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EventPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+    post:
+      operationId: createEvent
+      tags: [AdminEvents]
+      summary: Create a draft event
+      description: |
+        **Role:** ORGANISER, ADMIN. The event starts in `DRAFT`. With `template_id` the
+        template's categories and block/row assignments are copied onto it.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateEvent' }
+            example:
+              venue_id: 1
+              title: Harambee Stars vs Uganda Cranes
+              competition: AFCON Qualifier
+              home_team: Harambee Stars
+              away_team: Uganda Cranes
+              kickoff_at: '2026-11-14T13:00:00Z'
+              gates_open_at: '2026-11-14T10:00:00Z'
+              sales_open_at: '2026-10-20T06:00:00Z'
+              sales_close_at: '2026-11-14T12:00:00Z'
+              max_tickets_per_user: 6
+              template_id: 2
+      responses:
+        '201':
+          description: The new event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such venue or template.'
+          content: *err
+        '422':
+          description: '`VENUE_MISMATCH` - the template belongs to a different venue.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}:
+    get:
+      operationId: getAdminEvent
+      tags: [AdminEvents]
+      summary: One event, any status
+      description: '**Role:** ORGANISER, ADMIN.'
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+    patch:
+      operationId: updateEvent
+      tags: [AdminEvents]
+      summary: Edit an event's details
+      description: |
+        **Role:** ORGANISER, ADMIN. Send only the fields to change; a nullable field is
+        cleared by sending null. Status is not edited here: use `publish` and `cancel`.
+        `CANCELLED` and `COMPLETED` events cannot be edited.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateEvent' }
+      responses:
+        '200':
+          description: The updated event.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`EVENT_NOT_EDITABLE` - the event is `CANCELLED` or `COMPLETED`.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/readiness:
+    get:
+      operationId: getEventReadiness
+      tags: [AdminEvents]
+      summary: Can this event be published, and if not, what is missing
+      description: |
+        **Role:** ORGANISER, ADMIN. An event is ready when every active seat has a
+        category, every category has a price above zero, and the sales window is set and
+        sensible. `problems` is empty exactly when `ready` is true.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The readiness report.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Readiness' }
+              example:
+                event_id: 1
+                event_status: DRAFT
+                ready: false
+                seat_total: 60000
+                seats_with_category: 59520
+                problems:
+                  - code: SEATS_WITHOUT_CATEGORY
+                    message: Block N12 has 480 seats with no category.
+                    block_id: 112
+                    block_code: N12
+                    category_id: null
+                    category_name: null
+                    seat_count: 480
+                  - code: CATEGORY_WITHOUT_PRICE
+                    message: Category Terrace has no price.
+                    block_id: null
+                    block_code: null
+                    category_id: 9
+                    category_name: Terrace
+                    seat_count: null
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/publish:
+    post:
+      operationId: publishEvent
+      tags: [AdminEvents]
+      summary: Publish an event and put its seats on sale
+      description: |
+        **Role:** ORGANISER, ADMIN. Creates one inventory row per active seat and moves the
+        event from `DRAFT` to `PUBLISHED` (or straight to `ON_SALE` when `sales_open_at`
+        has passed). No request body.
+
+        Safe to repeat: publishing an event that is already `PUBLISHED`, `ON_SALE` or
+        `SOLD_OUT` changes nothing and answers 200 with `already_published: true`.
+
+        If the event is not ready the answer is 409 `EVENT_NOT_READY` and
+        `details.problems` is the same list as the readiness endpoint.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Published (now or earlier).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublishResult' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `EVENT_NOT_READY` - see `details.problems`.
+            - `INVALID_STATE_TRANSITION` - the event is `CANCELLED` or `COMPLETED`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: EVENT_NOT_READY
+                  message: This event cannot be published yet. 1 thing is missing.
+                  details:
+                    problems:
+                      - code: SALES_WINDOW_MISSING
+                        message: Set when ticket sales open and close.
+                        block_id: null
+                        block_code: null
+                        category_id: null
+                        category_name: null
+                        seat_count: null
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/cancel:
+    post:
+      operationId: cancelEvent
+      tags: [AdminEvents]
+      summary: Cancel an event, void its tickets and queue refunds
+      description: |
+        **Role:** ORGANISER, ADMIN. Moves the event to `CANCELLED`, releases every hold,
+        marks every ticket `VOID`, expires unpaid bookings and queues one refund per
+        successful payment. No request body. Safe to repeat: cancelling a `CANCELLED`
+        event answers 200 with zero counts.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: Cancelled.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CancelResult' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`INVALID_STATE_TRANSITION` - a `COMPLETED` event cannot be cancelled.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/categories:
+    get:
+      operationId: listAdminEventCategories
+      tags: [AdminEvents]
+      summary: An event's categories, any event status
+      description: '**Role:** ORGANISER, ADMIN. Not paged.'
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The categories.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CategoryList' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+    post:
+      operationId: createCategory
+      tags: [AdminEvents]
+      summary: Add a category to an event
+      description: '**Role:** ORGANISER, ADMIN. The name is unique within the event.'
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateCategory' }
+            example: { name: VIP, price_cents: 250000, color_hex: '#C9A227', description: 'West stand, padded seats' }
+      responses:
+        '201':
+          description: The new category.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`ALREADY_EXISTS` (name taken) or `EVENT_NOT_EDITABLE` (event is `CANCELLED` or `COMPLETED`).'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/categories/{categoryId}:
+    patch:
+      operationId: updateCategory
+      tags: [AdminEvents]
+      summary: Rename, recolour or reprice a category
+      description: |
+        **Role:** ORGANISER, ADMIN. Send only the fields to change.
+
+        Changing `price_cents` once the event has any held or sold seat needs
+        `confirm: true`; without it the answer is 409 `CONFIRMATION_REQUIRED` and nothing
+        changes. Past bookings always keep the price they were made at.
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateCategory' }
+            example: { price_cents: 300000, confirm: true }
+      responses:
+        '200':
+          description: The updated category.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Category' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `CONFIRMATION_REQUIRED` - sales have started; resend with `confirm: true`. `details` has the sold and held counts.
+            - `ALREADY_EXISTS` - name taken.
+            - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                error:
+                  code: CONFIRMATION_REQUIRED
+                  message: 1,240 tickets are already sold or held in VIP. They keep the old price.
+                  details: { sold: 1200, held: 40 }
+        '500': { $ref: '#/components/responses/Internal' }
+    delete:
+      operationId: deleteCategory
+      tags: [AdminEvents]
+      summary: Delete a category
+      description: |
+        **Role:** ORGANISER, ADMIN. Removes the category and its block and row
+        assignments. Refused once the event is published, because inventory points at it.
+      parameters:
+        - $ref: '#/components/parameters/CategoryId'
+      responses:
+        '204':
+          description: Deleted.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`CATEGORY_IN_USE` - the event has inventory or bookings in this category.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/assignments:
+    get:
+      operationId: getEventAssignments
+      tags: [AdminEvents]
+      summary: Which category each block and row is painted with
+      description: |
+        **Role:** ORGANISER, ADMIN. A seat's category is its row's override if there is
+        one, otherwise its block's. Blocks and rows with no entry are unpainted.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '200':
+          description: The assignments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/assign-category:
+    post:
+      operationId: assignCategory
+      tags: [AdminEvents]
+      summary: Paint blocks and rows with a category
+      description: |
+        **Role:** ORGANISER, ADMIN. Sets the category of every listed block and the
+        override of every listed row in one transaction. `category_id: null` clears them
+        instead. At least one of `block_ids` and `row_ids` must be non-empty.
+
+        Only while the event is `DRAFT`: publish copies the painting into inventory.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AssignCategory' }
+            example: { category_id: 8, block_ids: [140, 141], row_ids: [] }
+      responses:
+        '200':
+          description: The event's assignments after the change.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Assignments' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such event, or the category is not part of it.'
+          content: *err
+        '409':
+          description: '`EVENT_NOT_EDITABLE` - the event is no longer `DRAFT`.'
+          content: *err
+        '422':
+          description: '`VENUE_MISMATCH` - a block or row is not at the event''s venue; `details.fields` names them.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Admin: sales
+  # ---------------------------------------------------------------------------
+  /admin/events/{eventId}/sales:
+    get:
+      operationId: getEventSales
+      tags: [AdminSales]
+      summary: Live sales figures for an event
+      description: |
+        **Role:** ORGANISER, ADMIN. One call feeds the whole dashboard: totals,
+        per-category rows, a per-block heatmap, a time series of paid bookings and the
+        count of bookings waiting for a refund. Cheap enough to poll every few seconds.
+
+        Revenue counts `PAID` bookings only.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: bucket
+          in: query
+          description: Width of each time-series bucket.
+          schema: { $ref: '#/components/schemas/SalesBucket' }
+        - name: from
+          in: query
+          description: Start of the time series. Defaults to the first paid booking.
+          schema: { type: string, format: date-time }
+        - name: to
+          in: query
+          description: End of the time series. Defaults to now.
+          schema: { type: string, format: date-time }
+      responses:
+        '200':
+          description: The sales summary.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SalesSummary' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/events/{eventId}/bookings:
+    get:
+      operationId: listEventBookings
+      tags: [AdminSales]
+      summary: Bookings for an event
+      description: |
+        **Role:** ORGANISER, ADMIN. Newest first. `status=REFUND_REQUIRED` gives the list
+        the dashboard pins to the top.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/BookingStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of bookings.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminBookingPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/alerts:
+    get:
+      operationId: listAlerts
+      tags: [AdminSales]
+      summary: Things an organiser has to act on
+      description: '**Role:** ORGANISER, ADMIN. Newest first.'
+      parameters:
+        - name: event_id
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - name: acknowledged
+          in: query
+          description: '`false` for open alerts only, `true` for acknowledged only. Omit for both.'
+          schema: { type: boolean }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of alerts.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AlertPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/alerts/{alertId}/ack:
+    post:
+      operationId: ackAlert
+      tags: [AdminSales]
+      summary: Mark an alert as seen
+      description: '**Role:** ORGANISER, ADMIN. No request body. Safe to repeat; the first acknowledgement time is kept.'
+      parameters:
+        - $ref: '#/components/parameters/AlertId'
+      responses:
+        '200':
+          description: The alert.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Alert' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/refunds:
+    get:
+      operationId: listRefunds
+      tags: [AdminSales]
+      summary: The refund queue
+      description: |
+        **Role:** ORGANISER, ADMIN. Oldest first, so the longest-waiting fan is on top.
+        Refunds are paid by hand in the M-Pesa portal; this list is what to pay.
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/RefundStatus' }
+        - name: event_id
+          in: query
+          schema: { $ref: '#/components/schemas/Id' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of refunds.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RefundPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/refunds/{refundId}/complete:
+    post:
+      operationId: completeRefund
+      tags: [AdminSales]
+      summary: Record that a refund was paid
+      description: |
+        **Role:** ORGANISER, ADMIN. No request body. Marks the refund `DONE`; when a
+        booking has no refund left pending it becomes `REFUNDED`. This records the fact,
+        it does not move money. Safe to repeat.
+      parameters:
+        - $ref: '#/components/parameters/RefundId'
+      responses:
+        '200':
+          description: The refund.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Refund' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Admin: staff and invitations
+  # ---------------------------------------------------------------------------
+  /admin/users:
+    get:
+      operationId: listStaffUsers
+      tags: [AdminUsers]
+      summary: Staff accounts
+      description: '**Role:** ADMIN. Users with role `ORGANISER` or `ADMIN`, by name.'
+      parameters:
+        - name: role
+          in: query
+          schema: { $ref: '#/components/schemas/StaffRole' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of staff.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StaffUserPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/invitations:
+    get:
+      operationId: listInvitations
+      tags: [AdminUsers]
+      summary: Invitations sent
+      description: '**Role:** ADMIN. Newest first. `invite_url` is always null here.'
+      parameters:
+        - name: status
+          in: query
+          schema: { $ref: '#/components/schemas/InvitationStatus' }
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: One page of invitations.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/InvitationPage' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+    post:
+      operationId: createInvitation
+      tags: [AdminUsers]
+      summary: Invite a member of staff by email
+      description: |
+        **Role:** ADMIN. Emails the invitee a one-time link to set their password.
+
+        `invite_url` in the answer contains the one-time token. It is returned **only**
+        here and by `resend`, so the admin can copy the link when no mail provider is
+        configured. Only a hash of the token is stored; the link cannot be shown again.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateInvitation' }
+            example: { email: new.organiser@talanta.test, role: ORGANISER }
+      responses:
+        '201':
+          description: The invitation, with its `invite_url`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invitation' }
+              example:
+                id: 31
+                email: new.organiser@talanta.test
+                role: ORGANISER
+                status: PENDING
+                invited_by: { id: 2, name: Site Admin, email: admin@talanta.test }
+                expires_at: '2026-10-18T09:00:00Z'
+                created_at: '2026-10-11T09:00:00Z'
+                accepted_at: null
+                invite_url: https://talanta.vendorsoko.com/invite/4f9c0d6b1e7a43c2b8d5a1f0e3c7b9d24f9c0d6b1e7a43c2b8d5a1f0e3c7b9d2
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '409':
+          description: |
+            - `EMAIL_ALREADY_REGISTERED` - a user with this email exists.
+            - `INVITATION_ALREADY_PENDING` - an unexpired invitation for this email exists; resend or revoke it.
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/invitations/{invitationId}/resend:
+    post:
+      operationId: resendInvitation
+      tags: [AdminUsers]
+      summary: Send an invitation again with a new link
+      description: |
+        **Role:** ADMIN. No request body. Makes a new token and a new expiry; the old link
+        stops working. Works on `PENDING` and `EXPIRED` invitations (an expired one becomes
+        `PENDING` again). The answer carries the new `invite_url`.
+      parameters:
+        - $ref: '#/components/parameters/InvitationId'
+      responses:
+        '200':
+          description: The invitation, with its new `invite_url`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Invitation' }
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`INVITATION_NOT_PENDING` (already `ACCEPTED` or `REVOKED`) or `EMAIL_ALREADY_REGISTERED`.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /admin/invitations/{invitationId}:
+    delete:
+      operationId: revokeInvitation
+      tags: [AdminUsers]
+      summary: Revoke an invitation
+      description: '**Role:** ADMIN. The link stops working. Safe to repeat on a `REVOKED` invitation.'
+      parameters:
+        - $ref: '#/components/parameters/InvitationId'
+      responses:
+        '204':
+          description: Revoked (or already was).
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`INVITATION_NOT_PENDING` - it was already `ACCEPTED`; the account exists.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+  # ---------------------------------------------------------------------------
+  # Gate
+  # ---------------------------------------------------------------------------
+  /gate/events:
+    get:
+      operationId: listGateEvents
+      tags: [Gate]
+      summary: Events a gate device can scan for
+      description: |
+        **Role:** GATE_STAFF, ADMIN. Published events whose kickoff is within the last day
+        or still ahead, soonest first, each with its gate groups. Not paged.
+      responses:
+        '200':
+          description: The events.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GateEventList' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /gate/events/{eventId}/manifest:
+    get:
+      operationId: getGateManifest
+      tags: [Gate]
+      summary: Everything a device needs to check tickets offline
+      description: |
+        **Role:** GATE_STAFF, ADMIN. The Ed25519 public key(s), the event, and every
+        ticket as a 3-item tuple `[ticket_id, gate_group_index, status_code]`.
+
+        **Without `since`** (`full: true`): every ticket that is `VALID` or `USED`. The
+        device replaces its stored set.
+
+        **With `since=<version>`** (`full: false`): only tickets that changed after that
+        version, in any status, including ones that became `VOID`. The device applies them
+        on top of what it has. If the version is unreadable or too old the server answers
+        `full: true` instead; always check `full`.
+
+        `version` is an opaque string. Send with `Accept-Encoding: gzip`; a full stadium
+        is about 60,000 tuples.
+
+        The private signing key is never in this or any other answer.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+        - name: since
+          in: query
+          description: The `version` from the manifest the device already has.
+          schema: { type: string, minLength: 1, maxLength: 128 }
+      responses:
+        '200':
+          description: The manifest, full or changes only.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/GateManifest' }
+              example:
+                event:
+                  id: 1
+                  title: Harambee Stars vs Uganda Cranes
+                  kickoff_at: '2026-11-14T13:00:00Z'
+                  gates_open_at: '2026-11-14T10:00:00Z'
+                  status: ON_SALE
+                  venue_name: Talanta Stadium
+                version: 'MTc2MDE3NzAwMDAwMDAwMA'
+                full: true
+                generated_at: '2026-10-11T10:30:00Z'
+                keys:
+                  - key_id: k1
+                    algorithm: Ed25519
+                    public_key: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+                gate_groups: [N-LOWER, N-UPPER, W-LOWER]
+                ticket_count: 3
+                tickets:
+                  - ['0b0f3a52-7c1e-4d7e-9a57-0c1b4d5e6f70', 0, V]
+                  - ['5e2d9c1a-3b4f-4a6d-8e7f-1a2b3c4d5e6f', 0, U]
+                  - ['c7a1e2f3-4b5c-4d6e-8f70-9a8b7c6d5e4f', 2, V]
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500': { $ref: '#/components/responses/Internal' }
+
+  /gate/scans:
+    post:
+      operationId: uploadScans
+      tags: [Gate]
+      summary: Upload a batch of scans made at the gate
+      description: |
+        **Role:** GATE_STAFF, ADMIN. Up to 500 scans per call, from one device. Each scan
+        carries a UUID made on the device (`client_scan_id`); a scan that was already
+        uploaded is not stored again and gets the same answer as the first time, so the
+        device can resend a batch whenever it is unsure.
+
+        The server decides the final result of each scan, which may differ from what the
+        device showed offline:
+
+        - The earliest `ADMITTED` scan of a ticket (by `scanned_at`) wins and marks the
+          ticket `USED`. Every other admit of that ticket becomes `DUPLICATE`.
+        - A ticket the server does not know, a void ticket, or a `token` that fails
+          signature checking is `INVALID`.
+        - A ticket for another event is `WRONG_EVENT`; for another gate group, `WRONG_GATE`.
+
+        `overridden` is true where the final result differs from the device's verdict:
+        those are the scans this device lost.
+
+        A QR that could not be read as a ticket ID at all is not uploaded.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ScanBatch' }
+            example:
+              device_id: gate-phone-07
+              scans:
+                - client_scan_id: 6f1c2d3e-4a5b-4c6d-8e7f-809a1b2c3d4e
+                  ticket_id: 0b0f3a52-7c1e-4d7e-9a57-0c1b4d5e6f70
+                  event_id: 1
+                  gate_group: N-LOWER
+                  scanned_at: '2026-11-14T11:02:17Z'
+                  result: ADMITTED
+                  token: TLT1.CwvzpSfB5NfnmlcMG01eb3AAAAAAAAABAE4tTE9XRVKq3Q.b2s4c2lnbmF0dXJl
+                - client_scan_id: 7a2d3e4f-5b6c-4d7e-9f80-91ab2c3d4e5f
+                  ticket_id: 5e2d9c1a-3b4f-4a6d-8e7f-1a2b3c4d5e6f
+                  event_id: 1
+                  gate_group: N-LOWER
+                  scanned_at: '2026-11-14T11:02:41Z'
+                  result: ADMITTED
+      responses:
+        '200':
+          description: One result per uploaded scan, in the same order.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScanBatchResult' }
+              example:
+                results:
+                  - client_scan_id: 6f1c2d3e-4a5b-4c6d-8e7f-809a1b2c3d4e
+                    ticket_id: 0b0f3a52-7c1e-4d7e-9a57-0c1b4d5e6f70
+                    result: ADMITTED
+                    overridden: false
+                    ticket_status: USED
+                    first_admitted_at: '2026-11-14T11:02:17Z'
+                  - client_scan_id: 7a2d3e4f-5b6c-4d7e-9f80-91ab2c3d4e5f
+                    ticket_id: 5e2d9c1a-3b4f-4a6d-8e7f-1a2b3c4d5e6f
+                    result: DUPLICATE
+                    overridden: true
+                    ticket_status: USED
+                    first_admitted_at: '2026-11-14T10:58:03Z'
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '413':
+          description: '`PAYLOAD_TOO_LARGE` - split the batch.'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: The `access_token` from a sign-in or refresh. Lives 15 minutes.
+
+  headers:
+    RetryAfter:
+      description: Seconds to wait before trying again.
+      schema: { type: integer, minimum: 1 }
+
+  parameters:
+    EventId:
+      name: eventId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    StandId:
+      name: standId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    BlockId:
+      name: blockId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    VenueId:
+      name: venueId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    CategoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    HoldId:
+      name: holdId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    PaymentId:
+      name: paymentId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    AlertId:
+      name: alertId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    RefundId:
+      name: refundId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    InvitationId:
+      name: invitationId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
+    InvitationToken:
+      name: token
+      in: path
+      required: true
+      description: The one-time token from the invitation link.
+      schema: { type: string, pattern: '^[A-Za-z0-9_-]{32,128}$' }
+    TicketId:
+      name: ticketId
+      in: path
+      required: true
+      schema: { type: string, format: uuid }
+    BookingReference:
+      name: reference
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/BookingReference' }
+    Limit:
+      name: limit
+      in: query
+      description: Page size.
+      schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` from the previous page. Opaque.
+      schema: { type: string, minLength: 1, maxLength: 256 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: |
+        A value the client makes once per checkout (a UUID is ideal) and resends on every
+        retry of the same request. Scoped to the signed-in user.
+      schema: { type: string, minLength: 8, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+      example: 3f6c1c0e-8a4b-4f0e-9b7e-2d1a5c6e7f80
+    MockOutcome:
+      name: X-Mock-Outcome
+      in: header
+      required: false
+      description: |
+        **Dev only.** Chooses what the mock payment provider does. Omitted means
+        `success`. Refused with 403 `MOCK_NOT_ALLOWED` when `APP_ENV=production`.
+      schema: { $ref: '#/components/schemas/MockOutcome' }
+
+  responses:
+    ValidationFailed:
+      description: '`VALIDATION_FAILED` - the body, a query value or a path value is malformed. `details.fields` has one entry per bad field.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: VALIDATION_FAILED
+              message: Some fields are not valid.
+              details:
+                fields:
+                  - { field: phone, rule: e164, message: 'Enter the phone number in international format, for example +254712345678.' }
+    Unauthorized:
+      description: '`UNAUTHENTICATED` (no token, or a bad one) or `TOKEN_EXPIRED` (refresh, then retry once).'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: TOKEN_EXPIRED, message: Your session has expired., details: null }
+    Forbidden:
+      description: '`FORBIDDEN` - signed in, but this role may not call this.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: FORBIDDEN, message: You do not have access to this., details: null }
+    NotFound:
+      description: '`NOT_FOUND` - no such thing, or it is not the caller''s to see.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: NOT_FOUND, message: We could not find that., details: null }
+    TooManyRequests:
+      description: '`RATE_LIMITED` - wait `Retry-After` seconds.'
+      headers:
+        Retry-After: { $ref: '#/components/headers/RetryAfter' }
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error:
+              code: RATE_LIMITED
+              message: Too many requests. Try again in 30 seconds.
+              details: { retry_after_seconds: 30 }
+    Internal:
+      description: '`INTERNAL` - a fault on our side. The message never carries internals; quote the `X-Request-Id` response header when reporting it.'
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            error: { code: INTERNAL, message: Something went wrong on our side., details: null }
+
+  schemas:
+    # -------------------------------------------------------------------------
+    # Primitives and enums
+    # -------------------------------------------------------------------------
+    Id:
+      type: integer
+      format: int64
+      minimum: 1
+    Phone:
+      type: string
+      pattern: '^\+[1-9][0-9]{7,14}$'
+      description: Phone number in E.164 form.
+      examples: ['+254712345678']
+    Currency:
+      type: string
+      enum: [KES]
+    BookingReference:
+      type: string
+      pattern: '^TLT-[A-Z0-9]{6}$'
+      examples: [TLT-8H3K2M]
+    GateGroup:
+      type: string
+      pattern: '^[A-Z0-9]+-(LOWER|UPPER)$'
+      description: '`<stand code>-<tier>`. A ticket may only enter by gates of its group.'
+      examples: [N-LOWER]
+    ColorHex:
+      type: string
+      pattern: '^#[0-9A-Fa-f]{6}$'
+      examples: ['#2E7D32']
+    Point:
+      type: array
+      description: '`[x, y]` in venue plan coordinates (y grows downwards).'
+      prefixItems:
+        - { type: number, description: x }
+        - { type: number, description: y }
+      items: false
+      minItems: 2
+      maxItems: 2
+    Polygon:
+      type: array
+      description: A closed outline; the last point is not repeated.
+      items: { $ref: '#/components/schemas/Point' }
+    Bounds:
+      type: object
+      description: Axis-aligned box in venue plan coordinates.
+      additionalProperties: false
+      required: [min_x, min_y, max_x, max_y]
+      properties:
+        min_x: { type: number }
+        min_y: { type: number }
+        max_x: { type: number }
+        max_y: { type: number }
+    Role:
+      type: string
+      enum: [FAN, ORGANISER, ADMIN, GATE_STAFF]
+    Tier:
+      type: string
+      enum: [LOWER, UPPER]
+    SeatType:
+      type: string
+      enum: [STANDARD, ACCESSIBLE, COMPANION, RESTRICTED_VIEW]
+    EventStatus:
+      type: string
+      enum: [DRAFT, PUBLISHED, ON_SALE, SOLD_OUT, CANCELLED, COMPLETED]
+    PublicEventStatus:
+      type: string
+      description: The statuses the public event list shows.
+      enum: [PUBLISHED, ON_SALE, SOLD_OUT]
+    SeatStatus:
+      type: string
+      description: Inventory status as stored. The seat map sends the one-letter codes instead.
+      enum: [AVAILABLE, HELD, SOLD, BLOCKED]
+    HoldStatus:
+      type: string
+      enum: [ACTIVE, CONVERTED, EXPIRED, RELEASED]
+    BookingStatus:
+      type: string
+      description: |
+        `REFUND_REQUIRED` means money arrived but the seats could not be given (the hold
+        had lapsed and they were resold, or the amount was wrong). No tickets exist; a
+        refund is queued.
+      enum: [PENDING_PAYMENT, PAID, FAILED, EXPIRED, CANCELLED, REFUND_REQUIRED, REFUNDED]
+    PaymentStatus:
+      type: string
+      description: '`INITIATED` and `PENDING` are live; the rest are final.'
+      enum: [INITIATED, PENDING, SUCCESS, FAILED, TIMEOUT, REVERSED]
+    PaymentProvider:
+      type: string
+      enum: [MPESA]
+    PaymentFailureReason:
+      type: string
+      description: Why a payment did not succeed, in a form the app can switch on.
+      enum: [insufficient_funds, wrong_pin, cancelled, timeout, wrong_amount, other]
+    MockOutcome:
+      type: string
+      description: |
+        - `success` - callback arrives, payment succeeds.
+        - `insufficient_funds`, `wrong_pin`, `user_cancel` - callback arrives with that failure.
+        - `timeout` - the fan never answers the prompt; the callback reports a timeout.
+        - `no_callback` - no callback at all; reconciliation finds the (successful) result.
+        - `duplicate_callback` - the success callback is delivered twice.
+        - `late_callback` - the success callback arrives after the hold has expired.
+        - `wrong_amount` - the callback reports a different amount from the booking total.
+      enum: [success, insufficient_funds, wrong_pin, user_cancel, timeout, no_callback, duplicate_callback, late_callback, wrong_amount]
+    TicketStatus:
+      type: string
+      enum: [VALID, USED, VOID, TRANSFERRED]
+    ScanResult:
+      type: string
+      enum: [ADMITTED, DUPLICATE, INVALID, WRONG_EVENT, WRONG_GATE]
+    RefundStatus:
+      type: string
+      enum: [PENDING, DONE]
+    AlertKind:
+      type: string
+      enum: [REFUND_REQUIRED, AMOUNT_MISMATCH, PAYMENT_UNRESOLVED]
+    NumberingDirection:
+      type: string
+      description: Which end of a row seat 1 is at, looking from the pitch along the block's local x axis.
+      enum: [LTR, RTL]
+    RowLabelScheme:
+      type: string
+      description: '`ALPHA`: A to Z, then AA, AB and so on. `NUMERIC`: 1, 2, 3 and so on. Front row first.'
+      enum: [ALPHA, NUMERIC]
+    SalesBucket:
+      type: string
+      enum: [hour, day]
+      default: hour
+
+    # -------------------------------------------------------------------------
+    # Errors
+    # -------------------------------------------------------------------------
+    ErrorCode:
+      type: string
+      description: Every code the API can return. See `docs/API_NOTES.md` for status and meaning.
+      enum:
+        - VALIDATION_FAILED
+        - IDEMPOTENCY_KEY_REQUIRED
+        - UNAUTHENTICATED
+        - TOKEN_EXPIRED
+        - OTP_INVALID
+        - OTP_EXPIRED
+        - INVALID_CREDENTIALS
+        - MFA_TOKEN_INVALID
+        - TOTP_INVALID
+        - REFRESH_TOKEN_INVALID
+        - REFRESH_TOKEN_REUSED
+        - FORBIDDEN
+        - MOCK_NOT_ALLOWED
+        - NOT_FOUND
+        - INVITATION_INVALID
+        - INVITATION_EXPIRED
+        - SEATS_UNAVAILABLE
+        - NO_ADJACENT_SEATS
+        - EVENT_NOT_ON_SALE
+        - SALES_NOT_OPEN
+        - SALES_CLOSED
+        - HOLD_EXPIRED
+        - HOLD_NOT_ACTIVE
+        - HOLD_ALREADY_BOOKED
+        - BOOKING_NOT_PAYABLE
+        - PAYMENT_IN_PROGRESS
+        - EVENT_NOT_READY
+        - INVALID_STATE_TRANSITION
+        - EVENT_NOT_EDITABLE
+        - BLOCK_HAS_INVENTORY
+        - CATEGORY_IN_USE
+        - CONFIRMATION_REQUIRED
+        - ALREADY_EXISTS
+        - EMAIL_ALREADY_REGISTERED
+        - INVITATION_ALREADY_PENDING
+        - INVITATION_NOT_PENDING
+        - TOTP_ALREADY_ENABLED
+        - TOTP_NOT_ENABLED
+        - TOTP_SETUP_REQUIRED
+        - PAYLOAD_TOO_LARGE
+        - TICKET_LIMIT_EXCEEDED
+        - IDEMPOTENCY_KEY_REUSED
+        - VENUE_MISMATCH
+        - PASSWORD_INCORRECT
+        - TOTP_CODE_INCORRECT
+        - RATE_LIMITED
+        - OTP_ATTEMPTS_EXCEEDED
+        - INTERNAL
+        - PAYMENT_PROVIDER_UNAVAILABLE
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message, details]
+          properties:
+            code: { $ref: '#/components/schemas/ErrorCode' }
+            message:
+              type: string
+              description: Plain English, safe to show to the user.
+            details:
+              description: Null, or an object whose shape is fixed by `code`.
+              anyOf:
+                - { type: 'null' }
+                - { $ref: '#/components/schemas/ValidationDetails' }
+                - { $ref: '#/components/schemas/SeatsUnavailableDetails' }
+                - { $ref: '#/components/schemas/TicketLimitDetails' }
+                - { $ref: '#/components/schemas/SalesWindowDetails' }
+                - { $ref: '#/components/schemas/NoAdjacentSeatsDetails' }
+                - { $ref: '#/components/schemas/HoldStateDetails' }
+                - { $ref: '#/components/schemas/BookingStateDetails' }
+                - { $ref: '#/components/schemas/PaymentInProgressDetails' }
+                - { $ref: '#/components/schemas/NotReadyDetails' }
+                - { $ref: '#/components/schemas/EventStateDetails' }
+                - { $ref: '#/components/schemas/SalesStartedDetails' }
+                - { $ref: '#/components/schemas/InventoryDetails' }
+                - { $ref: '#/components/schemas/RateLimitDetails' }
+    ValidationDetails:
+      type: object
+      description: For `VALIDATION_FAILED`, `IDEMPOTENCY_KEY_REQUIRED`, `ALREADY_EXISTS`, `VENUE_MISMATCH`.
+      additionalProperties: false
+      required: [fields]
+      properties:
+        fields:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [field, rule, message]
+            properties:
+              field:
+                type: string
+                description: JSON path of the field in the request (`seat_ids[2]`), or the query, path or header name.
+              rule:
+                type: string
+                description: The rule that failed, for example `required`, `e164`, `min`, `max`, `unique`.
+              message:
+                type: string
+                description: Plain English, to show next to the field.
+    SeatsUnavailableDetails:
+      type: object
+      description: For `SEATS_UNAVAILABLE`.
+      additionalProperties: false
+      required: [unavailable_seat_ids]
+      properties:
+        unavailable_seat_ids:
+          type: array
+          description: The event seat IDs from the request that could not be held.
+          items: { $ref: '#/components/schemas/Id' }
+    TicketLimitDetails:
+      type: object
+      description: For `TICKET_LIMIT_EXCEEDED`.
+      additionalProperties: false
+      required: [allowed, held_or_bought, requested, remaining]
+      properties:
+        allowed: { type: integer, description: The event's `max_tickets_per_user`. }
+        held_or_bought: { type: integer, description: Seats in the caller's active holds plus paid bookings. }
+        requested: { type: integer }
+        remaining: { type: integer, minimum: 0, description: How many more the caller may hold now. }
+    SalesWindowDetails:
+      type: object
+      description: For `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN`, `SALES_CLOSED`.
+      additionalProperties: false
+      required: [event_status, sales_open_at, sales_close_at]
+      properties:
+        event_status: { $ref: '#/components/schemas/EventStatus' }
+        sales_open_at: { type: [string, 'null'], format: date-time }
+        sales_close_at: { type: [string, 'null'], format: date-time }
+    NoAdjacentSeatsDetails:
+      type: object
+      description: For `NO_ADJACENT_SEATS`.
+      additionalProperties: false
+      required: [category_id, quantity, available]
+      properties:
+        category_id: { $ref: '#/components/schemas/Id' }
+        quantity: { type: integer }
+        available: { type: integer, description: 'Seats still available in the category, together or not.' }
+    HoldStateDetails:
+      type: object
+      description: For `HOLD_EXPIRED`, `HOLD_NOT_ACTIVE`.
+      additionalProperties: false
+      required: [hold_id, hold_status, expires_at]
+      properties:
+        hold_id: { $ref: '#/components/schemas/Id' }
+        hold_status: { $ref: '#/components/schemas/HoldStatus' }
+        expires_at: { type: string, format: date-time }
+    BookingStateDetails:
+      type: object
+      description: For `BOOKING_NOT_PAYABLE`, `HOLD_ALREADY_BOOKED`.
+      additionalProperties: false
+      required: [booking_reference, booking_status]
+      properties:
+        booking_reference: { $ref: '#/components/schemas/BookingReference' }
+        booking_status: { $ref: '#/components/schemas/BookingStatus' }
+    PaymentInProgressDetails:
+      type: object
+      description: For `PAYMENT_IN_PROGRESS`.
+      additionalProperties: false
+      required: [payment_id, payment_status]
+      properties:
+        payment_id: { $ref: '#/components/schemas/Id' }
+        payment_status: { $ref: '#/components/schemas/PaymentStatus' }
+    NotReadyDetails:
+      type: object
+      description: For `EVENT_NOT_READY`.
+      additionalProperties: false
+      required: [problems]
+      properties:
+        problems:
+          type: array
+          items: { $ref: '#/components/schemas/ReadinessProblem' }
+    EventStateDetails:
+      type: object
+      description: For `INVALID_STATE_TRANSITION`, `EVENT_NOT_EDITABLE`.
+      additionalProperties: false
+      required: [current_status]
+      properties:
+        current_status: { $ref: '#/components/schemas/EventStatus' }
+    SalesStartedDetails:
+      type: object
+      description: For `CONFIRMATION_REQUIRED`, `CATEGORY_IN_USE`.
+      additionalProperties: false
+      required: [sold, held]
+      properties:
+        sold: { type: integer }
+        held: { type: integer }
+    InventoryDetails:
+      type: object
+      description: For `BLOCK_HAS_INVENTORY`.
+      additionalProperties: false
+      required: [event_ids]
+      properties:
+        event_ids:
+          type: array
+          items: { $ref: '#/components/schemas/Id' }
+    RateLimitDetails:
+      type: object
+      description: For `RATE_LIMITED`, `OTP_ATTEMPTS_EXCEEDED`.
+      additionalProperties: false
+      required: [retry_after_seconds]
+      properties:
+        retry_after_seconds: { type: integer, minimum: 0 }
+
+    # -------------------------------------------------------------------------
+    # Health, auth, users
+    # -------------------------------------------------------------------------
+    Health:
+      type: object
+      additionalProperties: false
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+    OtpRequest:
+      type: object
+      additionalProperties: false
+      required: [phone]
+      properties:
+        phone: { $ref: '#/components/schemas/Phone' }
+    OtpRequested:
+      type: object
+      additionalProperties: false
+      required: [expires_in_seconds, resend_after_seconds]
+      properties:
+        expires_in_seconds: { type: integer, description: How long the code is good for. }
+        resend_after_seconds: { type: integer, description: How long before another code may be requested for this phone. }
+        dev_code:
+          type: string
+          pattern: '^[0-9]{6}$'
+          description: The code itself. **Only outside production**; absent when `APP_ENV=production`.
+    OtpVerify:
+      type: object
+      additionalProperties: false
+      required: [phone, code]
+      properties:
+        phone: { $ref: '#/components/schemas/Phone' }
+        code: { type: string, pattern: '^[0-9]{6}$' }
+    PasswordLogin:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        password: { type: string, minLength: 1, maxLength: 256 }
+    LoginResult:
+      description: Answer of `POST /auth/login`. Switch on `mfa_required`.
+      oneOf:
+        - $ref: '#/components/schemas/LoginSession'
+        - $ref: '#/components/schemas/MfaChallenge'
+    LoginSession:
+      type: object
+      description: 'The same fields as `AuthSession`, plus `mfa_required: false`.'
+      additionalProperties: false
+      required: [mfa_required, access_token, token_type, expires_in_seconds, refresh_token, refresh_expires_at, user]
+      properties:
+        mfa_required:
+          type: boolean
+          enum: [false]
+        access_token: { type: string }
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in_seconds: { type: integer }
+        refresh_token: { type: string }
+        refresh_expires_at: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+    MfaChallenge:
+      type: object
+      additionalProperties: false
+      required: [mfa_required, mfa_token, expires_in_seconds]
+      properties:
+        mfa_required:
+          type: boolean
+          enum: [true]
+        mfa_token:
+          type: string
+          description: Only accepted by `POST /auth/totp/verify`. Never a bearer token.
+        expires_in_seconds: { type: integer }
+    TotpVerify:
+      type: object
+      additionalProperties: false
+      required: [mfa_token, code]
+      properties:
+        mfa_token: { type: string, minLength: 1 }
+        code: { type: string, pattern: '^[0-9]{6}$' }
+    RefreshRequest:
+      type: object
+      additionalProperties: false
+      required: [refresh_token]
+      properties:
+        refresh_token: { type: string, minLength: 1, maxLength: 512 }
+    AuthSession:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type, expires_in_seconds, refresh_token, refresh_expires_at, user]
+      properties:
+        access_token: { type: string, description: JWT. Send as `Authorization` `Bearer`. }
+        token_type:
+          type: string
+          enum: [Bearer]
+        expires_in_seconds: { type: integer, description: Life of the access token (900). }
+        refresh_token: { type: string, description: Opaque. Works once; keep it in secure storage. }
+        refresh_expires_at: { type: string, format: date-time }
+        user: { $ref: '#/components/schemas/User' }
+      example:
+        access_token: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiI0MiJ9.c2ln
+        token_type: Bearer
+        expires_in_seconds: 900
+        refresh_token: rt_5Jq0m1Zb2Xc3Vd4Ne5Mf6Lg7Kh8Ji9
+        refresh_expires_at: '2026-11-10T09:00:00Z'
+        user:
+          id: 42
+          phone: '+254712345678'
+          email: null
+          name: null
+          role: FAN
+          totp_enabled: false
+          created_at: '2026-10-11T09:00:00Z'
+    User:
+      type: object
+      additionalProperties: false
+      required: [id, phone, email, name, role, totp_enabled, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        phone:
+          description: Null for staff accounts that sign in by email.
+          anyOf:
+            - { $ref: '#/components/schemas/Phone' }
+            - { type: 'null' }
+        email: { type: [string, 'null'], format: email }
+        name: { type: [string, 'null'], description: Null until the user sets one. }
+        role: { $ref: '#/components/schemas/Role' }
+        totp_enabled: { type: boolean, description: Whether sign-in asks for a TOTP code. Always false for phone accounts. }
+        created_at: { type: string, format: date-time }
+    UpdateMe:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+
+    Password:
+      type: string
+      minLength: 10
+      maxLength: 256
+      description: At least 10 characters.
+    ChangePassword:
+      type: object
+      additionalProperties: false
+      required: [current_password, new_password]
+      properties:
+        current_password: { type: string, minLength: 1, maxLength: 256 }
+        new_password: { $ref: '#/components/schemas/Password' }
+    PasswordConfirm:
+      type: object
+      additionalProperties: false
+      required: [password]
+      properties:
+        password: { type: string, minLength: 1, maxLength: 256 }
+    TotpCode:
+      type: object
+      additionalProperties: false
+      required: [code]
+      properties:
+        code: { type: string, pattern: '^[0-9]{6}$' }
+    TotpSetup:
+      type: object
+      additionalProperties: false
+      required: [secret, otpauth_url]
+      properties:
+        secret: { type: string, description: 'Base32 secret, for typing into an authenticator by hand. Shown once.' }
+        otpauth_url: { type: string, description: The `otpauth://totp/...` URL to draw as a QR code. }
+    StaffRole:
+      type: string
+      enum: [ORGANISER, ADMIN]
+    InvitationStatus:
+      type: string
+      enum: [PENDING, ACCEPTED, EXPIRED, REVOKED]
+    CreateInvitation:
+      type: object
+      additionalProperties: false
+      required: [email, role]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+        role: { $ref: '#/components/schemas/StaffRole' }
+    Invitation:
+      type: object
+      additionalProperties: false
+      required: [id, email, role, status, invited_by, expires_at, created_at, accepted_at, invite_url]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/StaffRole' }
+        status: { $ref: '#/components/schemas/InvitationStatus' }
+        invited_by:
+          type: object
+          additionalProperties: false
+          required: [id, name, email]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            name: { type: [string, 'null'] }
+            email: { type: [string, 'null'], format: email }
+        expires_at: { type: string, format: date-time }
+        created_at: { type: string, format: date-time }
+        accepted_at: { type: [string, 'null'], format: date-time }
+        invite_url:
+          type: [string, 'null']
+          format: uri
+          description: |
+            The link to send to the invitee; it contains the one-time token. Set only in
+            the answers of create and resend. Null everywhere else: the server keeps only a
+            hash of the token.
+    InvitationPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Invitation' }
+        next_cursor: { type: [string, 'null'] }
+    InvitationPreview:
+      type: object
+      additionalProperties: false
+      required: [email, role, expires_at]
+      properties:
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/StaffRole' }
+        expires_at: { type: string, format: date-time }
+    AcceptInvitation:
+      type: object
+      additionalProperties: false
+      required: [name, password]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 100 }
+        password: { $ref: '#/components/schemas/Password' }
+    StaffUser:
+      type: object
+      additionalProperties: false
+      required: [id, name, email, role, totp_enabled, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: [string, 'null'] }
+        email: { type: string, format: email }
+        role: { $ref: '#/components/schemas/StaffRole' }
+        totp_enabled: { type: boolean }
+        created_at: { type: string, format: date-time }
+    StaffUserPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/StaffUser' }
+        next_cursor: { type: [string, 'null'] }
+
+    # -------------------------------------------------------------------------
+    # Events and categories
+    # -------------------------------------------------------------------------
+    EventSummary:
+      type: object
+      description: The few event fields carried inside bookings and tickets.
+      additionalProperties: false
+      required: [id, title, competition, home_team, away_team, kickoff_at, gates_open_at, venue_name, poster_url, status]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        title: { type: string }
+        competition: { type: [string, 'null'] }
+        home_team: { type: [string, 'null'] }
+        away_team: { type: [string, 'null'] }
+        kickoff_at: { type: string, format: date-time }
+        gates_open_at: { type: [string, 'null'], format: date-time }
+        venue_name: { type: string }
+        poster_url: { type: [string, 'null'], format: uri }
+        status: { $ref: '#/components/schemas/EventStatus' }
+    Event:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - venue_id
+        - venue_name
+        - title
+        - competition
+        - home_team
+        - away_team
+        - kickoff_at
+        - gates_open_at
+        - poster_url
+        - status
+        - sales_open_at
+        - sales_close_at
+        - max_tickets_per_user
+        - currency
+        - price_from_cents
+        - seats_available
+        - seats_total
+        - published_at
+        - created_at
+        - updated_at
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        venue_id: { $ref: '#/components/schemas/Id' }
+        venue_name: { type: string }
+        title: { type: string }
+        competition: { type: [string, 'null'] }
+        home_team: { type: [string, 'null'] }
+        away_team: { type: [string, 'null'] }
+        kickoff_at: { type: string, format: date-time }
+        gates_open_at: { type: [string, 'null'], format: date-time }
+        poster_url: { type: [string, 'null'], format: uri }
+        status: { $ref: '#/components/schemas/EventStatus' }
+        sales_open_at: { type: [string, 'null'], format: date-time }
+        sales_close_at: { type: [string, 'null'], format: date-time }
+        max_tickets_per_user: { type: integer, minimum: 1 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        price_from_cents:
+          type: [integer, 'null']
+          format: int64
+          description: Cheapest seat available now. Null when none is, or before publish.
+        seats_available: { type: integer, description: Zero before publish. }
+        seats_total: { type: integer, description: Inventory rows for the event. Zero before publish. }
+        published_at: { type: [string, 'null'], format: date-time }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    EventPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Event' }
+        next_cursor: { type: [string, 'null'] }
+    CreateEvent:
+      type: object
+      additionalProperties: false
+      required: [venue_id, title, kickoff_at]
+      properties:
+        venue_id: { $ref: '#/components/schemas/Id' }
+        title: { type: string, minLength: 1, maxLength: 200 }
+        competition: { type: [string, 'null'], maxLength: 200 }
+        home_team: { type: [string, 'null'], maxLength: 100 }
+        away_team: { type: [string, 'null'], maxLength: 100 }
+        kickoff_at: { type: string, format: date-time }
+        gates_open_at: { type: [string, 'null'], format: date-time, description: Must be before `kickoff_at`. }
+        poster_url: { type: [string, 'null'], format: uri, maxLength: 2048 }
+        sales_open_at: { type: [string, 'null'], format: date-time }
+        sales_close_at: { type: [string, 'null'], format: date-time, description: After `sales_open_at` and not after `kickoff_at`. }
+        max_tickets_per_user: { type: integer, minimum: 1, maximum: 50, default: 6 }
+        template_id:
+          description: Copy this venue template's categories and assignments onto the new event.
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+    UpdateEvent:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        title: { type: string, minLength: 1, maxLength: 200 }
+        competition: { type: [string, 'null'], maxLength: 200 }
+        home_team: { type: [string, 'null'], maxLength: 100 }
+        away_team: { type: [string, 'null'], maxLength: 100 }
+        kickoff_at: { type: string, format: date-time }
+        gates_open_at: { type: [string, 'null'], format: date-time }
+        poster_url: { type: [string, 'null'], format: uri, maxLength: 2048 }
+        sales_open_at: { type: [string, 'null'], format: date-time }
+        sales_close_at: { type: [string, 'null'], format: date-time }
+        max_tickets_per_user: { type: integer, minimum: 1, maximum: 50 }
+    Category:
+      type: object
+      additionalProperties: false
+      required: [id, event_id, name, description, price_cents, currency, color_hex, seats_available, seats_total]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        event_id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        description: { type: [string, 'null'] }
+        price_cents: { type: integer, format: int64, minimum: 0 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        color_hex: { $ref: '#/components/schemas/ColorHex' }
+        seats_available: { type: integer, description: Zero before publish. }
+        seats_total: { type: integer, description: Zero before publish. }
+    CategoryList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Category' }
+    CreateCategory:
+      type: object
+      additionalProperties: false
+      required: [name, price_cents, color_hex]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 60 }
+        price_cents: { type: integer, format: int64, minimum: 0, description: 'Zero is accepted here but blocks publishing.' }
+        color_hex: { $ref: '#/components/schemas/ColorHex' }
+        description: { type: [string, 'null'], maxLength: 500 }
+    UpdateCategory:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name: { type: string, minLength: 1, maxLength: 60 }
+        price_cents: { type: integer, format: int64, minimum: 0 }
+        color_hex: { $ref: '#/components/schemas/ColorHex' }
+        description: { type: [string, 'null'], maxLength: 500 }
+        confirm:
+          type: boolean
+          default: false
+          description: Must be true to change the price once any seat is held or sold.
+
+    # -------------------------------------------------------------------------
+    # Seat map
+    # -------------------------------------------------------------------------
+    MapCategory:
+      type: object
+      description: A category as the seat map needs it. Sent once per answer.
+      additionalProperties: false
+      required: [id, name, price_cents, color_hex]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        price_cents: { type: integer, format: int64 }
+        color_hex: { $ref: '#/components/schemas/ColorHex' }
+    StadiumMap:
+      type: object
+      additionalProperties: false
+      required: [event_id, venue, currency, stands]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        venue:
+          type: object
+          additionalProperties: false
+          required: [id, name, plan_width, plan_height]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            name: { type: string }
+            plan_width: { type: integer, description: Width of the coordinate space every polygon and seat is drawn in. }
+            plan_height: { type: integer }
+        currency: { $ref: '#/components/schemas/Currency' }
+        stands:
+          type: array
+          description: In drawing order.
+          items: { $ref: '#/components/schemas/MapStand' }
+      example:
+        event_id: 1
+        venue: { id: 1, name: Talanta Stadium, plan_width: 10000, plan_height: 8000 }
+        currency: KES
+        stands:
+          - id: 3
+            code: N
+            name: North Lower
+            tier: LOWER
+            gate_group: N-LOWER
+            polygon: [[3000, 400], [7000, 400], [6600, 1200], [3400, 1200]]
+            seats_total: 7500
+            seats_available: 5120
+            price_from_cents: 50000
+    MapStand:
+      type: object
+      additionalProperties: false
+      required: [id, code, name, tier, gate_group, polygon, seats_total, seats_available, price_from_cents]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        code: { type: string, examples: [N] }
+        name: { type: string }
+        tier: { $ref: '#/components/schemas/Tier' }
+        gate_group: { $ref: '#/components/schemas/GateGroup' }
+        polygon: { $ref: '#/components/schemas/Polygon' }
+        seats_total: { type: integer }
+        seats_available: { type: integer }
+        price_from_cents:
+          type: [integer, 'null']
+          format: int64
+          description: Cheapest available seat in the stand. Null when none is available.
+    StandBlocks:
+      type: object
+      additionalProperties: false
+      required: [event_id, stand, currency, categories, blocks]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        stand:
+          type: object
+          additionalProperties: false
+          required: [id, code, name, tier, gate_group, polygon]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            code: { type: string }
+            name: { type: string }
+            tier: { $ref: '#/components/schemas/Tier' }
+            gate_group: { $ref: '#/components/schemas/GateGroup' }
+            polygon: { $ref: '#/components/schemas/Polygon' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        categories:
+          type: array
+          description: Every category that appears in this stand.
+          items: { $ref: '#/components/schemas/MapCategory' }
+        blocks:
+          type: array
+          items: { $ref: '#/components/schemas/MapBlock' }
+    MapBlock:
+      type: object
+      additionalProperties: false
+      required: [id, code, label, outline, seats_total, seats_available, price_from_cents, badges]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        code: { type: string, examples: [N12] }
+        label: { type: string }
+        outline: { $ref: '#/components/schemas/Polygon' }
+        seats_total: { type: integer }
+        seats_available: { type: integer }
+        price_from_cents:
+          type: [integer, 'null']
+          format: int64
+          description: Cheapest available seat in the block. Null when none is available.
+        badges:
+          type: array
+          description: One per category present in the block, cheapest first. Usually one.
+          items:
+            type: object
+            additionalProperties: false
+            required: [category_id, seats_available]
+            properties:
+              category_id: { $ref: '#/components/schemas/Id', description: Points into `categories`. }
+              seats_available: { type: integer }
+    BlockSeats:
+      description: Level 3. Switch on `kind`.
+      oneOf:
+        - $ref: '#/components/schemas/BlockSeatsFull'
+        - $ref: '#/components/schemas/BlockSeatsDelta'
+      discriminator:
+        propertyName: kind
+        mapping:
+          full: '#/components/schemas/BlockSeatsFull'
+          delta: '#/components/schemas/BlockSeatsDelta'
+    BlockSeatsFull:
+      type: object
+      additionalProperties: false
+      required: [kind, marker, poll_interval_seconds, block, categories, rows]
+      properties:
+        kind:
+          type: string
+          enum: [full]
+        marker:
+          type: string
+          description: Opaque. Send back as `since` to get only what changed after this answer.
+        poll_interval_seconds: { type: integer, minimum: 1, description: How often the client should poll. }
+        block:
+          type: object
+          additionalProperties: false
+          required: [id, stand_id, code, label, rotation_deg, seat_pitch_x, seat_pitch_y, bounds]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            stand_id: { $ref: '#/components/schemas/Id' }
+            code: { type: string }
+            label: { type: string }
+            rotation_deg: { type: number, description: Clockwise rotation of the block on the plan. Lets the client turn the block to face up. }
+            seat_pitch_x: { type: number, description: Distance between seat centres in a row. A seat is drawn a little smaller than this. }
+            seat_pitch_y: { type: number, description: Distance between rows. }
+            bounds:
+              $ref: '#/components/schemas/Bounds'
+              description: Box around every seat, half a pitch larger than the seat centres. The initial viewport.
+        categories:
+          type: array
+          description: The category table. Seat tuples point into it by position (`category_index`).
+          items: { $ref: '#/components/schemas/MapCategory' }
+        rows:
+          type: array
+          description: Front row first.
+          items:
+            type: object
+            additionalProperties: false
+            required: [label, seats]
+            properties:
+              label: { type: string, description: 'Row label, for example `C`. A seat''s label is the row label followed by its number (`C14`).' }
+              seats:
+                type: array
+                items: { $ref: '#/components/schemas/SeatTuple' }
+    BlockSeatsDelta:
+      type: object
+      additionalProperties: false
+      required: [kind, marker, poll_interval_seconds, changes]
+      properties:
+        kind:
+          type: string
+          enum: [delta]
+        marker: { type: string, description: The new marker. Replace the old one with it. }
+        poll_interval_seconds: { type: integer, minimum: 1 }
+        changes:
+          type: array
+          description: Seats whose status changed. Often empty.
+          items: { $ref: '#/components/schemas/SeatChangeTuple' }
+    SeatStatusCode:
+      type: string
+      description: |
+        One-letter seat status on the seat map.
+
+        | Code | Meaning |
+        |---|---|
+        | `A` | Available |
+        | `H` | Held by someone else |
+        | `M` | Held by you (only with a FAN token that owns the hold) |
+        | `S` | Sold |
+        | `B` | Blocked (not for sale) |
+      enum: [A, H, M, S, B]
+    SeatTypeCode:
+      type: integer
+      description: '`0` STANDARD, `1` ACCESSIBLE, `2` COMPANION, `3` RESTRICTED_VIEW.'
+      enum: [0, 1, 2, 3]
+    SeatTuple:
+      type: array
+      description: |
+        One seat as a fixed 7-item array, to avoid repeating keys 2,000 times.
+
+        | Pos | Name | Type | Meaning |
+        |---|---|---|---|
+        | 0 | `event_seat_id` | int64 | The ID to send in `POST /holds` `seat_ids`. |
+        | 1 | `seat_number` | int | Number within the row. |
+        | 2 | `x` | number | Seat centre, venue plan coordinates, at most 2 decimals. |
+        | 3 | `y` | number | Seat centre, venue plan coordinates, at most 2 decimals. |
+        | 4 | `type_code` | 0-3 | `0` STANDARD, `1` ACCESSIBLE, `2` COMPANION, `3` RESTRICTED_VIEW. |
+        | 5 | `category_index` | int | Position in `categories`, or `-1` when the seat has no category (always blocked). |
+        | 6 | `status_code` | letter | `A`, `H`, `M`, `S` or `B`. |
+      prefixItems:
+        - { type: integer, format: int64, minimum: 1, description: event_seat_id }
+        - { type: integer, minimum: 1, description: seat_number }
+        - { type: number, description: x }
+        - { type: number, description: y }
+        - { $ref: '#/components/schemas/SeatTypeCode' }
+        - { type: integer, minimum: -1, description: category_index }
+        - { $ref: '#/components/schemas/SeatStatusCode' }
+      items: false
+      minItems: 7
+      maxItems: 7
+      examples:
+        - [910002, 2, 4017.5, 594, 1, 1, M]
+    SeatChangeTuple:
+      type: array
+      description: |
+        | Pos | Name | Meaning |
+        |---|---|---|
+        | 0 | `event_seat_id` | The seat that changed. |
+        | 1 | `status_code` | Its status now: `A`, `H`, `M`, `S` or `B`. |
+      prefixItems:
+        - { type: integer, format: int64, minimum: 1, description: event_seat_id }
+        - { $ref: '#/components/schemas/SeatStatusCode' }
+      items: false
+      minItems: 2
+      maxItems: 2
+      examples:
+        - [910001, H]
+
+    # -------------------------------------------------------------------------
+    # Holds
+    # -------------------------------------------------------------------------
+    CreateHold:
+      type: object
+      additionalProperties: false
+      required: [event_id, seat_ids]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        seat_ids:
+          type: array
+          description: Event seat IDs. No repeats.
+          minItems: 1
+          maxItems: 50
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Id' }
+    CreateBestAvailableHold:
+      type: object
+      additionalProperties: false
+      required: [event_id, category_id, quantity]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        category_id: { $ref: '#/components/schemas/Id' }
+        quantity: { type: integer, minimum: 1, maximum: 50 }
+    SeatLocation:
+      type: object
+      description: Where a seat is, in words. Shared by holds, bookings and tickets.
+      additionalProperties: false
+      required: [stand_id, stand_code, stand_name, tier, gate_group, block_id, block_code, block_label, row_label, seat_number, seat_label, seat_type]
+      properties:
+        stand_id: { $ref: '#/components/schemas/Id' }
+        stand_code: { type: string, examples: [N] }
+        stand_name: { type: string, examples: [North Lower] }
+        tier: { $ref: '#/components/schemas/Tier' }
+        gate_group: { $ref: '#/components/schemas/GateGroup' }
+        block_id: { $ref: '#/components/schemas/Id' }
+        block_code: { type: string, examples: [N12] }
+        block_label: { type: string, examples: [North 12] }
+        row_label: { type: string, examples: [C] }
+        seat_number: { type: integer, examples: [14] }
+        seat_label: { type: string, examples: [C14] }
+        seat_type: { $ref: '#/components/schemas/SeatType' }
+    HoldSeat:
+      type: object
+      additionalProperties: false
+      required: [event_seat_id, location, category_id, category_name, price_cents]
+      properties:
+        event_seat_id: { $ref: '#/components/schemas/Id' }
+        location: { $ref: '#/components/schemas/SeatLocation' }
+        category_id: { $ref: '#/components/schemas/Id' }
+        category_name: { type: string }
+        price_cents: { type: integer, format: int64, description: The category price now. It is fixed when the booking is made. }
+    Hold:
+      type: object
+      additionalProperties: false
+      required: [id, event_id, status, expires_at, remaining_seconds, extended, booking_reference, currency, subtotal_cents, seats, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        event_id: { $ref: '#/components/schemas/Id' }
+        status: { $ref: '#/components/schemas/HoldStatus' }
+        expires_at: { type: string, format: date-time, description: The client countdown is computed from this. }
+        remaining_seconds: { type: integer, minimum: 0, description: Server's view when it answered. Zero once expired. }
+        extended: { type: boolean, description: True once the expiry was pushed out for a payment. It is never pushed twice. }
+        booking_reference:
+          description: The booking made from this hold, if any.
+          anyOf:
+            - { $ref: '#/components/schemas/BookingReference' }
+            - { type: 'null' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        subtotal_cents: { type: integer, format: int64, description: 'Sum of the seats'' prices, before any fee.' }
+        seats:
+          type: array
+          description: Ordered by block, row, then seat number.
+          items: { $ref: '#/components/schemas/HoldSeat' }
+        created_at: { type: string, format: date-time }
+      example:
+        id: 5521
+        event_id: 1
+        status: ACTIVE
+        expires_at: '2026-10-11T09:25:00Z'
+        remaining_seconds: 600
+        extended: false
+        booking_reference: null
+        currency: KES
+        subtotal_cents: 100000
+        created_at: '2026-10-11T09:15:00Z'
+        seats:
+          - event_seat_id: 910001
+            category_id: 7
+            category_name: Regular
+            price_cents: 50000
+            location:
+              stand_id: 3
+              stand_code: N
+              stand_name: North Lower
+              tier: LOWER
+              gate_group: N-LOWER
+              block_id: 112
+              block_code: N12
+              block_label: North 12
+              row_label: A
+              seat_number: 1
+              seat_label: A1
+              seat_type: STANDARD
+          - event_seat_id: 910005
+            category_id: 7
+            category_name: Regular
+            price_cents: 50000
+            location:
+              stand_id: 3
+              stand_code: N
+              stand_name: North Lower
+              tier: LOWER
+              gate_group: N-LOWER
+              block_id: 112
+              block_code: N12
+              block_label: North 12
+              row_label: B
+              seat_number: 2
+              seat_label: B2
+              seat_type: RESTRICTED_VIEW
+    HoldList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Hold' }
+
+    # -------------------------------------------------------------------------
+    # Bookings and payments
+    # -------------------------------------------------------------------------
+    CreateBooking:
+      type: object
+      additionalProperties: false
+      required: [hold_id]
+      properties:
+        hold_id: { $ref: '#/components/schemas/Id' }
+    BookingItem:
+      type: object
+      additionalProperties: false
+      required: [event_seat_id, location, category_id, category_name, unit_price_cents]
+      properties:
+        event_seat_id: { $ref: '#/components/schemas/Id' }
+        location: { $ref: '#/components/schemas/SeatLocation' }
+        category_id: { $ref: '#/components/schemas/Id' }
+        category_name: { type: string }
+        unit_price_cents: { type: integer, format: int64, description: The price copied at booking time. Never changes. }
+    Booking:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - reference
+        - status
+        - event
+        - items
+        - currency
+        - subtotal_cents
+        - fee_cents
+        - total_cents
+        - hold_id
+        - hold_expires_at
+        - latest_payment
+        - tickets
+        - created_at
+        - paid_at
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        reference: { $ref: '#/components/schemas/BookingReference' }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        event: { $ref: '#/components/schemas/EventSummary' }
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/BookingItem' }
+        currency: { $ref: '#/components/schemas/Currency' }
+        subtotal_cents: { type: integer, format: int64 }
+        fee_cents: { type: integer, format: int64 }
+        total_cents: { type: integer, format: int64, description: '`subtotal_cents + fee_cents`. The amount of the M-Pesa prompt.' }
+        hold_id:
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+        hold_expires_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the seats stop being reserved. Meaningful while `PENDING_PAYMENT`; the checkout countdown runs to this. Null once the booking is final.
+        latest_payment:
+          description: The most recent payment attempt, or null if none was started.
+          anyOf:
+            - { $ref: '#/components/schemas/Payment' }
+            - { type: 'null' }
+        tickets:
+          type: array
+          description: Empty until the booking is `PAID`.
+          items: { $ref: '#/components/schemas/Ticket' }
+        created_at: { type: string, format: date-time }
+        paid_at: { type: [string, 'null'], format: date-time }
+    BookingPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Booking' }
+        next_cursor: { type: [string, 'null'] }
+    StartStkPush:
+      type: object
+      additionalProperties: false
+      required: [booking_id, phone]
+      properties:
+        booking_id: { $ref: '#/components/schemas/Id' }
+        phone:
+          $ref: '#/components/schemas/Phone'
+          description: The M-Pesa number to prompt. May differ from the account's phone.
+    Payment:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - booking_id
+        - booking_reference
+        - booking_status
+        - provider
+        - status
+        - amount_cents
+        - currency
+        - phone
+        - merchant_request_id
+        - checkout_request_id
+        - mpesa_receipt
+        - failure_reason
+        - result_code
+        - result_desc
+        - created_at
+        - completed_at
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        booking_id: { $ref: '#/components/schemas/Id' }
+        booking_reference: { $ref: '#/components/schemas/BookingReference' }
+        booking_status: { $ref: '#/components/schemas/BookingStatus' }
+        provider: { $ref: '#/components/schemas/PaymentProvider' }
+        status: { $ref: '#/components/schemas/PaymentStatus' }
+        amount_cents: { type: integer, format: int64 }
+        currency: { $ref: '#/components/schemas/Currency' }
+        phone: { $ref: '#/components/schemas/Phone' }
+        merchant_request_id: { type: [string, 'null'] }
+        checkout_request_id: { type: [string, 'null'], description: Daraja's ID for the prompt. }
+        mpesa_receipt: { type: [string, 'null'], description: 'M-Pesa receipt number, once paid.' }
+        failure_reason:
+          description: Null while live and on success. Set for `FAILED` and `TIMEOUT`.
+          anyOf:
+            - { $ref: '#/components/schemas/PaymentFailureReason' }
+            - { type: 'null' }
+        result_code: { type: [integer, 'null'], description: The provider's raw result code. }
+        result_desc: { type: [string, 'null'], description: The provider's own wording. For display or support only. }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+    MpesaCallback:
+      type: object
+      description: Daraja's STK push callback envelope, exactly as Safaricom sends it. Unknown fields are accepted and kept in the stored raw body.
+      required: [Body]
+      properties:
+        Body:
+          type: object
+          required: [stkCallback]
+          properties:
+            stkCallback:
+              type: object
+              required: [MerchantRequestID, CheckoutRequestID, ResultCode, ResultDesc]
+              properties:
+                MerchantRequestID: { type: string }
+                CheckoutRequestID: { type: string }
+                ResultCode: { type: integer, description: '`0` is success. `1` insufficient funds, `1032` cancelled by user, `1037` timeout, `2001` wrong PIN.' }
+                ResultDesc: { type: string }
+                CallbackMetadata:
+                  type: object
+                  description: Present only on success.
+                  required: [Item]
+                  properties:
+                    Item:
+                      type: array
+                      items:
+                        type: object
+                        required: [Name]
+                        properties:
+                          Name: { type: string, description: '`Amount`, `MpesaReceiptNumber`, `Balance`, `TransactionDate`, `PhoneNumber`.' }
+                          Value:
+                            description: Amount is in shillings (may be fractional). Some items arrive with no value.
+                            type: [string, number]
+    MpesaCallbackAck:
+      type: object
+      additionalProperties: false
+      required: [ResultCode, ResultDesc]
+      properties:
+        ResultCode:
+          type: integer
+          enum: [0]
+        ResultDesc:
+          type: string
+          enum: [Accepted]
+
+    # -------------------------------------------------------------------------
+    # Tickets
+    # -------------------------------------------------------------------------
+    Ticket:
+      type: object
+      description: Self-contained, so the app can show it with no network.
+      additionalProperties: false
+      required:
+        - id
+        - status
+        - event
+        - booking_reference
+        - location
+        - category_name
+        - holder_name
+        - holder_phone
+        - qr_token
+        - issued_at
+        - used_at
+        - updated_at
+      properties:
+        id: { type: string, format: uuid }
+        status: { $ref: '#/components/schemas/TicketStatus' }
+        event: { $ref: '#/components/schemas/EventSummary' }
+        booking_reference: { $ref: '#/components/schemas/BookingReference' }
+        location: { $ref: '#/components/schemas/SeatLocation' }
+        category_name: { type: string }
+        holder_name: { type: [string, 'null'] }
+        holder_phone:
+          anyOf:
+            - { $ref: '#/components/schemas/Phone' }
+            - { type: 'null' }
+        qr_token:
+          type: string
+          pattern: '^TLT1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$'
+          description: The signed string to draw as a QR code. Layout in `docs/TICKET_FORMAT.md`.
+        issued_at: { type: string, format: date-time }
+        used_at: { type: [string, 'null'], format: date-time }
+        updated_at: { type: string, format: date-time }
+    TicketPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Ticket' }
+        next_cursor: { type: [string, 'null'] }
+
+    # -------------------------------------------------------------------------
+    # Admin: venues, blocks, layout
+    # -------------------------------------------------------------------------
+    Venue:
+      type: object
+      additionalProperties: false
+      required: [id, name, city, capacity, plan_width, plan_height]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        city: { type: string }
+        capacity: { type: integer }
+        plan_width: { type: integer }
+        plan_height: { type: integer }
+    VenueList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Venue' }
+    VenueDetail:
+      type: object
+      additionalProperties: false
+      required: [id, name, city, capacity, plan_width, plan_height, seat_count, stands]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        city: { type: string }
+        capacity: { type: integer }
+        plan_width: { type: integer }
+        plan_height: { type: integer }
+        seat_count: { type: integer, description: Active seats across all blocks. }
+        stands:
+          type: array
+          description: In drawing order.
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, code, name, tier, gate_group, polygon, display_order, blocks]
+            properties:
+              id: { $ref: '#/components/schemas/Id' }
+              code: { type: string }
+              name: { type: string }
+              tier: { $ref: '#/components/schemas/Tier' }
+              gate_group: { $ref: '#/components/schemas/GateGroup' }
+              polygon: { $ref: '#/components/schemas/Polygon' }
+              display_order: { type: integer }
+              blocks:
+                type: array
+                items: { $ref: '#/components/schemas/Block' }
+    Block:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - stand_id
+        - code
+        - label
+        - origin_x
+        - origin_y
+        - rotation_deg
+        - arc_radius
+        - seat_pitch_x
+        - seat_pitch_y
+        - row_count
+        - seats_per_row
+        - numbering_direction
+        - seat_count
+        - outline
+        - has_inventory
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        stand_id: { $ref: '#/components/schemas/Id' }
+        code: { type: string }
+        label: { type: string }
+        origin_x: { type: number, description: Plan x of the first seat position of the front row. }
+        origin_y: { type: number }
+        rotation_deg: { type: number, description: Clockwise. At 0 the block faces up the screen. }
+        arc_radius: { type: [number, 'null'], description: Radius of the front row. Null for a straight block. }
+        seat_pitch_x: { type: number }
+        seat_pitch_y: { type: number }
+        row_count: { type: integer, description: Zero until seats are generated. }
+        seats_per_row: { type: integer }
+        numbering_direction: { $ref: '#/components/schemas/NumberingDirection' }
+        seat_count: { type: integer, description: Active seats. }
+        outline:
+          $ref: '#/components/schemas/Polygon'
+          description: Empty until seats are generated.
+        has_inventory: { type: boolean, description: True when any event was published with this block; it can then not be deleted or regenerated. }
+    CreateBlock:
+      type: object
+      additionalProperties: false
+      required: [stand_id, code, label, origin_x, origin_y, seat_pitch_x, seat_pitch_y]
+      properties:
+        stand_id: { $ref: '#/components/schemas/Id' }
+        code: { type: string, minLength: 1, maxLength: 12, pattern: '^[A-Z0-9-]+$' }
+        label: { type: string, minLength: 1, maxLength: 60 }
+        origin_x: { type: number }
+        origin_y: { type: number }
+        rotation_deg: { type: number, minimum: -360, maximum: 360, default: 0 }
+        arc_radius: { type: [number, 'null'], exclusiveMinimum: 0, description: Null or omitted for a straight block. }
+        seat_pitch_x: { type: number, exclusiveMinimum: 0 }
+        seat_pitch_y: { type: number, exclusiveMinimum: 0 }
+    UpdateBlock:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        code: { type: string, minLength: 1, maxLength: 12, pattern: '^[A-Z0-9-]+$' }
+        label: { type: string, minLength: 1, maxLength: 60 }
+        origin_x: { type: number }
+        origin_y: { type: number }
+        rotation_deg: { type: number, minimum: -360, maximum: 360 }
+        arc_radius: { type: [number, 'null'], exclusiveMinimum: 0, description: Null makes the block straight. }
+        seat_pitch_x: { type: number, exclusiveMinimum: 0 }
+        seat_pitch_y: { type: number, exclusiveMinimum: 0 }
+    GenerateSeats:
+      type: object
+      additionalProperties: false
+      required: [rows, seats_per_row]
+      properties:
+        rows: { type: integer, minimum: 1, maximum: 200 }
+        seats_per_row: { type: integer, minimum: 1, maximum: 500 }
+        row_label_scheme:
+          $ref: '#/components/schemas/RowLabelScheme'
+          default: ALPHA
+        numbering_direction:
+          $ref: '#/components/schemas/NumberingDirection'
+          default: LTR
+        row_offsets:
+          type: array
+          description: |
+            How far each row is shifted along the row direction, in plan units, front row
+            first. Empty or omitted means no shift; otherwise exactly one entry per row.
+          maxItems: 200
+          items: { type: number }
+        dry_run:
+          type: boolean
+          default: false
+          description: True returns the preview and saves nothing.
+    BlockLayout:
+      type: object
+      description: A block's rows and physical seats, generated or saved.
+      additionalProperties: false
+      required: [block_id, dry_run, seat_count, outline, bounds, rows]
+      properties:
+        block_id: { $ref: '#/components/schemas/Id' }
+        dry_run: { type: boolean, description: True when this is an unsaved preview; row and seat IDs are then null. }
+        seat_count: { type: integer }
+        outline: { $ref: '#/components/schemas/Polygon' }
+        bounds:
+          description: Null when the block has no seats.
+          anyOf:
+            - { $ref: '#/components/schemas/Bounds' }
+            - { type: 'null' }
+        rows:
+          type: array
+          description: Front row first.
+          items:
+            type: object
+            additionalProperties: false
+            required: [id, label, row_index, x_offset, seats]
+            properties:
+              id:
+                description: Row ID, for `assign-category`. Null in a dry run.
+                anyOf:
+                  - { $ref: '#/components/schemas/Id' }
+                  - { type: 'null' }
+              label: { type: string }
+              row_index: { type: integer, minimum: 0 }
+              x_offset: { type: number }
+              seats:
+                type: array
+                items: { $ref: '#/components/schemas/PhysicalSeatTuple' }
+      example:
+        block_id: 112
+        dry_run: true
+        seat_count: 4
+        outline: [[4010, 590], [4020, 590], [4020, 606], [4010, 606]]
+        bounds: { min_x: 4010, min_y: 590, max_x: 4020, max_y: 606 }
+        rows:
+          - id: null
+            label: A
+            row_index: 0
+            x_offset: 0
+            seats:
+              - [null, 1, 4012.5, 594, 0, 1]
+              - [null, 2, 4017.5, 594, 0, 1]
+          - id: null
+            label: B
+            row_index: 1
+            x_offset: 0
+            seats:
+              - [null, 1, 4012.5, 602, 0, 1]
+              - [null, 2, 4017.5, 602, 0, 1]
+    PhysicalSeatTuple:
+      type: array
+      description: |
+        One physical seat as a fixed 6-item array.
+
+        | Pos | Name | Type | Meaning |
+        |---|---|---|---|
+        | 0 | `seat_id` | int64 or null | Physical seat ID. Null in a dry run. |
+        | 1 | `seat_number` | int | Number within the row. |
+        | 2 | `x` | number | Seat centre, venue plan coordinates. |
+        | 3 | `y` | number | Seat centre, venue plan coordinates. |
+        | 4 | `type_code` | 0-3 | `0` STANDARD, `1` ACCESSIBLE, `2` COMPANION, `3` RESTRICTED_VIEW. |
+        | 5 | `active` | 0 or 1 | `0` when the seat is switched off and never put on sale. |
+      prefixItems:
+        - { type: [integer, 'null'], format: int64, description: seat_id }
+        - { type: integer, minimum: 1, description: seat_number }
+        - { type: number, description: x }
+        - { type: number, description: y }
+        - { $ref: '#/components/schemas/SeatTypeCode' }
+        - { type: integer, enum: [0, 1], description: active }
+      items: false
+      minItems: 6
+      maxItems: 6
+    TemplateCategory:
+      type: object
+      additionalProperties: false
+      required: [name, color_hex, price_cents, description]
+      properties:
+        name: { type: string }
+        color_hex: { $ref: '#/components/schemas/ColorHex' }
+        price_cents: { type: integer, format: int64 }
+        description: { type: [string, 'null'] }
+    Template:
+      type: object
+      additionalProperties: false
+      required: [id, venue_id, name, categories, block_assignment_count, row_assignment_count, created_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        venue_id: { $ref: '#/components/schemas/Id' }
+        name: { type: string }
+        categories:
+          type: array
+          items: { $ref: '#/components/schemas/TemplateCategory' }
+        block_assignment_count: { type: integer, description: Blocks the template paints. }
+        row_assignment_count: { type: integer, description: Row overrides the template holds. }
+        created_at: { type: string, format: date-time }
+    TemplateList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Template' }
+    CreateTemplate:
+      type: object
+      additionalProperties: false
+      required: [name, event_id]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 80 }
+        event_id:
+          $ref: '#/components/schemas/Id'
+          description: The event whose categories and painting to save. Must be at this venue.
+
+    # -------------------------------------------------------------------------
+    # Admin: readiness, publish, cancel, painting
+    # -------------------------------------------------------------------------
+    ReadinessProblem:
+      type: object
+      description: One thing that stops an event being published. Fields that do not apply to the `code` are null.
+      additionalProperties: false
+      required: [code, message, block_id, block_code, category_id, category_name, seat_count]
+      properties:
+        code:
+          type: string
+          description: |
+            - `NO_SEATS` - the venue has no active seats.
+            - `NO_CATEGORIES` - the event has no category.
+            - `SEATS_WITHOUT_CATEGORY` - one entry per block; `block_id`, `block_code` and `seat_count` are set.
+            - `CATEGORY_WITHOUT_PRICE` - one entry per category whose price is zero; `category_id` and `category_name` are set.
+            - `SALES_WINDOW_MISSING` - `sales_open_at` or `sales_close_at` is not set.
+            - `SALES_WINDOW_INVALID` - close is not after open, or close is after kickoff.
+            - `KICKOFF_IN_PAST` - the event has already started.
+          enum: [NO_SEATS, NO_CATEGORIES, SEATS_WITHOUT_CATEGORY, CATEGORY_WITHOUT_PRICE, SALES_WINDOW_MISSING, SALES_WINDOW_INVALID, KICKOFF_IN_PAST]
+        message: { type: string, description: 'Plain English, ready to show.' }
+        block_id:
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+        block_code: { type: [string, 'null'] }
+        category_id:
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+        category_name: { type: [string, 'null'] }
+        seat_count: { type: [integer, 'null'] }
+    Readiness:
+      type: object
+      additionalProperties: false
+      required: [event_id, event_status, ready, seat_total, seats_with_category, problems]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        event_status: { $ref: '#/components/schemas/EventStatus' }
+        ready: { type: boolean }
+        seat_total: { type: integer, description: 'Active seats at the venue: what publishing would put on sale.' }
+        seats_with_category: { type: integer }
+        problems:
+          type: array
+          items: { $ref: '#/components/schemas/ReadinessProblem' }
+    PublishResult:
+      type: object
+      additionalProperties: false
+      required: [event, seats_on_sale, already_published]
+      properties:
+        event: { $ref: '#/components/schemas/Event' }
+        seats_on_sale: { type: integer, description: Inventory rows that are for sale for this event. }
+        already_published: { type: boolean, description: True when this call changed nothing. }
+    CancelResult:
+      type: object
+      additionalProperties: false
+      required: [event, tickets_voided, bookings_cancelled, refunds_queued, refund_total_cents, holds_released]
+      properties:
+        event: { $ref: '#/components/schemas/Event' }
+        tickets_voided: { type: integer }
+        bookings_cancelled: { type: integer, description: Unpaid bookings closed. }
+        refunds_queued: { type: integer }
+        refund_total_cents: { type: integer, format: int64 }
+        holds_released: { type: integer }
+    Assignments:
+      type: object
+      additionalProperties: false
+      required: [event_id, blocks, rows]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        blocks:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [block_id, category_id]
+            properties:
+              block_id: { $ref: '#/components/schemas/Id' }
+              category_id: { $ref: '#/components/schemas/Id' }
+        rows:
+          type: array
+          description: Row overrides. A row not listed takes its block's category.
+          items:
+            type: object
+            additionalProperties: false
+            required: [row_id, block_id, category_id]
+            properties:
+              row_id: { $ref: '#/components/schemas/Id' }
+              block_id: { $ref: '#/components/schemas/Id' }
+              category_id: { $ref: '#/components/schemas/Id' }
+    AssignCategory:
+      type: object
+      additionalProperties: false
+      required: [category_id, block_ids, row_ids]
+      properties:
+        category_id:
+          description: The category to paint with, or null to clear the listed blocks and rows.
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+        block_ids:
+          type: array
+          maxItems: 1000
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Id' }
+        row_ids:
+          type: array
+          maxItems: 5000
+          uniqueItems: true
+          items: { $ref: '#/components/schemas/Id' }
+
+    # -------------------------------------------------------------------------
+    # Admin: sales, bookings, alerts, refunds
+    # -------------------------------------------------------------------------
+    SeatCounts:
+      type: object
+      additionalProperties: false
+      required: [sold, held, available, blocked, total]
+      properties:
+        sold: { type: integer }
+        held: { type: integer }
+        available: { type: integer }
+        blocked: { type: integer }
+        total: { type: integer }
+    SalesSummary:
+      type: object
+      additionalProperties: false
+      required: [event_id, generated_at, currency, revenue_cents, seats, refund_required_count, refund_required_cents, open_alert_count, categories, blocks, series]
+      properties:
+        event_id: { $ref: '#/components/schemas/Id' }
+        generated_at: { type: string, format: date-time }
+        currency: { $ref: '#/components/schemas/Currency' }
+        revenue_cents: { type: integer, format: int64, description: Sum of `total_cents` over `PAID` bookings. }
+        seats: { $ref: '#/components/schemas/SeatCounts' }
+        refund_required_count: { type: integer, description: Bookings in `REFUND_REQUIRED`. }
+        refund_required_cents: { type: integer, format: int64, description: Money owed back on those bookings. }
+        open_alert_count: { type: integer, description: Unacknowledged alerts for this event. }
+        categories:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            required: [category_id, name, color_hex, price_cents, sold, held, available, blocked, total, revenue_cents]
+            properties:
+              category_id: { $ref: '#/components/schemas/Id' }
+              name: { type: string }
+              color_hex: { $ref: '#/components/schemas/ColorHex' }
+              price_cents: { type: integer, format: int64, description: The price now. }
+              sold: { type: integer }
+              held: { type: integer }
+              available: { type: integer }
+              blocked: { type: integer }
+              total: { type: integer }
+              revenue_cents: { type: integer, format: int64, description: Sum of the prices actually paid in this category. }
+        blocks:
+          type: array
+          description: One row per block, for the heatmap. Draw with the outlines from `GET /admin/venues/{venueId}`.
+          items:
+            type: object
+            additionalProperties: false
+            required: [block_id, stand_id, sold, held, total]
+            properties:
+              block_id: { $ref: '#/components/schemas/Id' }
+              stand_id: { $ref: '#/components/schemas/Id' }
+              sold: { type: integer }
+              held: { type: integer }
+              total: { type: integer, description: Seats in the block that are not blocked. }
+        series:
+          type: object
+          additionalProperties: false
+          required: [bucket, points]
+          properties:
+            bucket: { $ref: '#/components/schemas/SalesBucket' }
+            points:
+              type: array
+              description: Oldest first. Buckets with no sales are included as zeros.
+              items:
+                type: object
+                additionalProperties: false
+                required: [bucket_start, bookings, tickets, revenue_cents]
+                properties:
+                  bucket_start: { type: string, format: date-time }
+                  bookings: { type: integer, description: Bookings paid in the bucket. }
+                  tickets: { type: integer }
+                  revenue_cents: { type: integer, format: int64 }
+    AdminBooking:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - reference
+        - status
+        - event_id
+        - user
+        - seat_count
+        - seat_labels
+        - currency
+        - subtotal_cents
+        - fee_cents
+        - total_cents
+        - latest_payment
+        - refund
+        - created_at
+        - paid_at
+        - updated_at
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        reference: { $ref: '#/components/schemas/BookingReference' }
+        status: { $ref: '#/components/schemas/BookingStatus' }
+        event_id: { $ref: '#/components/schemas/Id' }
+        user:
+          type: object
+          additionalProperties: false
+          required: [id, name, phone]
+          properties:
+            id: { $ref: '#/components/schemas/Id' }
+            name: { type: [string, 'null'] }
+            phone:
+              anyOf:
+                - { $ref: '#/components/schemas/Phone' }
+                - { type: 'null' }
+        seat_count: { type: integer }
+        seat_labels:
+          type: array
+          description: 'Block code and seat label for each seat, for example `N12 C14`.'
+          items: { type: string }
+        currency: { $ref: '#/components/schemas/Currency' }
+        subtotal_cents: { type: integer, format: int64 }
+        fee_cents: { type: integer, format: int64 }
+        total_cents: { type: integer, format: int64 }
+        latest_payment:
+          anyOf:
+            - { $ref: '#/components/schemas/Payment' }
+            - { type: 'null' }
+        refund:
+          description: The booking's refund, if one was queued.
+          anyOf:
+            - { $ref: '#/components/schemas/Refund' }
+            - { type: 'null' }
+        created_at: { type: string, format: date-time }
+        paid_at: { type: [string, 'null'], format: date-time }
+        updated_at: { type: string, format: date-time }
+    AdminBookingPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/AdminBooking' }
+        next_cursor: { type: [string, 'null'] }
+    Alert:
+      type: object
+      additionalProperties: false
+      required: [id, event_id, booking_id, booking_reference, kind, message, created_at, acknowledged_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        event_id: { $ref: '#/components/schemas/Id' }
+        booking_id:
+          anyOf:
+            - { $ref: '#/components/schemas/Id' }
+            - { type: 'null' }
+        booking_reference:
+          anyOf:
+            - { $ref: '#/components/schemas/BookingReference' }
+            - { type: 'null' }
+        kind: { $ref: '#/components/schemas/AlertKind' }
+        message: { type: string }
+        created_at: { type: string, format: date-time }
+        acknowledged_at: { type: [string, 'null'], format: date-time }
+    AlertPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Alert' }
+        next_cursor: { type: [string, 'null'] }
+    Refund:
+      type: object
+      additionalProperties: false
+      required: [id, booking_id, booking_reference, event_id, payment_id, amount_cents, currency, phone, mpesa_receipt, reason, status, created_at, completed_at]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        booking_id: { $ref: '#/components/schemas/Id' }
+        booking_reference: { $ref: '#/components/schemas/BookingReference' }
+        event_id: { $ref: '#/components/schemas/Id' }
+        payment_id: { $ref: '#/components/schemas/Id' }
+        amount_cents: { type: integer, format: int64, description: What was actually received and must go back. }
+        currency: { $ref: '#/components/schemas/Currency' }
+        phone:
+          $ref: '#/components/schemas/Phone'
+          description: The number that paid.
+        mpesa_receipt: { type: [string, 'null'], description: The receipt of the payment being refunded. }
+        reason: { type: string, description: 'Plain English, for example "Paid after the hold expired; seats were resold".' }
+        status: { $ref: '#/components/schemas/RefundStatus' }
+        created_at: { type: string, format: date-time }
+        completed_at: { type: [string, 'null'], format: date-time }
+    RefundPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Refund' }
+        next_cursor: { type: [string, 'null'] }
+
+    # -------------------------------------------------------------------------
+    # Gate
+    # -------------------------------------------------------------------------
+    GateEvent:
+      type: object
+      additionalProperties: false
+      required: [id, title, kickoff_at, gates_open_at, status, venue_name]
+      properties:
+        id: { $ref: '#/components/schemas/Id' }
+        title: { type: string }
+        kickoff_at: { type: string, format: date-time }
+        gates_open_at: { type: [string, 'null'], format: date-time }
+        status: { $ref: '#/components/schemas/EventStatus' }
+        venue_name: { type: string }
+    GateEventListItem:
+      type: object
+      additionalProperties: false
+      required: [event, gate_groups, ticket_count, manifest_version]
+      properties:
+        event: { $ref: '#/components/schemas/GateEvent' }
+        gate_groups:
+          type: array
+          description: Every gate group of the venue, for the "which gate are you at" picker.
+          items: { $ref: '#/components/schemas/GateGroup' }
+        ticket_count: { type: integer, description: Tickets that are `VALID` or `USED`. }
+        manifest_version: { type: string, description: 'The current manifest `version`. If it equals the one on the device, there is nothing to download.' }
+    GateEventList:
+      type: object
+      additionalProperties: false
+      required: [items]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/GateEventListItem' }
+    TicketStatusCode:
+      type: string
+      description: |
+        One-letter ticket status in the manifest.
+
+        | Code | Meaning | Device should |
+        |---|---|---|
+        | `V` | VALID | Admit. |
+        | `U` | USED | Refuse as duplicate. |
+        | `X` | VOID | Refuse; remove from the stored set. |
+        | `T` | TRANSFERRED | Refuse; remove from the stored set. |
+
+        `X` and `T` appear only in a changes-only manifest.
+      enum: [V, U, X, T]
+    ManifestTicketTuple:
+      type: array
+      description: |
+        One ticket as a fixed 3-item array.
+
+        | Pos | Name | Type | Meaning |
+        |---|---|---|---|
+        | 0 | `ticket_id` | uuid string | The ticket ID inside the signed QR payload. |
+        | 1 | `gate_group_index` | int | Position in the manifest's `gate_groups` array. |
+        | 2 | `status_code` | letter | `V`, `U`, `X` or `T`. |
+      prefixItems:
+        - { type: string, format: uuid, description: ticket_id }
+        - { type: integer, minimum: 0, description: gate_group_index }
+        - { $ref: '#/components/schemas/TicketStatusCode' }
+      items: false
+      minItems: 3
+      maxItems: 3
+    GateManifest:
+      type: object
+      additionalProperties: false
+      required: [event, version, full, generated_at, keys, gate_groups, ticket_count, tickets]
+      properties:
+        event: { $ref: '#/components/schemas/GateEvent' }
+        version: { type: string, description: Opaque. Send back as `since` next time. }
+        full: { type: boolean, description: True - replace the stored ticket set. False - apply `tickets` on top of it. }
+        generated_at: { type: string, format: date-time }
+        keys:
+          type: array
+          description: |
+            Every public key that signed a ticket for this event; normally one. A token
+            names its key by ID. A token whose key ID is not here is invalid.
+          minItems: 1
+          items:
+            type: object
+            additionalProperties: false
+            required: [key_id, algorithm, public_key]
+            properties:
+              key_id: { type: string }
+              algorithm:
+                type: string
+                enum: [Ed25519]
+              public_key:
+                type: string
+                pattern: '^[A-Za-z0-9_-]{43}$'
+                description: The 32-byte Ed25519 public key, base64url without padding.
+        gate_groups:
+          type: array
+          description: The table `gate_group_index` points into. Always the venue's full list in a stable order, also in a changes-only manifest.
+          items: { $ref: '#/components/schemas/GateGroup' }
+        ticket_count: { type: integer, description: 'Tickets that are `VALID` or `USED` for the event as of `version`, whatever `tickets` holds. A device can check its stored set against it.' }
+        tickets:
+          type: array
+          items: { $ref: '#/components/schemas/ManifestTicketTuple' }
+    Scan:
+      type: object
+      additionalProperties: false
+      required: [client_scan_id, ticket_id, event_id, gate_group, scanned_at, result]
+      properties:
+        client_scan_id: { type: string, format: uuid, description: 'Made on the device, once per scan. The upload is idempotent on it.' }
+        ticket_id: { type: string, format: uuid, description: The ticket ID read from the QR payload. }
+        event_id:
+          $ref: '#/components/schemas/Id'
+          description: The event the device was scanning for.
+        gate_group:
+          $ref: '#/components/schemas/GateGroup'
+          description: The gate group the device was set to.
+        scanned_at: { type: string, format: date-time, description: Device clock at the moment of the scan. }
+        result:
+          $ref: '#/components/schemas/ScanResult'
+          description: What the device decided offline and showed to the steward.
+        token:
+          type: string
+          maxLength: 512
+          description: The full QR text. Optional, but send it when the device has it so the server can check the signature itself.
+    ScanBatch:
+      type: object
+      additionalProperties: false
+      required: [device_id, scans]
+      properties:
+        device_id: { type: string, minLength: 1, maxLength: 64, description: Stable per install. }
+        scans:
+          type: array
+          minItems: 1
+          maxItems: 500
+          items: { $ref: '#/components/schemas/Scan' }
+    ScanBatchResult:
+      type: object
+      additionalProperties: false
+      required: [results]
+      properties:
+        results:
+          type: array
+          description: Same length and order as the uploaded `scans`.
+          items:
+            type: object
+            additionalProperties: false
+            required: [client_scan_id, ticket_id, result, overridden, ticket_status, first_admitted_at]
+            properties:
+              client_scan_id: { type: string, format: uuid }
+              ticket_id: { type: string, format: uuid }
+              result:
+                $ref: '#/components/schemas/ScanResult'
+                description: The server's final result for this scan.
+              overridden: { type: boolean, description: True when `result` differs from what the device sent. }
+              ticket_status:
+                description: The ticket's status now. Null when the server does not know the ticket.
+                anyOf:
+                  - { $ref: '#/components/schemas/TicketStatus' }
+                  - { type: 'null' }
+              first_admitted_at:
+                type: [string, 'null']
+                format: date-time
+                description: When the winning admit of this ticket was scanned. Null if it was never admitted.
