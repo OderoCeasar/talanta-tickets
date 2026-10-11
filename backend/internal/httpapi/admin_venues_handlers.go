@@ -244,3 +244,21 @@ func (s *Server) createVenueTemplate(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusCreated, newTemplateDTO(t))
 }
+
+func (s *Server) deleteVenueTemplate(w http.ResponseWriter, r *http.Request) {
+	venueID, err := PathID(r, "venueId")
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	templateID, err := PathID(r, "templateId")
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	if err := s.events.DeleteTemplate(r.Context(), venueID, templateID); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}

@@ -26,8 +26,14 @@ import (
 func (s *Service) Release(ctx context.Context, userID, holdID int64) error {
 	return store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
 		// Lock order: the event, the hold row, the booking, and the seats written last.
-		if _, err := store.LockEventOfHold(ctx, tx, holdID); errors.Is(err, store.ErrNoRows) {
+		// Bounded like a hold's wait: the only thing that keeps an event for long is a
+		// cancel of a well-sold one (which is releasing this hold anyway) or a publish.
+		if _, err := store.LockEventOfHoldWithin(ctx, tx, holdID, s.policy.EventLockWait); errors.Is(err, store.ErrNoRows) {
 			return domain.ErrNotFound
+		} else if store.IsLockTimeout(err) {
+			busy := domain.EventBusy("This event is being updated. Try again in a moment.")
+			busy.Err = err
+			return busy
 		} else if err != nil {
 			return fmt.Errorf("lock event of hold %d: %w", holdID, err)
 		}

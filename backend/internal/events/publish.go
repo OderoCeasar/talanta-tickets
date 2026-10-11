@@ -104,7 +104,9 @@ type PublishResult struct {
 //  1. Raise the statement timeout for this transaction only: copying ~60,000 seats takes
 //     longer than the pool's ordinary limit.
 //  2. Lock the event row. Painting and category edits take the same lock, so none can slip
-//     between "read the painting" and "copy it"; a second publish waits here.
+//     between "read the painting" and "copy it". They do not queue behind this for long:
+//     every taker of the lock waits Policy.LockWait and then answers EVENT_BUSY, a second
+//     publish included.
 //  3. Check the status read under the lock. Already published: nothing to do, answer with
 //     the current counts. Cancelled or completed: refused.
 //  4. Lock the venue row (shared) so no block is deleted or regenerated mid-copy.
@@ -117,7 +119,7 @@ func (s *Service) Publish(ctx context.Context, eventID int64) (PublishResult, er
 			return err
 		}
 		q := store.New(tx)
-		ev, err := lockEvent(ctx, q, eventID)
+		ev, err := s.lockEvent(ctx, q, eventID)
 		if err != nil {
 			return err
 		}
@@ -191,10 +193,19 @@ const cancelRefundReason = "The event was cancelled"
 // Cancel moves an event to CANCELLED, releases its holds, voids its tickets, closes unpaid
 // bookings and queues one refund per successful payment, all in one transaction. Cancelling
 // a cancelled event changes nothing and answers with zero counts.
+//
+// On a sold-out stadium that is about 60,000 tickets and 15,000 bookings rewritten at once,
+// so like publish it raises the statement timeout for its own transaction (and its route has
+// the longer request timeout). It stays one transaction: a cancel that stopped half way
+// would leave valid tickets for an event that is off.
 func (s *Service) Cancel(ctx context.Context, eventID int64) (CancelResult, error) {
 	var out CancelResult
-	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
-		ev, err := lockEvent(ctx, q, eventID)
+	err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
+		if err := store.SetLocalStatementTimeout(ctx, tx, s.policy.CancelTimeout); err != nil {
+			return err
+		}
+		q := store.New(tx)
+		ev, err := s.lockEvent(ctx, q, eventID)
 		if err != nil {
 			return err
 		}
@@ -249,6 +260,8 @@ func (s *Service) Cancel(ctx context.Context, eventID int64) (CancelResult, erro
 		return CancelResult{}, err
 	}
 	s.counts.invalidate(eventID)
+	s.log.InfoContext(ctx, "event cancelled", "event_id", eventID, "tickets_voided", out.TicketsVoided,
+		"refunds_queued", out.RefundsQueued, "holds_released", out.HoldsReleased)
 	out.Event, err = s.GetAdmin(ctx, eventID)
 	return out, err
 }

@@ -109,6 +109,19 @@ SELECT id FROM venues WHERE id = $1 FOR SHARE;
 -- them at once on one block would interleave their seat writes.
 SELECT * FROM blocks WHERE id = $1 FOR UPDATE;
 
+-- name: LockBlockForEdit :one
+-- Locks: the one blocks row, FOR NO KEY UPDATE, until the transaction ends.
+-- Why: a rename or a move reads the block and then rewrites it and its seats' positions; two
+-- edits of one block at once would interleave. NO KEY UPDATE still shuts out the other
+-- edits, regenerate and delete (they take NO KEY UPDATE or FOR UPDATE on the same row), but
+-- unlike FOR UPDATE it does not conflict with the FOR KEY SHARE locks a publish takes on
+-- every block it copies seats of (the event_seats.block_id foreign key) and keeps until it
+-- commits, most of a minute later. A move changes no key column, so it has no reason to
+-- queue behind a publish. Changing the block's code is the exception: (stand_id, code) is a
+-- unique key, so that UPDATE itself needs the stronger lock and waits; UpdateBlock runs
+-- under a short lock_timeout for that case.
+SELECT * FROM blocks WHERE id = $1 FOR NO KEY UPDATE;
+
 -- name: GetBlockWithVenue :one
 SELECT sqlc.embed(b), st.venue_id, v.plan_width, v.plan_height
 FROM blocks b

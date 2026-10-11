@@ -70,7 +70,7 @@ func (s *Service) Assign(ctx context.Context, eventID int64, in AssignInput) (As
 	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
 		// The same row lock publish takes: this either commits before publish reads the
 		// painting, or runs after it and is refused just below.
-		ev, err := lockEvent(ctx, q, eventID)
+		ev, err := s.lockEvent(ctx, q, eventID)
 		if err != nil {
 			return err
 		}
@@ -265,4 +265,16 @@ func (s *Service) CreateTemplate(ctx context.Context, venueID int64, name string
 		return Template{}, err
 	}
 	return decodeTemplate(row)
+}
+
+// DeleteTemplate removes a venue's template. Events made from it keep what was copied.
+func (s *Service) DeleteTemplate(ctx context.Context, venueID, templateID int64) error {
+	n, err := s.q.DeleteVenueTemplate(ctx, store.DeleteVenueTemplateParams{ID: templateID, VenueID: venueID})
+	if err != nil {
+		return fmt.Errorf("delete template %d: %w", templateID, err)
+	}
+	if n == 0 {
+		return domain.E(domain.CodeNotFound, "We could not find that template.")
+	}
+	return nil
 }

@@ -94,7 +94,8 @@ type Deps struct {
 	// Venues is the venue layout service (M4).
 	Venues *venue.Service
 	// PublishTimeout bounds POST /admin/events/{id}/publish, which copies one row per seat
-	// and outlasts RequestTimeout. Zero means 55 seconds. It must stay under the server's
+	// and outlasts RequestTimeout, and POST /admin/events/{id}/cancel, which on a sold-out
+	// event rewrites as many tickets. Zero means 55 seconds. It must stay under the server's
 	// write timeout.
 	PublishTimeout time.Duration
 

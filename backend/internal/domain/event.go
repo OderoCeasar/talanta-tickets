@@ -89,6 +89,16 @@ func EventNotEditable(current EventStatus, message string) *Error {
 	return &Error{Code: CodeEventNotEditable, Message: message, Details: EventStateDetails{CurrentStatus: current}}
 }
 
+// EventBusy builds the EVENT_BUSY error: the event (or, for a layout edit, an event at the
+// venue) is locked by a publish, a cancel or another edit, and this request gave up waiting
+// for it. Nothing was changed and the same request can simply be sent again.
+func EventBusy(message string) *Error {
+	if message == "" {
+		message = "This event is being published or changed. Try again in a moment."
+	}
+	return &Error{Code: CodeEventBusy, Message: message}
+}
+
 // SalesOpenAt reports whether now is inside the sales window [open, close). A missing open
 // time means "already open"; a missing close time means "never closes".
 func SalesOpenAt(open, closeAt *time.Time, now time.Time) bool {
@@ -206,10 +216,49 @@ func SalesWindowProblems(kickoff time.Time, open, closeAt *time.Time, now time.T
 	return out
 }
 
-// SalesStartedDetails is the details shape of CONFIRMATION_REQUIRED and CATEGORY_IN_USE.
+// PublishedEventProblems checks an edit of an event that has already been published, on the
+// merged row, against the same rules publish enforced (SalesWindowProblems), and names the
+// field to blame for each. Without it an edit could undo readiness: clear sales_close_at so
+// sales never close, or move the kickoff into the past.
+//
+// kickoffChanged says whether the edit moves the kickoff. An event whose kickoff has simply
+// come and gone must stay editable (a poster, a typo in the title), so "kickoff in the past"
+// is only a problem when this edit is what puts it there.
+func PublishedEventProblems(kickoff time.Time, open, closeAt *time.Time, kickoffChanged bool, now time.Time) []FieldError {
+	var out []FieldError
+	if open == nil {
+		out = append(out, FieldError{Field: "sales_open_at", Rule: "required", Message: "A published event must say when ticket sales open."})
+	}
+	if closeAt == nil {
+		out = append(out, FieldError{Field: "sales_close_at", Rule: "required", Message: "A published event must say when ticket sales close."})
+	}
+	if open != nil && closeAt != nil {
+		switch {
+		case !closeAt.After(*open):
+			out = append(out, FieldError{Field: "sales_close_at", Rule: "after_open", Message: "Sales must close after they open."})
+		case closeAt.After(kickoff):
+			out = append(out, FieldError{Field: "sales_close_at", Rule: "before_kickoff", Message: "Sales must close at or before kickoff."})
+		}
+	}
+	if kickoffChanged && !kickoff.After(now) {
+		out = append(out, FieldError{Field: "kickoff_at", Rule: "future", Message: "The kickoff of a published event cannot be moved into the past."})
+	}
+	return out
+}
+
+// SalesStartedDetails is the details shape of CONFIRMATION_REQUIRED.
 type SalesStartedDetails struct {
 	Sold int `json:"sold"`
 	Held int `json:"held"`
+}
+
+// CategoryInUseDetails is the details shape of CATEGORY_IN_USE. Seats is every inventory row
+// of the category, so "the event is published with it" (Seats > 0, Sold and Held zero) can
+// be told from "tickets are sold or held in it".
+type CategoryInUseDetails struct {
+	Seats int `json:"seats"`
+	Sold  int `json:"sold"`
+	Held  int `json:"held"`
 }
 
 // InventoryDetails is the details shape of BLOCK_HAS_INVENTORY.

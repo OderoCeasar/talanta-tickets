@@ -125,11 +125,17 @@ func (q *Queries) CreateVenueTemplate(ctx context.Context, arg CreateVenueTempla
 }
 
 const deleteVenueTemplate = `-- name: DeleteVenueTemplate :execrows
-DELETE FROM venue_templates WHERE id = $1
+DELETE FROM venue_templates WHERE id = $1 AND venue_id = $2
 `
 
-func (q *Queries) DeleteVenueTemplate(ctx context.Context, id int64) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteVenueTemplate, id)
+type DeleteVenueTemplateParams struct {
+	ID      int64
+	VenueID int64
+}
+
+// Scoped to the venue in the path, so a template id from another venue deletes nothing.
+func (q *Queries) DeleteVenueTemplate(ctx context.Context, arg DeleteVenueTemplateParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteVenueTemplate, arg.ID, arg.VenueID)
 	if err != nil {
 		return 0, err
 	}

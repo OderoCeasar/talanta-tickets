@@ -39,6 +39,10 @@ type Policy struct {
 	SweepBatch int
 	// SweepMaxBatches bounds one sweeper run.
 	SweepMaxBatches int
+	// EventLockWait is how long a hold request waits for the event when an organiser's
+	// publish, cancel or edit has it locked, before it answers EVENT_BUSY. Without a limit
+	// the request sat behind a long cancel until the statement timeout and answered 500.
+	EventLockWait time.Duration
 	// BookingFeeBPS is the booking fee in basis points of the subtotal (BOOKING_FEE_BPS).
 	// Zero means no fee. A hold shows the fee as an estimate; the booking charges it.
 	BookingFeeBPS int
@@ -52,6 +56,7 @@ func DefaultPolicy() Policy {
 		BestAvailableTries: 6,
 		SweepBatch:         200,
 		SweepMaxBatches:    50,
+		EventLockWait:      3 * time.Second,
 	}
 }
 
@@ -97,6 +102,9 @@ func NewService(cfg Config) (*Service, error) {
 	}
 	if p.SweepMaxBatches <= 0 {
 		p.SweepMaxBatches = def.SweepMaxBatches
+	}
+	if p.EventLockWait <= 0 {
+		p.EventLockWait = def.EventLockWait
 	}
 	return &Service{db: cfg.DB, q: store.New(cfg.DB), log: cfg.Logger, policy: p}, nil
 }

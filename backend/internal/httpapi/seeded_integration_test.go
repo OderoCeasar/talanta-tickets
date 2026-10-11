@@ -125,12 +125,59 @@ func TestSeededVenue_SeatMapPayloadSizes(t *testing.T) {
 	t.Logf("level 2 (largest stand, %2d blocks): %5d bytes raw (%.1f KB), %5d gzipped", maxBlocks, maxRaw, float64(maxRaw)/kb, maxGz)
 	assert.LessOrEqual(t, maxRaw, 12*1024, "§5.1: about 10 KB")
 
-	// Level 3: the largest block of the venue.
-	var blockID int64
-	var blockSeats int
-	require.NoError(t, db.Pool.QueryRow(context.Background(), `
-		SELECT block_id, count(*) FROM event_seats WHERE event_id = $1 GROUP BY block_id ORDER BY count(*) DESC, block_id LIMIT 1`,
-		sv.OnSale).Scan(&blockID, &blockSeats))
+	// Level 3: EVERY block of the venue is measured, and the largest answer is the one
+	// reported and asserted. Size does not follow the seat count alone: blocks with the
+	// same number of seats differ by thousands of bytes (a curved block's coordinates have
+	// more digits, and ids, labels and numbers of a later block are longer), so "the block
+	// with the most seats, lowest id first" measured a block that was not the largest.
+	type blockSize struct {
+		id             int64
+		seats, raw, gz int
+	}
+	var sizes []blockSize
+	rows, err := db.Pool.Query(context.Background(),
+		`SELECT block_id, count(*) FROM event_seats WHERE event_id = $1 GROUP BY block_id ORDER BY block_id`, sv.OnSale)
+	require.NoError(t, err)
+	for rows.Next() {
+		var b blockSize
+		require.NoError(t, rows.Scan(&b.id, &b.seats))
+		sizes = append(sizes, b)
+	}
+	require.NoError(t, rows.Err())
+	require.Len(t, sizes, queryInt(t, `SELECT count(*) FROM blocks b JOIN stands st ON st.id = b.stand_id WHERE st.venue_id = $1`, sv.VenueID), "every block of the venue")
+	var largest, largestGz, mostSeats blockSize
+	over40 := 0
+	for i := range sizes {
+		b := &sizes[i]
+		b.gz, b.raw = gzipped(t, e, fmt.Sprintf("%s/blocks/%d/seats", base, b.id), "")
+		if b.raw > largest.raw {
+			largest = *b
+		}
+		if b.gz > largestGz.gz {
+			largestGz = *b
+		}
+		if b.seats > mostSeats.seats {
+			mostSeats = *b
+		}
+		if b.raw > 40*1024 {
+			over40++
+		}
+	}
+	blockID, blockSeats, raw3, gz3 := largest.id, largest.seats, largest.raw, largest.gz
+	t.Logf("level 3, all %d blocks measured: largest answer is block %d (%d seats): %5d bytes raw (%.1f KB), %5d gzipped (%.1f bytes a seat raw)",
+		len(sizes), blockID, blockSeats, raw3, float64(raw3)/kb, gz3, float64(raw3)/float64(blockSeats))
+	t.Logf("level 3: largest gzipped answer is block %d (%d seats): %d bytes gzipped, %d raw; %d of %d blocks are over 40 KB raw",
+		largestGz.id, largestGz.seats, largestGz.gz, largestGz.raw, over40, len(sizes))
+	t.Logf("level 3: the first block with the most seats (%d, block %d), which this test used to report: %d bytes raw, %d gzipped",
+		mostSeats.seats, mostSeats.id, mostSeats.raw, mostSeats.gz)
+	// Reported, not hidden: the tuple layout costs 33 to 35 bytes a seat raw, so the largest
+	// blocks are over the 40 KB of §5.1 before compression, and a curved block's coordinates
+	// compress to about a third rather than the eighth first estimated. The bounds here are
+	// guard rails against a regression, on the true maximum, not the targets.
+	assert.LessOrEqual(t, raw3, 48*1024)
+	assert.LessOrEqual(t, largestGz.gz, 16*1024, "what travels over the air")
+
+	// The largest block again, contract-checked: one block only.
 	seatsPath := fmt.Sprintf("%s/blocks/%d/seats", base, blockID)
 	full := want(t, e.do("GET", seatsPath, nil, ""), http.StatusOK)
 	codes := seatCodes(t, full)
@@ -142,15 +189,6 @@ func TestSeededVenue_SeatMapPayloadSizes(t *testing.T) {
 	for id := range codes {
 		require.True(t, inBlock[id], "seat %d is not in block %d", id, blockID)
 	}
-	gz3, raw3 := gzipped(t, e, seatsPath, "")
-	t.Logf("level 3 (largest block, %d seats): %5d bytes raw (%.1f KB), %5d gzipped (%.1f bytes a seat raw)",
-		blockSeats, raw3, float64(raw3)/kb, gz3, float64(raw3)/float64(blockSeats))
-	// Reported, not hidden: the tuple layout costs about 33 bytes a seat raw, so the
-	// largest block is a little over the 40 KB of §5.1 before compression, and a curved
-	// block's coordinates compress to about a third rather than the eighth first estimated.
-	// The bounds here are guard rails against a regression, not the targets.
-	assert.LessOrEqual(t, raw3, 48*1024)
-	assert.LessOrEqual(t, gz3, 16*1024, "what travels over the air")
 
 	// The poll: an empty delta, and one with a handful of changes.
 	marker := full["marker"].(string)

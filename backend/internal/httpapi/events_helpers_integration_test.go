@@ -33,6 +33,7 @@ var m4m5Operations = []string{
 	"publishEvent", "cancelEvent", "listAdminEventCategories", "createCategory",
 	"updateCategory", "deleteCategory", "getEventAssignments", "assignCategory",
 	"getEventSales", "listEventBookings",
+	"deleteEvent", "deleteVenueTemplate",
 }
 
 func withEventPolicy(fn func(*events.Policy)) envOption {

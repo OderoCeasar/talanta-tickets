@@ -171,10 +171,13 @@ func TestGenerateLabelsPastZ(t *testing.T) {
 
 func TestGenerateRejectsBadParams(t *testing.T) {
 	cases := map[string]func(*BlockParams){
-		"no rows":             func(p *BlockParams) { p.Rows = 0 },
-		"too many rows":       func(p *BlockParams) { p.Rows = MaxRows + 1 },
-		"no seats":            func(p *BlockParams) { p.SeatsPerRow = 0 },
-		"too many seats":      func(p *BlockParams) { p.SeatsPerRow = MaxSeatsPerRow + 1 },
+		"no rows":        func(p *BlockParams) { p.Rows = 0 },
+		"too many rows":  func(p *BlockParams) { p.Rows = MaxRows + 1 },
+		"no seats":       func(p *BlockParams) { p.SeatsPerRow = 0 },
+		"too many seats": func(p *BlockParams) { p.SeatsPerRow = MaxSeatsPerRow + 1 },
+		"too many seats in all": func(p *BlockParams) {
+			p.Rows, p.SeatsPerRow = MaxRows, MaxSeatsPerRow
+		},
 		"zero pitch":          func(p *BlockParams) { p.PitchX = 0 },
 		"negative pitch":      func(p *BlockParams) { p.PitchY = -1 },
 		"NaN pitch":           func(p *BlockParams) { p.PitchX = math.NaN() },
@@ -263,4 +266,29 @@ func TestBounds(t *testing.T) {
 	assert.Equal(t, Bounds{MinX: 46, MinY: 96, MaxX: 69, MaxY: 112}, sb, "half the larger pitch on every side")
 	_, ok = SeatBounds(nil, 5, 8)
 	assert.False(t, ok)
+}
+
+// Rows and seats per row are each capped, but 200 × 500 is 100,000 seats in one block. The
+// product has its own cap, and the error says it is the size, not either number alone.
+func TestValidateCapsTheSizeOfABlock(t *testing.T) {
+	p := base()
+	p.OriginX, p.OriginY = 0, 0
+
+	p.Rows, p.SeatsPerRow = 6, MaxSeatsPerRow // exactly 3,000
+	require.Equal(t, MaxSeatsPerBlock, p.Rows*p.SeatsPerRow)
+	require.NoError(t, p.Validate())
+	layout, err := Generate(p)
+	require.NoError(t, err)
+	assert.Equal(t, MaxSeatsPerBlock, layout.SeatCount())
+
+	for _, size := range [][2]int{{MaxRows, MaxSeatsPerRow}, {7, MaxSeatsPerRow}, {MaxRows, 16}, {61, 50}} {
+		p.Rows, p.SeatsPerRow = size[0], size[1]
+		err := p.Validate()
+		var pe *ParamError
+		require.ErrorAs(t, err, &pe, "%d × %d", size[0], size[1])
+		assert.Equal(t, FieldBlockSize, pe.Field)
+		assert.Contains(t, pe.Reason, "at most 3000 seats")
+		_, err = Generate(p)
+		require.ErrorIs(t, err, ErrInvalidParams, "Generate must refuse it before building anything")
+	}
 }
