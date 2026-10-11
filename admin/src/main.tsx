@@ -5,6 +5,8 @@ import { BrowserRouter } from "react-router-dom";
 import { App } from "./App";
 import { queryClient } from "./lib/api";
 import { SessionProvider } from "./lib/session";
+// Fonts first, so the faces are declared before the rules that name them.
+import "./fonts.css";
 import "./index.css";
 
 createRoot(document.getElementById("root")!).render(

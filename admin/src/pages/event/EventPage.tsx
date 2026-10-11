@@ -7,10 +7,11 @@ import { EventForm } from "../../components/EventForm";
 import { StatusChip, teamsLine } from "../../components/EventBits";
 import { Alert, Button, Card, ConfirmDialog, LoadFailed, SkeletonRows, useElapsedSeconds } from "../../components/ui";
 import { api, type Schemas } from "../../lib/api";
+import { badgeText, countPhrase } from "../../lib/attention";
 import { describeError, isCode } from "../../lib/errors";
 import { formatDateTime } from "../../lib/format";
 import { formatCount, formatKes } from "../../lib/money";
-import { isPublished, keys, STATUS_HINTS, STATUS_LABELS, useCancelInFlight, useEvent, usePublishInFlight, type AdminEvent } from "../../lib/queries";
+import { isPublished, keys, STATUS_HINTS, STATUS_LABELS, useCancelInFlight, useEvent, useOpenAlertCount, usePublishInFlight, type AdminEvent } from "../../lib/queries";
 import { NotFoundPage } from "../SimplePages";
 
 /** The contract asks clients to give publish and cancel 60 seconds; the server gives up at 55. */
@@ -77,6 +78,9 @@ export function EventPage() {
 function EventPageInner({ eventId }: { eventId: number }) {
   const queryClient = useQueryClient();
   const event = useEvent(eventId);
+  // A draft has no payments, so it has no alerts to count.
+  const openAlerts = useOpenAlertCount(eventId, event.data !== undefined && event.data.status !== "DRAFT").data;
+  const alertBadge = openAlerts ? badgeText(openAlerts.count, openAlerts.more) : null;
   const publishing = usePublishInFlight(eventId);
   const [publishStartedAt, setPublishStartedAt] = useState<number | null>(null);
   const cancelling = useCancelInFlight(eventId);
@@ -89,6 +93,8 @@ function EventPageInner({ eventId }: { eventId: number }) {
       queryClient.invalidateQueries({ queryKey: keys.event(eventId) }),
       queryClient.invalidateQueries({ queryKey: ["events", "list"] }),
       queryClient.invalidateQueries({ queryKey: keys.venues }),
+      // A cancel queues a refund for every paid booking.
+      queryClient.invalidateQueries({ queryKey: keys.refunds }),
     ]);
 
   const publish = useMutation({
@@ -287,6 +293,12 @@ function EventPageInner({ eventId }: { eventId: number }) {
         {TABS.map((tab) => (
           <NavLink key={tab.to} to={tab.to} end={tab.end} className="tabs__tab">
             {tab.label}
+            {tab.to === "sales" && alertBadge && (
+              <span className="badge tabs__badge" data-testid="sales-tab-badge">
+                <span aria-hidden="true">{alertBadge}</span>
+                <span className="visually-hidden">, {countPhrase(openAlerts!.count, openAlerts!.more, "open alert", "open alerts")}</span>
+              </span>
+            )}
           </NavLink>
         ))}
       </nav>
