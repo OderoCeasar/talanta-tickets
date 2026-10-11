@@ -402,6 +402,9 @@ export interface paths {
          *     the moment of the request: a published event is `ON_SALE` exactly while now is
          *     inside `[sales_open_at, sales_close_at)` and `PUBLISHED` outside it. The `status`
          *     filter matches on that same value.
+         *
+         *     `seats_available` and `price_from_cents` in this list may be up to 20 seconds old.
+         *     `GET /events/{eventId}` and the seat map lag by a few seconds at most.
          */
         get: operations["listEvents"];
         put?: never;
@@ -915,6 +918,11 @@ export interface paths {
          *     so existing inventory and tickets are not affected. A move that would take the
          *     block's outline outside the venue plan is 400 with rule `plan_bounds` on the
          *     placement fields that were sent.
+         *
+         *     A move, a new label or a new curve goes through while an event at the venue is
+         *     being published. A new `code` has to wait for the publish; if the wait passes
+         *     about 3 seconds, or someone else is editing the same block, the answer is 409
+         *     `EVENT_BUSY` and nothing changed.
          */
         patch: operations["updateBlock"];
         trace?: never;
@@ -938,7 +946,9 @@ export interface paths {
          *     **replaced** and the answer carries the new IDs. Replacing is refused once any
          *     event has inventory for the block.
          *
-         *     Limits: 200 rows, 500 seats per row. The generated outline must stay inside the
+         *     Limits: 200 rows, 500 seats per row, and 3,000 seats in the block
+         *     (`rows` x `seats_per_row`; more is 400 with rule `max_seats` on both fields, for a
+         *     preview too). The generated outline must stay inside the
          *     venue plan (`0..plan_width` by `0..plan_height`); if it does not, the answer is 400
          *     with rule `plan_bounds` on `rows` and `seats_per_row` and nothing is saved. A
          *     layout the geometry cannot make (for example a row too long for the block's
@@ -999,6 +1009,27 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/admin/venues/{venueId}/templates/{templateId}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        /**
+         * Delete a saved template
+         * @description **Role:** ORGANISER, ADMIN. Removes the template. Events that were created from it
+         *     keep their categories and painting: those were copied when the event was made.
+         */
+        delete: operations["deleteVenueTemplate"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/admin/events": {
         parameters: {
             query?: never;
@@ -1008,7 +1039,7 @@ export interface paths {
         };
         /**
          * Events in every status
-         * @description **Role:** ORGANISER, ADMIN. Ordered by kickoff, latest first.
+         * @description **Role:** ORGANISER, ADMIN. Ordered by kickoff, latest first. `seats_available` and `price_from_cents` in this list may be up to 20 seconds old; one event read on its own lags by a few seconds at most.
          */
         get: operations["listAdminEvents"];
         put?: never;
@@ -1038,7 +1069,16 @@ export interface paths {
         get: operations["getAdminEvent"];
         put?: never;
         post?: never;
-        delete?: never;
+        /**
+         * Delete a draft event
+         * @description **Role:** ORGANISER, ADMIN. Removes a `DRAFT` event with its categories and its
+         *     painting. Only a draft can be deleted: once published an event has inventory and
+         *     may have sales, so it is cancelled instead (409 `EVENT_NOT_EDITABLE`,
+         *     `details.current_status` says where it is; a draft that was cancelled is
+         *     `CANCELLED` and stays). Venue templates saved from the event are copies and are
+         *     not touched. Deleting an event that is already gone answers 404.
+         */
+        delete: operations["deleteEvent"];
         options?: never;
         head?: never;
         /**
@@ -1048,6 +1088,12 @@ export interface paths {
          *     `CANCELLED` and `COMPLETED` events cannot be edited. The times must still make
          *     sense together after the change (gates before kickoff, sales closing after they
          *     open and not after kickoff), otherwise 400.
+         *
+         *     Once the event has left `DRAFT` the change must also keep what publishing
+         *     checked: `sales_open_at` and `sales_close_at` cannot be cleared (400, rule
+         *     `required`) and `kickoff_at` cannot be moved to a time that has already passed
+         *     (400, rule `future`). An event whose kickoff has simply gone by can still have
+         *     its other fields edited.
          */
         patch: operations["updateEvent"];
         trace?: never;
@@ -1090,8 +1136,12 @@ export interface paths {
          *     otherwise to `PUBLISHED`. No request body.
          *
          *     This is the one slow call in the API: for the full stadium it can take most of a
-         *     minute, so give it a client timeout of 60 seconds. Painting and category changes
-         *     sent while it runs wait for it and are then answered against the published event.
+         *     minute, so give it a client timeout of 60 seconds. While it runs the event is
+         *     locked: painting, category changes, edits of the event, cancel, a second publish
+         *     and a fan's hold request wait a few seconds (5 for staff calls, 3 for holds) and
+         *     are then answered 409 `EVENT_BUSY`, with nothing changed. Send them again once
+         *     the publish has answered. Changing a block's `code` at the same venue is refused
+         *     the same way; deleting or regenerating a block answers 409 `BLOCK_HAS_INVENTORY`.
          *
          *     Safe to repeat: publishing an event that is already `PUBLISHED`, `ON_SALE` or
          *     `SOLD_OUT` changes nothing and answers 200 with `already_published: true`.
@@ -1123,6 +1173,11 @@ export interface paths {
          *     per successful payment and moves `PAID` bookings to `REFUND_REQUIRED`, all in one
          *     transaction. A draft can be cancelled too. No request body. Safe to repeat:
          *     cancelling a `CANCELLED` event answers 200 with zero counts.
+         *
+         *     On a sold-out stadium this rewrites about 60,000 seats, tickets and bookings and
+         *     can take longer than an ordinary call, so it runs under the same longer time limit
+         *     as publish: give it a client timeout of 60 seconds. While it runs the event is
+         *     locked as it is during a publish (other calls answer 409 `EVENT_BUSY`).
          */
         post: operations["cancelEvent"];
         delete?: never;
@@ -1146,7 +1201,9 @@ export interface paths {
         put?: never;
         /**
          * Add a category to an event
-         * @description **Role:** ORGANISER, ADMIN. The name is unique within the event.
+         * @description **Role:** ORGANISER, ADMIN. The name is unique within the event. While the event is
+         *     `DRAFT` a price of zero is accepted (it blocks publishing); once the event has left
+         *     `DRAFT` the price must be above zero (400 on `price_cents`, rule `gt`).
          */
         post: operations["createCategory"];
         delete?: never;
@@ -1183,6 +1240,9 @@ export interface paths {
          *     already be looking at the old price; `details` says how many seats of the category
          *     are sold or held, which may be none.) Sending the price the category already has is
          *     not a change. Past bookings always keep the price they were made at.
+         *
+         *     Once the event has left `DRAFT` the price must stay above zero: `price_cents: 0`
+         *     is 400 on `price_cents` (rule `gt`), with or without `confirm`.
          */
         patch: operations["updateCategory"];
         trace?: never;
@@ -1250,8 +1310,14 @@ export interface paths {
          *
          *     Time-series buckets start on Africa/Nairobi clock boundaries: a `day` bucket runs
          *     from Nairobi midnight (21:00 UTC) to the next. `from` is inclusive, `to` exclusive;
-         *     the first and last buckets only count what is inside the range. A range of more
-         *     than 2,000 buckets is refused with 400 on `from`.
+         *     the first and last buckets only count what is inside the range.
+         *
+         *     A call with no `bucket` and no `from` always succeeds, however long the event has
+         *     been selling. When `bucket` is left out the server picks it: `hour` for a range of
+         *     up to 48 hours, `day` beyond that; `series.bucket` says which. When `from` is left
+         *     out the series starts at the first paid booking, or later if that would be more
+         *     than 2,000 buckets: then it is the most recent 2,000. Only a `from` the caller
+         *     sent can be too far back: more than 2,000 buckets is then 400 on `from`.
          */
         get: operations["getEventSales"];
         put?: never;
@@ -1652,23 +1718,20 @@ export interface components {
          * @enum {string}
          */
         RowLabelScheme: "ALPHA" | "NUMERIC";
-        /**
-         * @default hour
-         * @enum {string}
-         */
+        /** @enum {string} */
         SalesBucket: "hour" | "day";
         /**
          * @description Every code the API can return. See `docs/API_NOTES.md` for status and meaning.
          * @enum {string}
          */
-        ErrorCode: "VALIDATION_FAILED" | "IDEMPOTENCY_KEY_REQUIRED" | "UNAUTHENTICATED" | "TOKEN_EXPIRED" | "OTP_INVALID" | "OTP_EXPIRED" | "INVALID_CREDENTIALS" | "MFA_TOKEN_INVALID" | "TOTP_INVALID" | "REFRESH_TOKEN_INVALID" | "REFRESH_TOKEN_REUSED" | "FORBIDDEN" | "MOCK_NOT_ALLOWED" | "NOT_FOUND" | "INVITATION_INVALID" | "INVITATION_EXPIRED" | "SEATS_UNAVAILABLE" | "NO_ADJACENT_SEATS" | "EVENT_NOT_ON_SALE" | "SALES_NOT_OPEN" | "SALES_CLOSED" | "HOLD_EXPIRED" | "HOLD_NOT_ACTIVE" | "HOLD_ALREADY_BOOKED" | "BOOKING_NOT_PAYABLE" | "PAYMENT_IN_PROGRESS" | "EVENT_NOT_READY" | "INVALID_STATE_TRANSITION" | "EVENT_NOT_EDITABLE" | "BLOCK_HAS_INVENTORY" | "CATEGORY_IN_USE" | "CONFIRMATION_REQUIRED" | "ALREADY_EXISTS" | "EMAIL_ALREADY_REGISTERED" | "INVITATION_ALREADY_PENDING" | "INVITATION_NOT_PENDING" | "TOTP_ALREADY_ENABLED" | "TOTP_NOT_ENABLED" | "TOTP_SETUP_REQUIRED" | "PAYLOAD_TOO_LARGE" | "TICKET_LIMIT_EXCEEDED" | "IDEMPOTENCY_KEY_REUSED" | "VENUE_MISMATCH" | "PASSWORD_INCORRECT" | "TOTP_CODE_INCORRECT" | "RATE_LIMITED" | "OTP_ATTEMPTS_EXCEEDED" | "INTERNAL" | "PAYMENT_PROVIDER_UNAVAILABLE";
+        ErrorCode: "VALIDATION_FAILED" | "IDEMPOTENCY_KEY_REQUIRED" | "UNAUTHENTICATED" | "TOKEN_EXPIRED" | "OTP_INVALID" | "OTP_EXPIRED" | "INVALID_CREDENTIALS" | "MFA_TOKEN_INVALID" | "TOTP_INVALID" | "REFRESH_TOKEN_INVALID" | "REFRESH_TOKEN_REUSED" | "FORBIDDEN" | "MOCK_NOT_ALLOWED" | "NOT_FOUND" | "INVITATION_INVALID" | "INVITATION_EXPIRED" | "SEATS_UNAVAILABLE" | "NO_ADJACENT_SEATS" | "EVENT_NOT_ON_SALE" | "SALES_NOT_OPEN" | "SALES_CLOSED" | "HOLD_EXPIRED" | "HOLD_NOT_ACTIVE" | "HOLD_ALREADY_BOOKED" | "BOOKING_NOT_PAYABLE" | "PAYMENT_IN_PROGRESS" | "EVENT_NOT_READY" | "INVALID_STATE_TRANSITION" | "EVENT_NOT_EDITABLE" | "EVENT_BUSY" | "BLOCK_HAS_INVENTORY" | "CATEGORY_IN_USE" | "CONFIRMATION_REQUIRED" | "ALREADY_EXISTS" | "EMAIL_ALREADY_REGISTERED" | "INVITATION_ALREADY_PENDING" | "INVITATION_NOT_PENDING" | "TOTP_ALREADY_ENABLED" | "TOTP_NOT_ENABLED" | "TOTP_SETUP_REQUIRED" | "PAYLOAD_TOO_LARGE" | "TICKET_LIMIT_EXCEEDED" | "IDEMPOTENCY_KEY_REUSED" | "VENUE_MISMATCH" | "PASSWORD_INCORRECT" | "TOTP_CODE_INCORRECT" | "RATE_LIMITED" | "OTP_ATTEMPTS_EXCEEDED" | "INTERNAL" | "PAYMENT_PROVIDER_UNAVAILABLE";
         Error: {
             error: {
                 code: components["schemas"]["ErrorCode"];
                 /** @description Plain English, safe to show to the user. */
                 message: string;
                 /** @description Null, or an object whose shape is fixed by `code`. */
-                details: null | components["schemas"]["ValidationDetails"] | components["schemas"]["SeatsUnavailableDetails"] | components["schemas"]["TicketLimitDetails"] | components["schemas"]["SalesWindowDetails"] | components["schemas"]["NoAdjacentSeatsDetails"] | components["schemas"]["HoldStateDetails"] | components["schemas"]["BookingStateDetails"] | components["schemas"]["PaymentInProgressDetails"] | components["schemas"]["NotReadyDetails"] | components["schemas"]["EventStateDetails"] | components["schemas"]["SalesStartedDetails"] | components["schemas"]["InventoryDetails"] | components["schemas"]["RateLimitDetails"];
+                details: null | components["schemas"]["ValidationDetails"] | components["schemas"]["SeatsUnavailableDetails"] | components["schemas"]["TicketLimitDetails"] | components["schemas"]["SalesWindowDetails"] | components["schemas"]["NoAdjacentSeatsDetails"] | components["schemas"]["HoldStateDetails"] | components["schemas"]["BookingStateDetails"] | components["schemas"]["PaymentInProgressDetails"] | components["schemas"]["NotReadyDetails"] | components["schemas"]["EventStateDetails"] | components["schemas"]["SalesStartedDetails"] | components["schemas"]["CategoryInUseDetails"] | components["schemas"]["InventoryDetails"] | components["schemas"]["RateLimitDetails"];
             };
         };
         /** @description For `VALIDATION_FAILED`, `IDEMPOTENCY_KEY_REQUIRED`, `ALREADY_EXISTS`, `VENUE_MISMATCH`. */
@@ -1737,9 +1800,18 @@ export interface components {
         EventStateDetails: {
             current_status: components["schemas"]["EventStatus"];
         };
-        /** @description For `CONFIRMATION_REQUIRED`, `CATEGORY_IN_USE`. */
+        /** @description For `CONFIRMATION_REQUIRED`. */
         SalesStartedDetails: {
             sold: number;
+            held: number;
+        };
+        /** @description For `CATEGORY_IN_USE`. */
+        CategoryInUseDetails: {
+            /** @description Seats published in this category (the event's inventory rows that point at it), whatever their status. Above zero as soon as the event is published with the category painted on any seat. */
+            seats: number;
+            /** @description How many of those seats are sold. */
+            sold: number;
+            /** @description How many of those seats are in a live hold. */
             held: number;
         };
         /** @description For `BLOCK_HAS_INVENTORY`. */
@@ -2015,8 +2087,8 @@ export interface components {
              * @description After `sales_open_at` and not after `kickoff_at`.
              */
             sales_close_at?: string | null;
-            /** @default 6 */
-            max_tickets_per_user: number;
+            /** @description Optional. 6 when left out. */
+            max_tickets_per_user?: number;
             /** @description Copy this venue template's categories and assignments onto the new event. */
             template_id?: components["schemas"]["Id"] | null;
         };
@@ -2058,7 +2130,7 @@ export interface components {
             name: string;
             /**
              * Format: int64
-             * @description Zero is accepted here but blocks publishing.
+             * @description Zero is accepted while the event is `DRAFT` (it blocks publishing) and refused afterwards.
              */
             price_cents: number;
             color_hex: components["schemas"]["ColorHex"];
@@ -2070,11 +2142,8 @@ export interface components {
             price_cents?: number;
             color_hex?: components["schemas"]["ColorHex"];
             description?: string | null;
-            /**
-             * @description Must be true to change the price once the event has left `DRAFT`.
-             * @default false
-             */
-            confirm: boolean;
+            /** @description Optional; false when left out. Must be true to change the price once the event has left `DRAFT`. */
+            confirm?: boolean;
         };
         /** @description A category as the seat map needs it. Sent once per answer. */
         MapCategory: {
@@ -2641,8 +2710,8 @@ export interface components {
             label: string;
             origin_x: number;
             origin_y: number;
-            /** @default 0 */
-            rotation_deg: number;
+            /** @description Optional. 0 when left out. */
+            rotation_deg?: number;
             /** @description Null or omitted for a straight block. */
             arc_radius?: number | null;
             seat_pitch_x: number;
@@ -2661,21 +2730,19 @@ export interface components {
         };
         GenerateSeats: {
             rows: number;
+            /** @description `rows` x `seats_per_row` may be at most 3,000. */
             seats_per_row: number;
-            /** @default ALPHA */
-            row_label_scheme: components["schemas"]["RowLabelScheme"];
-            /** @default LTR */
-            numbering_direction: components["schemas"]["NumberingDirection"];
+            /** @description Optional. `ALPHA` when left out. */
+            row_label_scheme?: components["schemas"]["RowLabelScheme"];
+            /** @description Optional. `LTR` when left out. */
+            numbering_direction?: components["schemas"]["NumberingDirection"];
             /**
              * @description How far each row is shifted along the row direction, in plan units, front row
              *     first. Empty or omitted means no shift; otherwise exactly one entry per row.
              */
             row_offsets?: number[];
-            /**
-             * @description True returns the preview and saves nothing.
-             * @default false
-             */
-            dry_run: boolean;
+            /** @description Optional; false when left out. True returns the preview and saves nothing. */
+            dry_run?: boolean;
         };
         /**
          * @description A block's rows and physical seats, generated or saved.
@@ -3291,6 +3358,7 @@ export interface components {
         BlockId: components["schemas"]["Id"];
         VenueId: components["schemas"]["Id"];
         CategoryId: components["schemas"]["Id"];
+        TemplateId: components["schemas"]["Id"];
         HoldId: components["schemas"]["Id"];
         PaymentId: components["schemas"]["Id"];
         AlertId: components["schemas"]["Id"];
@@ -4056,6 +4124,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationFailed"];
+            /** @description `UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
         };
@@ -4081,6 +4158,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationFailed"];
+            /** @description `UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
@@ -4107,6 +4193,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationFailed"];
+            /** @description `UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
@@ -4133,6 +4228,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationFailed"];
+            /** @description `UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
@@ -4160,6 +4264,15 @@ export interface operations {
                 };
             };
             400: components["responses"]["ValidationFailed"];
+            /** @description `UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous. */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             404: components["responses"]["NotFound"];
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
@@ -4244,6 +4357,7 @@ export interface operations {
              *     - `EVENT_NOT_ON_SALE` - the event is not in status `ON_SALE`.
              *     - `SALES_NOT_OPEN` - before `sales_open_at`.
              *     - `SALES_CLOSED` - after `sales_close_at`.
+             *     - `EVENT_BUSY` - the organiser is changing the event right now (publishing, cancelling or editing it) and it stayed locked for more than about 3 seconds. Nothing was held; ask again in a moment.
              */
             409: {
                 headers: {
@@ -4321,7 +4435,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `NO_ADJACENT_SEATS`, `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN` or `SALES_CLOSED`. */
+            /** @description `NO_ADJACENT_SEATS`, `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN`, `SALES_CLOSED`, or `EVENT_BUSY` (the organiser is changing the event right now; nothing was held, ask again in a moment). */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -4408,6 +4522,7 @@ export interface operations {
             /**
              * @description - `PAYMENT_IN_PROGRESS` - an M-Pesa prompt is live for this hold's booking; wait for it to finish.
              *     - `HOLD_NOT_ACTIVE` - the hold is `CONVERTED` (the seats were bought).
+             *     - `EVENT_BUSY` - the organiser is changing the event right now and it stayed locked for more than about 3 seconds. Nothing changed; ask again in a moment. (If the event is being cancelled, the cancel releases the hold itself.)
              */
             409: {
                 headers: {
@@ -4958,7 +5073,10 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `ALREADY_EXISTS` - another block in the stand has this code. */
+            /**
+             * @description - `ALREADY_EXISTS` - another block in the stand has this code.
+             *     - `EVENT_BUSY` - an event at the venue is being published, or the block is being changed by someone else. Nothing changed; try again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5141,6 +5259,40 @@ export interface operations {
             500: components["responses"]["Internal"];
         };
     };
+    deleteVenueTemplate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                venueId: components["parameters"]["VenueId"];
+                templateId: components["parameters"]["TemplateId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            /** @description `NOT_FOUND` - no such template at this venue (or no such venue). */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
     listAdminEvents: {
         parameters: {
             query?: {
@@ -5263,6 +5415,43 @@ export interface operations {
             500: components["responses"]["Internal"];
         };
     };
+    deleteEvent: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                eventId: components["parameters"]["EventId"];
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Deleted. */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["ValidationFailed"];
+            401: components["responses"]["Unauthorized"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            /**
+             * @description - `EVENT_NOT_EDITABLE` - the event is not `DRAFT`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            500: components["responses"]["Internal"];
+        };
+    };
     updateEvent: {
         parameters: {
             query?: never;
@@ -5291,7 +5480,10 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `EVENT_NOT_EDITABLE` - the event is `CANCELLED` or `COMPLETED`. */
+            /**
+             * @description - `EVENT_NOT_EDITABLE` - the event is `CANCELLED` or `COMPLETED`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5386,6 +5578,7 @@ export interface operations {
             /**
              * @description - `EVENT_NOT_READY` - see `details.problems`.
              *     - `INVALID_STATE_TRANSITION` - the event is `CANCELLED` or `COMPLETED`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment. A second publish sent while the first is still running gets this.
              */
             409: {
                 headers: {
@@ -5443,7 +5636,10 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `INVALID_STATE_TRANSITION` - a `COMPLETED` event cannot be cancelled. */
+            /**
+             * @description - `INVALID_STATE_TRANSITION` - a `COMPLETED` event cannot be cancelled.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5518,7 +5714,11 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `ALREADY_EXISTS` (name taken) or `EVENT_NOT_EDITABLE` (event is `CANCELLED` or `COMPLETED`). */
+            /**
+             * @description - `ALREADY_EXISTS` - name taken.
+             *     - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5552,7 +5752,10 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
-            /** @description `CATEGORY_IN_USE` - the event has inventory or bookings in this category. */
+            /**
+             * @description - `CATEGORY_IN_USE` - the event has inventory or bookings in this category. `details.seats` is how many seats were published in it; `details.sold` and `details.held` how many of those are sold or held now. `seats` above zero with both others at zero means the only obstacle is that the event is published.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5602,6 +5805,7 @@ export interface operations {
              * @description - `CONFIRMATION_REQUIRED` - the event is published; resend with `confirm: true`. `details` has the sold and held counts.
              *     - `ALREADY_EXISTS` - name taken.
              *     - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
              */
             409: {
                 headers: {
@@ -5699,7 +5903,10 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
-            /** @description `EVENT_NOT_EDITABLE` - the event is no longer `DRAFT`. */
+            /**
+             * @description - `EVENT_NOT_EDITABLE` - the event is no longer `DRAFT`.
+             *     - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+             */
             409: {
                 headers: {
                     [name: string]: unknown;
@@ -5723,9 +5930,9 @@ export interface operations {
     getEventSales: {
         parameters: {
             query?: {
-                /** @description Width of each time-series bucket. */
+                /** @description Width of each time-series bucket. Left out: `hour` when the range is 48 hours or less, otherwise `day`. */
                 bucket?: components["schemas"]["SalesBucket"];
-                /** @description Start of the time series. Defaults to the first paid booking. */
+                /** @description Start of the time series. Left out, it is the first paid booking, moved forward if needed so that the series has at most 2,000 buckets. */
                 from?: string;
                 /** @description End of the time series. Defaults to now. */
                 to?: string;

@@ -1,12 +1,14 @@
-import { useState } from "react";
-import { Link } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
+import { Link, useLocation } from "react-router-dom";
+import { DeleteEventDialog } from "../components/DeleteEventDialog";
 import { StatusChip } from "../components/EventBits";
 import { CalendarIcon } from "../components/icons";
-import { Card, LoadFailed, SkeletonRows, StateBlock, Button } from "../components/ui";
+import { Alert, Card, LoadFailed, SkeletonRows, StateBlock, Button } from "../components/ui";
 import { describeError } from "../lib/errors";
 import { formatDateTime } from "../lib/format";
 import { formatCount, formatKes } from "../lib/money";
-import { isPublished, STATUS_LABELS, useAdminEvents, type EventStatus } from "../lib/queries";
+import { isPublished, keys, STATUS_LABELS, useAdminEvents, usePublishInFlight, type AdminEvent, type EventStatus } from "../lib/queries";
 
 const FILTERS: (EventStatus | "ALL")[] = ["ALL", "DRAFT", "PUBLISHED", "ON_SALE", "SOLD_OUT", "CANCELLED", "COMPLETED"];
 
@@ -14,6 +16,20 @@ export function EventsPage() {
   const [status, setStatus] = useState<EventStatus | "ALL">("ALL");
   const events = useAdminEvents(status);
   const rows = events.data?.pages.flatMap((page) => page.items) ?? [];
+  const queryClient = useQueryClient();
+  const location = useLocation();
+  // Set by the event page when a draft was deleted there and the organiser was sent back here.
+  const cameFromDelete = (location.state as { deleted?: Deleted } | null)?.deleted ?? null;
+  const [toDelete, setToDelete] = useState<AdminEvent | null>(null);
+  const [deletedHere, setDeletedHere] = useState<Deleted | null>(null);
+  const deleted = deletedHere ?? cameFromDelete;
+  // A publish started in this tab keeps running when the organiser comes back to the list.
+  const publishing = usePublishInFlight();
+
+  // Drop what is cached about a deleted event, so nothing of it is shown if its address is opened again.
+  useEffect(() => {
+    if (deleted) queryClient.removeQueries({ queryKey: keys.event(deleted.id) });
+  }, [deleted, queryClient]);
 
   return (
     <div className="page">
@@ -26,6 +42,12 @@ export function EventsPage() {
           New event
         </Link>
       </header>
+
+      {deleted && (
+        <Alert tone="success" title="Draft deleted">
+          “{deleted.title}” and its categories and painting are gone.
+        </Alert>
+      )}
 
       <Card>
         <div className="card__header">
@@ -77,6 +99,9 @@ export function EventsPage() {
                     <th scope="col">Status</th>
                     <th scope="col">Seats left</th>
                     <th scope="col">From</th>
+                    <th scope="col">
+                      <span className="visually-hidden">Actions</span>
+                    </th>
                   </tr>
                 </thead>
                 <tbody>
@@ -104,6 +129,22 @@ export function EventsPage() {
                       <td data-label="From">
                         {event.price_from_cents === null ? <span className="muted">—</span> : formatKes(event.price_from_cents)}
                       </td>
+                      {/* Only a draft can be deleted; the cell stays empty for every other status. */}
+                      <td className="table__actions-cell" data-label="Actions">
+                        {event.status === "DRAFT" && (
+                          <div className="table__actions">
+                            <Button
+                              variant="danger"
+                              size="small"
+                              disabled={publishing}
+                              onClick={() => setToDelete(event)}
+                              aria-label={`Delete the draft ${event.title}`}
+                            >
+                              Delete
+                            </Button>
+                          </div>
+                        )}
+                      </td>
                     </tr>
                   ))}
                 </tbody>
@@ -119,6 +160,20 @@ export function EventsPage() {
           </div>
         )}
       </Card>
+
+      <DeleteEventDialog
+        event={toDelete}
+        onClose={() => setToDelete(null)}
+        onDeleted={(gone) => {
+          setToDelete(null);
+          setDeletedHere({ id: gone.id, title: gone.title });
+        }}
+      />
     </div>
   );
+}
+
+interface Deleted {
+  id: number;
+  title: string;
 }

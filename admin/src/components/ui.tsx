@@ -352,6 +352,18 @@ export function ConfirmDialog({
   );
 }
 
+/** Whole seconds since `since` (a timestamp in milliseconds), ticking while it is set. 0 when null. */
+export function useElapsedSeconds(since: number | null): number {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    if (since === null) return;
+    setNow(Date.now());
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [since]);
+  return since === null ? 0 : Math.max(0, Math.floor((now - since) / 1000));
+}
+
 /** Counts a wait down to zero, one second at a time. `until` is a timestamp in milliseconds. */
 export function useSecondsLeft(until: number | null): number {
   const [now, setNow] = useState(() => Date.now());

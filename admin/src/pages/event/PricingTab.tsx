@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useLocation } from "react-router-dom";
 import { Alert, Button, Card, ConfirmDialog, LoadFailed, SkeletonRows, StateBlock, Swatch, TextField } from "../../components/ui";
 import { api, type Schemas } from "../../lib/api";
-import { describeError, isCode, splitFieldErrors } from "../../lib/errors";
+import { categoryInUseText, describeError, isCode, splitFieldErrors } from "../../lib/errors";
 import { centsToShillingsInput, formatCount, formatKes, parseShillingsToCents } from "../../lib/money";
 import { isPublished, keys, useAssignments, useCategories, type Category } from "../../lib/queries";
 import { editLock, useEventContext } from "./EventPage";
@@ -86,7 +86,7 @@ export function PricingTab() {
 
   const removeError = remove.error
     ? isCode(remove.error, "CATEGORY_IN_USE")
-      ? `This category cannot be deleted: ${inUseText(remove.error.details)} Once an event is published its categories stay, because seats and bookings point at them. You can still rename it or change its price.`
+      ? `This category cannot be deleted. ${categoryInUseText(remove.error.details)} Once an event is published its categories stay, because seats and bookings point at them. You can still rename it or change its price.`
       : describeError(remove.error, {
           EVENT_NOT_EDITABLE: "This event is closed, so its categories can no longer be changed.",
           NOT_FOUND: "This category no longer exists.",
@@ -192,6 +192,7 @@ export function PricingTab() {
             eventId={event.id}
             category={editing === "new" ? null : editing}
             usedColours={rows.map((category) => category.color_hex.toUpperCase())}
+            draftEvent={event.status === "DRAFT"}
             onDone={() => {
               setEditing(null);
               void refresh();
@@ -204,7 +205,7 @@ export function PricingTab() {
       <ConfirmDialog
         open={toDelete !== null}
         title={`Delete ${toDelete?.name ?? "this category"}?`}
-        confirmLabel={remove.isPending ? "Deleting…" : "Delete category"}
+        confirmLabel={remove.isPending ? "Deleting…" : isCode(remove.error, "EVENT_BUSY") ? "Try again" : "Delete category"}
         cancelLabel="Keep it"
         danger
         busy={remove.isPending}
@@ -227,14 +228,6 @@ export function PricingTab() {
   );
 }
 
-function inUseText(details: unknown): string {
-  const counts = details as { sold?: number; held?: number } | null;
-  const sold = counts?.sold ?? 0;
-  const held = counts?.held ?? 0;
-  if (sold === 0 && held === 0) return "it has seats on sale.";
-  return `${formatCount(sold)} of its seats are sold and ${formatCount(held)} are being paid for.`;
-}
-
 function paintedSummary(assignments: Schemas["Assignments"], categoryId: number): string {
   const blocks = assignments.blocks.filter((entry) => entry.category_id === categoryId).length;
   const rows = assignments.rows.filter((entry) => entry.category_id === categoryId).length;
@@ -247,12 +240,15 @@ function CategoryForm({
   eventId,
   category,
   usedColours,
+  draftEvent,
   onDone,
   onCancel,
 }: {
   eventId: number;
   category: Category | null;
   usedColours: string[];
+  /** While the event is a draft a price of 0 can be saved; afterwards the server refuses it. */
+  draftEvent: boolean;
   onDone: () => void;
   onCancel: () => void;
 }) {
@@ -318,7 +314,7 @@ function CategoryForm({
       return;
     }
     // Never confirmed on the first try: the server then says whether the question is needed.
-    save.mutate({ update: { ...body, confirm: false } });
+    save.mutate({ update: body });
   }
 
   const { fields, other } = splitFieldErrors(save.error, FIELDS);
@@ -363,7 +359,9 @@ function CategoryForm({
             hint={
               parsed.ok
                 ? parsed.cents === 0
-                  ? "A price of 0 can be saved, but the event cannot be published until it is above 0."
+                  ? draftEvent
+                    ? "A price of 0 can be saved, but the event cannot be published until it is above 0."
+                    : "This event is published, so the price must be above 0."
                   : `Fans will pay ${formatKes(parsed.cents)} for each ticket.`
                 : "For example 1500 or 1,500. Cents are allowed: 1500.50."
             }

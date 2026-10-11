@@ -6,7 +6,7 @@ import { StadiumPlan, zoomBox } from "../components/StadiumPlan";
 import { StadiumIcon } from "../components/icons";
 import { Alert, Button, Card, ConfirmDialog, LoadFailed, SelectField, SkeletonRows, StateBlock, Swatch, TextField } from "../components/ui";
 import { api, type Schemas } from "../lib/api";
-import { describeError, isCode, splitFieldErrors } from "../lib/errors";
+import { BLOCK_BUSY_MESSAGE, describeError, isCode, splitFieldErrors } from "../lib/errors";
 import { formatDate } from "../lib/format";
 import { placementFromBox, polygonPath, type Box } from "../lib/geometry";
 import { formatCount, formatKes } from "../lib/money";
@@ -22,6 +22,7 @@ import {
   useVenues,
   type Block,
   type BlockLayout,
+  type Template,
   type VenueDetail,
 } from "../lib/queries";
 
@@ -411,14 +412,17 @@ function PlaceForm({
   function submit(event: FormEvent) {
     event.preventDefault();
     if (busy) return;
-    const { errors, values } = readPlacement(draft);
+    // An empty rotation box on a new block means "not turned".
+    const { errors, values } = readPlacement({ ...draft, rotation: draft.rotation.trim() || "0" });
     if (!draft.originX.trim() && !draft.originY.trim()) {
       errors.origin_x = "Drag a rectangle on the plan, or type the position.";
       delete errors.origin_y;
     }
     setLocal(errors);
     if (Object.keys(errors).length > 0) return;
-    onSubmit({ stand_id: draft.standId, ...values });
+    // rotation_deg is only sent when the block is turned; left out, the server places it straight.
+    const { rotation_deg, ...placement } = values;
+    onSubmit({ stand_id: draft.standId, ...placement, ...(rotation_deg !== 0 ? { rotation_deg } : {}) });
   }
 
   const change = (patch: Partial<Draft>) => {
@@ -635,7 +639,10 @@ function PlacementForm({ block, locked, onSaved }: { block: Block; locked: boole
   const { fields, other } = splitFieldErrors(save.error, PLACE_FIELDS);
   const taken = isCode(save.error, "ALREADY_EXISTS") ? "Another block in this stand has this code." : null;
   const errorFor = (field: PlaceField) => local[field] ?? fields[field] ?? null;
-  const formError = save.error && !taken && Object.keys(fields).length === 0 ? describeError(save.error, { NOT_FOUND: "This block no longer exists. Reload the page." }) : null;
+  const formError =
+    save.error && !taken && Object.keys(fields).length === 0
+      ? describeError(save.error, { NOT_FOUND: "This block no longer exists. Reload the page.", EVENT_BUSY: BLOCK_BUSY_MESSAGE })
+      : null;
 
   return (
     <form className="stack" onSubmit={submit} noValidate>
@@ -718,7 +725,7 @@ function SeatsForm({
     if (rowCount === null || rowCount < 1 || rowCount > 200) errors.rows = "Enter a whole number of rows from 1 to 200.";
     const perRow = readWhole(seatsPerRow);
     if (perRow === null || perRow < 1 || perRow > 500) errors.seats_per_row = "Enter a whole number of seats from 1 to 500.";
-    let rowOffsets: number[] = [];
+    let rowOffsets: number[] | undefined;
     if (offsets.trim()) {
       const parts = offsets.split(/[,\s]+/).filter(Boolean).map(readNumber);
       if (parts.some((part) => part === null)) errors.row_offsets = "Use numbers separated by commas, for example 0, 2.5, 0, 2.5.";
@@ -727,7 +734,15 @@ function SeatsForm({
     }
     setLocal(errors);
     if (Object.keys(errors).length > 0 || rowCount === null || perRow === null) return null;
-    return { rows: rowCount, seats_per_row: perRow, row_label_scheme: scheme, numbering_direction: direction, row_offsets: rowOffsets, dry_run: true };
+    // The row names and the numbering side are what the two boxes show, so they are always sent.
+    return {
+      rows: rowCount,
+      seats_per_row: perRow,
+      row_label_scheme: scheme,
+      numbering_direction: direction,
+      ...(rowOffsets ? { row_offsets: rowOffsets } : {}),
+      dry_run: true,
+    };
   }
 
   function changed() {
@@ -818,11 +833,12 @@ function SeatsForm({
           </Button>
           <Button
             disabled={disabled || !preview || generate.isPending}
-            loading={generate.isPending && generate.variables?.dry_run === false && !confirming}
+            loading={generate.isPending && !generate.variables?.dry_run && !confirming}
             onClick={() => {
               const body = read();
               if (!body) return;
-              const real = { ...body, dry_run: false };
+              // Without dry_run the server saves.
+              const { dry_run: _preview, ...real } = body;
               if (block.seat_count > 0) setConfirming(real);
               else generate.mutate(real);
             }}
@@ -854,7 +870,30 @@ function SeatsForm({
 }
 
 function TemplatesCard({ venue }: { venue: VenueDetail }) {
+  const queryClient = useQueryClient();
   const templates = useTemplates(venue.id);
+  const [toDelete, setToDelete] = useState<Template | null>(null);
+  const [deletedName, setDeletedName] = useState<string | null>(null);
+
+  const remove = useMutation({
+    mutationFn: async (template: Template) => {
+      try {
+        await unwrap(
+          api.DELETE("/admin/venues/{venueId}/templates/{templateId}", { params: { path: { venueId: venue.id, templateId: template.id } } }),
+        );
+      } catch (error) {
+        // Already gone (deleted in another tab, or by a colleague): that is what was asked for.
+        if (!isCode(error, "NOT_FOUND")) throw error;
+      }
+      return template;
+    },
+    onSuccess: (template) => {
+      setToDelete(null);
+      setDeletedName(template.name);
+    },
+    onSettled: () => queryClient.invalidateQueries({ queryKey: keys.templates(venue.id) }),
+  });
+
   const events = useAdminEvents("ALL", 100);
   const publishing = usePublishInFlight();
   const [eventChoice, setEventChoice] = useState<number | null>(null);
@@ -885,6 +924,9 @@ function TemplatesCard({ venue }: { venue: VenueDetail }) {
                   <th scope="col">Categories</th>
                   <th scope="col">Painting</th>
                   <th scope="col">Saved</th>
+                  <th scope="col">
+                    <span className="visually-hidden">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -909,6 +951,22 @@ function TemplatesCard({ venue }: { venue: VenueDetail }) {
                     <td data-label="Saved">
                       <time dateTime={template.created_at}>{formatDate(template.created_at)}</time>
                     </td>
+                    <td className="table__actions-cell" data-label="Actions">
+                      <div className="table__actions">
+                        <Button
+                          variant="danger"
+                          size="small"
+                          onClick={() => {
+                            remove.reset();
+                            setDeletedName(null);
+                            setToDelete(template);
+                          }}
+                          aria-label={`Delete the template ${template.name}`}
+                        >
+                          Delete
+                        </Button>
+                      </div>
+                    </td>
                   </tr>
                 ))}
               </tbody>
@@ -916,6 +974,29 @@ function TemplatesCard({ venue }: { venue: VenueDetail }) {
           </div>
         )}
       </div>
+      {deletedName !== null && (
+        <div className="card__body">
+          <Alert tone="success">The template “{deletedName}” is deleted.</Alert>
+        </div>
+      )}
+      <ConfirmDialog
+        open={toDelete !== null}
+        title="Delete this template?"
+        confirmLabel={remove.isPending ? "Deleting…" : remove.isError ? "Try again" : "Delete template"}
+        cancelLabel="Keep it"
+        danger
+        busy={remove.isPending}
+        error={remove.error ? describeError(remove.error) : null}
+        onConfirm={() => toDelete && remove.mutate(toDelete)}
+        onCancel={() => setToDelete(null)}
+      >
+        <p>
+          The template <strong>{toDelete?.name}</strong> will no longer be offered when you create an event.
+        </p>
+        <p>
+          Events already created from it keep their categories, prices and painting. <strong>This cannot be undone.</strong>
+        </p>
+      </ConfirmDialog>
       <div className="card__footer stack">
         <h3 className="subhead">Save an event as a new template</h3>
         {events.isError ? (

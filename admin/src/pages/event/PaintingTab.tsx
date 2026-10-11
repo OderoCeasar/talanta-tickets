@@ -7,7 +7,7 @@ import { SaveTemplateForm } from "../../components/SaveTemplateForm";
 import { StadiumPlan } from "../../components/StadiumPlan";
 import { Alert, Button, Card, LoadFailed, SkeletonRows, StateBlock, Swatch } from "../../components/ui";
 import { api } from "../../lib/api";
-import { describeError } from "../../lib/errors";
+import { describeError, isCode } from "../../lib/errors";
 import { blocksInBox, type Box } from "../../lib/geometry";
 import { formatCount } from "../../lib/money";
 import { keys, useAssignments, useBlockLayout, useCategories, useVenue, type Assignments, type Block, type Category } from "../../lib/queries";
@@ -176,9 +176,15 @@ export function PaintingTab() {
         EVENT_NOT_EDITABLE: "This event is no longer a draft, so its painting cannot be changed. Reload the page to see its current state.",
         NOT_FOUND: "That category no longer exists. Reload the page.",
         VENUE_MISMATCH: "One of those blocks or rows is not part of this event's venue. Reload the page.",
-        INTERNAL: "The server could not save that. If the event is being published, wait for it to finish, then reload.",
       })
     : null;
+  // A busy event changed nothing, so the same paint (or undo) can simply be sent again.
+  const retryPaint =
+    isCode(paint.error, "EVENT_BUSY") && paint.variables
+      ? () => paint.mutate(paint.variables!)
+      : isCode(revert.error, "EVENT_BUSY") && revert.variables
+        ? () => revert.mutate(revert.variables!)
+        : null;
 
   return (
     <>
@@ -331,7 +337,18 @@ export function PaintingTab() {
             </div>
           </div>
 
-          {paintError && <Alert tone="error">{paintError}</Alert>}
+          {paintError && (
+            <Alert tone="error">
+              <p>{paintError}</p>
+              {retryPaint && !readOnly && (
+                <p>
+                  <Button variant="secondary" size="small" disabled={busy} onClick={retryPaint}>
+                    Try again
+                  </Button>
+                </p>
+              )}
+            </Alert>
+          )}
           {undo && !readOnly && (
             <div className="undo" role="status">
               <span>Done: {undo.label}.</span>
@@ -353,15 +370,18 @@ export function PaintingTab() {
           readOnly={readOnly}
           busy={busy}
           touchDrag={touchDrag}
-          onPaint={(category, rowIds, labels) =>
-            paint.mutate({
-              categoryId: category?.id ?? null,
-              blockIds: [],
-              rowIds,
-              label: category
-                ? `${rowIds.length === 1 ? `row ${labels[0]}` : `${rowIds.length} rows`} of ${openBlock.code} painted ${category.name}`
-                : `${rowIds.length === 1 ? `row ${labels[0]}` : `${rowIds.length} rows`} of ${openBlock.code} set back to the block's category`,
-            })
+          onPaint={(category, rowIds, labels, onPainted) =>
+            paint.mutate(
+              {
+                categoryId: category?.id ?? null,
+                blockIds: [],
+                rowIds,
+                label: category
+                  ? `${rowIds.length === 1 ? `row ${labels[0]}` : `${rowIds.length} rows`} of ${openBlock.code} painted ${category.name}`
+                  : `${rowIds.length === 1 ? `row ${labels[0]}` : `${rowIds.length} rows`} of ${openBlock.code} set back to the block's category`,
+              },
+              { onSuccess: onPainted },
+            )
           }
           onClose={() => setOpenBlockId(null)}
         />
@@ -380,7 +400,7 @@ export function PaintingTab() {
             <SaveTemplateForm
               venueId={event.venue_id}
               eventId={event.id}
-              disabledReason={context.publishing ? "Wait until publishing has finished." : null}
+              disabledReason={context.publishing ? "Wait until publishing has finished." : context.cancelling ? "This event is being cancelled." : null}
             />
           </div>
         </Card>
@@ -407,7 +427,8 @@ function BlockRows({
   readOnly: boolean;
   busy: boolean;
   touchDrag: boolean;
-  onPaint: (category: Category | null, rowIds: number[], labels: string[]) => void;
+  /** `onPainted` runs once the server has saved the paint; it is not called when the paint is refused. */
+  onPaint: (category: Category | null, rowIds: number[], labels: string[], onPainted: () => void) => void;
   onClose: () => void;
 }) {
   const layout = useBlockLayout(block.id);
@@ -439,8 +460,8 @@ function BlockRows({
 
   function paintRows(category: Category | null) {
     if (pickedIds.length === 0) return;
-    onPaint(category, pickedIds, pickedRows.map((row) => row.label));
-    setPicked(new Set());
+    // The rows stay picked until the paint is saved, so a refused paint can be sent again as it is.
+    onPaint(category, pickedIds, pickedRows.map((row) => row.label), () => setPicked(new Set()));
   }
 
   return (

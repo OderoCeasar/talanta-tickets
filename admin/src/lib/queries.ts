@@ -39,6 +39,7 @@ export const keys = {
   sales: (eventId: number) => ["events", eventId, "sales"] as const,
   refundBookings: (eventId: number) => ["events", eventId, "refund-bookings"] as const,
   publish: (eventId: number) => ["publish", eventId] as const,
+  cancel: (eventId: number) => ["cancel", eventId] as const,
 };
 
 export function fetchVenue(venueId: number): Promise<VenueDetail> {
@@ -148,13 +149,18 @@ export function useReadiness(eventId: number, enabled = true) {
  * True while this browser is waiting for a publish to answer. With an event ID: that event.
  * Without: any event.
  *
- * The server holds the event row (and the venue row) locked for the whole publish, and a
- * second request that waits on that lock can answer 500 after about 15 seconds. So every
- * editing action for the event, and block edits at the venue, are switched off until the
- * publish has answered.
+ * The server holds the event (and the venue row) locked for the whole publish, and anything
+ * else sent for the event meanwhile is answered 409 `EVENT_BUSY` after a few seconds. So
+ * every editing action for the event, and block edits at the venue, are switched off until
+ * the publish has answered, instead of letting the organiser run into that.
  */
 export function usePublishInFlight(eventId?: number): boolean {
   return useIsMutating({ mutationKey: eventId === undefined ? ["publish"] : keys.publish(eventId) }) > 0;
+}
+
+/** True while this browser is waiting for a cancel of this event to answer. The event is locked as it is during a publish. */
+export function useCancelInFlight(eventId: number): boolean {
+  return useIsMutating({ mutationKey: keys.cancel(eventId) }) > 0;
 }
 
 export const STATUS_LABELS: Record<EventStatus, string> = {

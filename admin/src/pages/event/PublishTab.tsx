@@ -1,7 +1,7 @@
 import { useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState, type CSSProperties } from "react";
 import { Link } from "react-router-dom";
-import { Alert, Button, Card, ConfirmDialog, LoadFailed, SkeletonRows } from "../../components/ui";
+import { Alert, Button, Card, ConfirmDialog, LoadFailed, SkeletonRows, useElapsedSeconds } from "../../components/ui";
 import { describeError, isCode } from "../../lib/errors";
 import { formatDateTime } from "../../lib/format";
 import { formatCount } from "../../lib/money";
@@ -19,22 +19,11 @@ const FIX: Record<ReadinessProblem["code"], { to: string; label: string }> = {
   KICKOFF_IN_PAST: { to: "..", label: "Change the kickoff" },
 };
 
-function useElapsedSeconds(since: number | null): number {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    if (since === null) return;
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 500);
-    return () => window.clearInterval(timer);
-  }, [since]);
-  return since === null ? 0 : Math.max(0, Math.floor((now - since) / 1000));
-}
-
 export function PublishTab() {
-  const { event, publishing, publish, publishStartedAt } = useEventContext();
+  const { event, publishing, cancelling, publish, publishStartedAt } = useEventContext();
   const queryClient = useQueryClient();
   const draft = event.status === "DRAFT";
-  const readiness = useReadiness(event.id, draft && !publishing);
+  const readiness = useReadiness(event.id, draft && !publishing && !cancelling);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const elapsed = useElapsedSeconds(publishing ? publishStartedAt : null);
 
@@ -176,10 +165,14 @@ export function PublishTab() {
               )}
 
               <div className="form-actions">
-                <Button disabled={!report.ready} onClick={() => { publish.reset(); setConfirmOpen(true); }}>
+                <Button disabled={!report.ready || cancelling} onClick={() => { publish.reset(); setConfirmOpen(true); }}>
                   Publish event…
                 </Button>
-                {!report.ready && <span className="small muted">Fix the list above first.</span>}
+                {cancelling ? (
+                  <span className="small muted">This event is being cancelled.</span>
+                ) : (
+                  !report.ready && <span className="small muted">Fix the list above first.</span>
+                )}
               </div>
             </div>
           )

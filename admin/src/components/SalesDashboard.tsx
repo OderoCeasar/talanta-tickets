@@ -13,16 +13,17 @@ import { isPublished, keys, useVenue, type AdminEvent, type SalesBucket, type Sa
 
 /** How often the figures refresh. The server caches seat counts for 3 seconds, so faster buys nothing. */
 const REFRESH_MS = 5_000;
-/** The hourly chart looks back this far. The API refuses more than 2,000 buckets; this is 48. */
+/** The hourly chart shows this many of the most recent hours: enough bars to read, and no more. */
 const HOURLY_LOOKBACK_HOURS = 48;
 
 function useSales(eventId: number, bucket: SalesBucket, enabled: boolean) {
   return useQuery({
     queryKey: [...keys.sales(eventId), bucket],
     queryFn: () => {
-      // Hour buckets are asked for a fixed recent window, so an event that has sold for months
-      // never asks for thousands of them. Day buckets take the server's default range (from
-      // the first paid booking), which stays under the limit for five years.
+      // The hourly view is "the last 48 hours", so it sends its own start. (Left out, the server
+      // would answer with every hour since the first sale, up to 2,000 bars.) The daily view
+      // takes the server's default range, from the first paid booking. `bucket` is always sent,
+      // so the chart is drawn in the unit the organiser picked.
       const from =
         bucket === "hour"
           ? new Date(Math.floor(Date.now() / 3_600_000) * 3_600_000 - (HOURLY_LOOKBACK_HOURS - 1) * 3_600_000)
