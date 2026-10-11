@@ -59,6 +59,73 @@ func (q *Queries) CreateInvitation(ctx context.Context, arg CreateInvitationPara
 	return i, err
 }
 
+const getInvitationByID = `-- name: GetInvitationByID :one
+SELECT id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at FROM invitations WHERE id = $1
+`
+
+func (q *Queries) GetInvitationByID(ctx context.Context, id int64) (Invitation, error) {
+	row := q.db.QueryRow(ctx, getInvitationByID, id)
+	var i Invitation
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.ExpiresAt,
+		&i.AcceptedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getInvitationByTokenHash = `-- name: GetInvitationByTokenHash :one
+SELECT id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at FROM invitations WHERE token_hash = $1
+`
+
+// Any state: the caller tells expired (410) from revoked or accepted (404).
+func (q *Queries) GetInvitationByTokenHash(ctx context.Context, tokenHash []byte) (Invitation, error) {
+	row := q.db.QueryRow(ctx, getInvitationByTokenHash, tokenHash)
+	var i Invitation
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.ExpiresAt,
+		&i.AcceptedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getInvitationByTokenHashForUpdate = `-- name: GetInvitationByTokenHashForUpdate :one
+SELECT id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at FROM invitations WHERE token_hash = $1 FOR UPDATE
+`
+
+// Locks the invitation row for the length of the accept transaction, so two people (or one
+// double click) accepting the same link run one after the other: the second sees
+// accepted_at set and creates nothing.
+func (q *Queries) GetInvitationByTokenHashForUpdate(ctx context.Context, tokenHash []byte) (Invitation, error) {
+	row := q.db.QueryRow(ctx, getInvitationByTokenHashForUpdate, tokenHash)
+	var i Invitation
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.ExpiresAt,
+		&i.AcceptedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const getLiveInvitationByTokenHash = `-- name: GetLiveInvitationByTokenHash :one
 SELECT id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at FROM invitations
 WHERE token_hash = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()
@@ -66,6 +133,29 @@ WHERE token_hash = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires
 
 func (q *Queries) GetLiveInvitationByTokenHash(ctx context.Context, tokenHash []byte) (Invitation, error) {
 	row := q.db.QueryRow(ctx, getLiveInvitationByTokenHash, tokenHash)
+	var i Invitation
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.ExpiresAt,
+		&i.AcceptedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
+const getOpenInvitationByEmail = `-- name: GetOpenInvitationByEmail :one
+SELECT id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at FROM invitations
+WHERE email = lower($1::text) AND accepted_at IS NULL AND revoked_at IS NULL
+`
+
+// The one invitation for an address that is neither accepted nor revoked (it may have lapsed).
+func (q *Queries) GetOpenInvitationByEmail(ctx context.Context, email string) (Invitation, error) {
+	row := q.db.QueryRow(ctx, getOpenInvitationByEmail, email)
 	var i Invitation
 	err := row.Scan(
 		&i.ID,
@@ -122,6 +212,73 @@ func (q *Queries) ListInvitations(ctx context.Context, arg ListInvitationsParams
 	return items, nil
 }
 
+const listInvitationsPage = `-- name: ListInvitationsPage :many
+SELECT i.id, i.email, i.role, i.token_hash, i.invited_by, i.expires_at, i.accepted_at, i.revoked_at, i.created_at, u.name AS inviter_name, u.email AS inviter_email
+FROM invitations i
+JOIN users u ON u.id = i.invited_by
+WHERE ($1::bigint IS NULL OR i.id < $1::bigint)
+  AND ($2::text IS NULL OR $2::text = CASE
+          WHEN i.accepted_at IS NOT NULL THEN 'ACCEPTED'
+          WHEN i.revoked_at IS NOT NULL THEN 'REVOKED'
+          WHEN i.expires_at <= $3::timestamptz THEN 'EXPIRED'
+          ELSE 'PENDING'
+      END)
+ORDER BY i.id DESC
+LIMIT $4
+`
+
+type ListInvitationsPageParams struct {
+	BeforeID *int64
+	Status   *string
+	Now      time.Time
+	PageSize int32
+}
+
+type ListInvitationsPageRow struct {
+	Invitation   Invitation
+	InviterName  *string
+	InviterEmail *string
+}
+
+// Newest first by id (ids rise with creation), keyset paged. The status is not stored; the
+// CASE mirrors domain.InvitationStatusAt and must change with it.
+func (q *Queries) ListInvitationsPage(ctx context.Context, arg ListInvitationsPageParams) ([]ListInvitationsPageRow, error) {
+	rows, err := q.db.Query(ctx, listInvitationsPage,
+		arg.BeforeID,
+		arg.Status,
+		arg.Now,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListInvitationsPageRow{}
+	for rows.Next() {
+		var i ListInvitationsPageRow
+		if err := rows.Scan(
+			&i.Invitation.ID,
+			&i.Invitation.Email,
+			&i.Invitation.Role,
+			&i.Invitation.TokenHash,
+			&i.Invitation.InvitedBy,
+			&i.Invitation.ExpiresAt,
+			&i.Invitation.AcceptedAt,
+			&i.Invitation.RevokedAt,
+			&i.Invitation.CreatedAt,
+			&i.InviterName,
+			&i.InviterEmail,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markInvitationAccepted = `-- name: MarkInvitationAccepted :execrows
 UPDATE invitations SET accepted_at = now()
 WHERE id = $1 AND accepted_at IS NULL AND revoked_at IS NULL AND expires_at > now()
@@ -135,6 +292,38 @@ func (q *Queries) MarkInvitationAccepted(ctx context.Context, id int64) (int64, 
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const reissueInvitation = `-- name: ReissueInvitation :one
+UPDATE invitations
+SET token_hash = $1, expires_at = $2
+WHERE id = $3 AND accepted_at IS NULL AND revoked_at IS NULL
+RETURNING id, email, role, token_hash, invited_by, expires_at, accepted_at, revoked_at, created_at
+`
+
+type ReissueInvitationParams struct {
+	TokenHash []byte
+	ExpiresAt time.Time
+	ID        int64
+}
+
+// Resend: a new token and a new expiry on the same row, so the old link stops working. No
+// row means it was accepted or revoked in the meantime.
+func (q *Queries) ReissueInvitation(ctx context.Context, arg ReissueInvitationParams) (Invitation, error) {
+	row := q.db.QueryRow(ctx, reissueInvitation, arg.TokenHash, arg.ExpiresAt, arg.ID)
+	var i Invitation
+	err := row.Scan(
+		&i.ID,
+		&i.Email,
+		&i.Role,
+		&i.TokenHash,
+		&i.InvitedBy,
+		&i.ExpiresAt,
+		&i.AcceptedAt,
+		&i.RevokedAt,
+		&i.CreatedAt,
+	)
+	return i, err
 }
 
 const revokeInvitation = `-- name: RevokeInvitation :execrows

@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -24,15 +27,106 @@ type Base struct {
 	LogLevel    slog.Level
 }
 
-// IsProduction gates every dev-only shortcut (OTP in the response, mock payment outcomes).
-func (b Base) IsProduction() bool { return b.AppEnv == EnvProduction }
+// IsProduction reports whether production rules apply. It is true for anything that is not
+// explicitly development or test, so a Base that was never loaded (or a future fourth value)
+// fails closed.
+func (b Base) IsProduction() bool { return !b.AllowDevShortcuts() }
+
+// IsDevelopment reports whether APP_ENV is exactly "development".
+func (b Base) IsDevelopment() bool { return b.AppEnv == EnvDevelopment }
+
+// IsTest reports whether APP_ENV is exactly "test".
+func (b Base) IsTest() bool { return b.AppEnv == EnvTest }
+
+// AllowDevShortcuts gates every dev-only shortcut (OTP in the response, mock payment
+// outcomes, the public signing secret). Shortcuts are on only when the environment is named
+// as development or test; "not production" is never the question asked.
+func (b Base) AllowDevShortcuts() bool { return b.IsDevelopment() || b.IsTest() }
 
 type API struct {
 	Base
 	Addr string
 	// CORSOrigins lists the admin site origins allowed to call the API from a browser.
 	CORSOrigins []string
+	// TrustedProxies are the networks our own reverse proxies connect from. Forwarding
+	// headers are believed only on connections from these; empty means trust nobody and use
+	// the TCP peer address. Production must say which it is: a range, or "none".
+	TrustedProxies []netip.Prefix
+	// ClientIPHeader is a single-address header to believe from a trusted proxy before
+	// X-Forwarded-For. Empty by default: it is safe only when nothing but the CDN that sets
+	// it can reach the origin, or the proxy overwrites it.
+	ClientIPHeader string
+
+	// Server timeouts. WriteTimeout must outlast the slowest handler (event publish).
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	IdleTimeout    time.Duration
+	RequestTimeout time.Duration
+
+	// Database session limits, applied to every pooled connection.
+	DBStatementTimeout time.Duration
+	DBIdleInTxTimeout  time.Duration
+
+	// JWTSecret signs access tokens and keys the other auth hashes.
+	JWTSecret []byte
+	// JWTSecretIsDevDefault is true when JWT_SECRET was not set and DevJWTSecret is in use.
+	// Never true in production.
+	JWTSecretIsDevDefault bool
+
+	// AdminBaseURL is where the admin site is served; invitation links point into it.
+	AdminBaseURL string
+	// BootstrapAdmin is the first admin to create at startup when the database has none.
+	// Empty Email means "do not bootstrap".
+	BootstrapAdmin BootstrapAdmin
+	// SMTP is empty (Host == "") when no mail server is configured; mail is then only logged.
+	SMTP SMTP
+
+	// Argon2MaxConcurrent caps password hashing and verification running at once.
+	Argon2MaxConcurrent int
+	// OTPCountryCodes are the calling codes (digits, no plus) sign-in SMS may be sent to.
+	OTPCountryCodes []string
+	// OTPGlobalHourlyLimit and OTPGlobalDailyLimit cap sign-in SMS across all phones.
+	OTPGlobalHourlyLimit int
+	OTPGlobalDailyLimit  int
 }
+
+// TrustNoProxies is the TRUSTED_PROXY_CIDRS value that says "the API is exposed directly:
+// believe no forwarding header". Production must write it out; an empty value there is
+// refused, because behind a proxy it would put every caller in one rate-limit bucket.
+const TrustNoProxies = "none"
+
+// BootstrapAdmin comes from BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD.
+type BootstrapAdmin struct {
+	Email    string
+	Password string
+}
+
+func (b BootstrapAdmin) Enabled() bool { return b.Email != "" }
+
+// SMTP comes from the SMTP_* variables.
+type SMTP struct {
+	Host     string
+	Port     int
+	Username string
+	Password string
+	From     string
+	// AllowPlaintext (SMTP_ALLOW_PLAINTEXT) permits a server with no STARTTLS.
+	AllowPlaintext bool
+}
+
+func (s SMTP) Enabled() bool { return s.Host != "" }
+
+// DevJWTSecret is the documented signing secret used in development and test when JWT_SECRET
+// is not set, so `make dev` works with no setup. It is public: production refuses to start
+// without its own JWT_SECRET, and refuses this value.
+const DevJWTSecret = "talanta-dev-only-jwt-secret-do-not-use-in-production"
+
+// MinJWTSecretBytes is the least a signing secret may be: HS256 keys shorter than the hash
+// output weaken the signature.
+const MinJWTSecretBytes = 32
+
+// MinBootstrapPasswordLength matches the password rule of the API contract.
+const MinBootstrapPasswordLength = 10
 
 type Worker struct {
 	Base
@@ -43,11 +137,162 @@ type Worker struct {
 func LoadAPI() (API, error) {
 	l := newLoader()
 	cfg := API{
-		Base:        l.base(),
-		Addr:        l.str("ADDR", ":8080"),
-		CORSOrigins: l.list("CORS_ORIGINS", "http://localhost:5173"),
+		Base:           l.base(),
+		Addr:           l.str("ADDR", ":8080"),
+		CORSOrigins:    l.list("CORS_ORIGINS", "http://localhost:5173"),
+		ClientIPHeader: l.str("CLIENT_IP_HEADER", ""),
+		ReadTimeout:    l.duration("HTTP_READ_TIMEOUT", 15*time.Second),
+		WriteTimeout:   l.duration("HTTP_WRITE_TIMEOUT", 60*time.Second),
+		IdleTimeout:    l.duration("HTTP_IDLE_TIMEOUT", 120*time.Second),
+		RequestTimeout: l.duration("REQUEST_TIMEOUT", 30*time.Second),
+
+		DBStatementTimeout: l.duration("DB_STATEMENT_TIMEOUT", 15*time.Second),
+		DBIdleInTxTimeout:  l.duration("DB_IDLE_IN_TX_TIMEOUT", 15*time.Second),
+
+		Argon2MaxConcurrent:  l.Int("ARGON2_MAX_CONCURRENT", 4),
+		OTPCountryCodes:      l.list("OTP_ALLOWED_COUNTRY_CODES", "254"),
+		OTPGlobalHourlyLimit: l.Int("OTP_GLOBAL_HOURLY_LIMIT", 2000),
+		OTPGlobalDailyLimit:  l.Int("OTP_GLOBAL_DAILY_LIMIT", 10000),
+	}
+	cfg.TrustedProxies = l.trustedProxies(cfg.Base)
+	cfg.AdminBaseURL = l.adminBaseURL(cfg.Base)
+	cfg.JWTSecret, cfg.JWTSecretIsDevDefault = l.jwtSecret(cfg.Base)
+	cfg.BootstrapAdmin = l.bootstrapAdmin()
+	cfg.SMTP = l.smtp()
+
+	if cfg.WriteTimeout <= cfg.RequestTimeout {
+		l.fail("HTTP_WRITE_TIMEOUT (%s) must be longer than REQUEST_TIMEOUT (%s), or slow answers are cut off mid-write", cfg.WriteTimeout, cfg.RequestTimeout)
+	}
+	if cfg.Argon2MaxConcurrent < 1 {
+		l.fail("ARGON2_MAX_CONCURRENT must be at least 1, got %d", cfg.Argon2MaxConcurrent)
+	}
+	for _, code := range cfg.OTPCountryCodes {
+		if !isCallingCode(code) {
+			l.fail("OTP_ALLOWED_COUNTRY_CODES: %q is not a calling code; write digits only, such as 254", code)
+		}
+	}
+	if cfg.OTPGlobalHourlyLimit < 1 || cfg.OTPGlobalDailyLimit < 1 {
+		l.fail("OTP_GLOBAL_HOURLY_LIMIT and OTP_GLOBAL_DAILY_LIMIT must be at least 1, got %d and %d", cfg.OTPGlobalHourlyLimit, cfg.OTPGlobalDailyLimit)
 	}
 	return cfg, l.err()
+}
+
+// trustedProxies reads TRUSTED_PROXY_CIDRS. Development and test may leave it empty (the TCP
+// peer is the client). Production may not: behind Caddy an empty list makes Caddy's address
+// "the client" for everyone, so every per-IP limit becomes one shared bucket and nobody
+// notices. Production says either a range or TrustNoProxies.
+func (l *Loader) trustedProxies(b Base) []netip.Prefix {
+	raw := l.str("TRUSTED_PROXY_CIDRS", "")
+	if strings.EqualFold(raw, TrustNoProxies) {
+		return nil
+	}
+	if raw == "" && b.IsProduction() {
+		l.fail("TRUSTED_PROXY_CIDRS is required when APP_ENV=production: set it to the network your reverse proxy connects from (for example 172.16.0.0/12), or to %q if the API is exposed directly with no proxy in front", TrustNoProxies)
+		return nil
+	}
+	return l.Prefixes("TRUSTED_PROXY_CIDRS", "")
+}
+
+// adminBaseURL reads ADMIN_BASE_URL, where invitation links point. Production has no default
+// (a link to localhost is useless and looks like it worked) and must be https: the link is a
+// one-time credential.
+func (l *Loader) adminBaseURL(b Base) string {
+	fallback := ""
+	if b.AllowDevShortcuts() {
+		fallback = "http://localhost:5173"
+	}
+	raw := strings.TrimRight(l.str("ADMIN_BASE_URL", fallback), "/")
+	if raw == "" {
+		l.fail("ADMIN_BASE_URL is required when APP_ENV=production, for example https://talanta.example.com")
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		l.fail("ADMIN_BASE_URL must be an http(s) URL such as https://talanta.example.com, got %q", raw)
+		return raw
+	}
+	if b.IsProduction() && u.Scheme != "https" {
+		l.fail("ADMIN_BASE_URL must be https when APP_ENV=production, got %q", raw)
+	}
+	return raw
+}
+
+// isCallingCode reports whether s is one to three digits not starting with zero.
+func isCallingCode(s string) bool {
+	if len(s) < 1 || len(s) > 3 || s[0] == '0' {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// jwtSecret reads JWT_SECRET. Production must set its own; elsewhere a fixed, public default
+// keeps local setup to zero steps.
+func (l *Loader) jwtSecret(b Base) (secret []byte, isDevDefault bool) {
+	// Not trimmed through str(): a secret is used byte for byte.
+	raw := os.Getenv("JWT_SECRET")
+	if raw == "" {
+		if !b.AllowDevShortcuts() {
+			l.fail("JWT_SECRET is required when APP_ENV=production (at least %d bytes)", MinJWTSecretBytes)
+			return nil, false
+		}
+		return []byte(DevJWTSecret), true
+	}
+	if len(raw) < MinJWTSecretBytes {
+		l.fail("JWT_SECRET must be at least %d bytes, got %d", MinJWTSecretBytes, len(raw))
+	}
+	if b.IsProduction() && raw == DevJWTSecret {
+		l.fail("JWT_SECRET is the public development default; set a private one in production")
+	}
+	return []byte(raw), false
+}
+
+func (l *Loader) bootstrapAdmin() BootstrapAdmin {
+	b := BootstrapAdmin{
+		Email: strings.ToLower(l.str("BOOTSTRAP_ADMIN_EMAIL", "")),
+		// Not trimmed: a password is used exactly as given.
+		Password: os.Getenv("BOOTSTRAP_ADMIN_PASSWORD"),
+	}
+	switch {
+	case b.Email == "" && b.Password == "":
+		return BootstrapAdmin{}
+	case b.Email == "" || b.Password == "":
+		l.fail("BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD must be set together")
+		return BootstrapAdmin{}
+	}
+	if addr, err := mail.ParseAddress(b.Email); err != nil || addr.Address != b.Email {
+		l.fail("BOOTSTRAP_ADMIN_EMAIL is not an email address")
+	}
+	if n := len([]rune(b.Password)); n < MinBootstrapPasswordLength {
+		l.fail("BOOTSTRAP_ADMIN_PASSWORD must be at least %d characters, got %d", MinBootstrapPasswordLength, n)
+	}
+	return b
+}
+
+func (l *Loader) smtp() SMTP {
+	s := SMTP{
+		Host:     l.str("SMTP_HOST", ""),
+		Port:     l.Int("SMTP_PORT", 587),
+		Username: l.str("SMTP_USERNAME", ""),
+		Password: os.Getenv("SMTP_PASSWORD"),
+		From:     l.str("SMTP_FROM", ""),
+
+		AllowPlaintext: l.Bool("SMTP_ALLOW_PLAINTEXT", false),
+	}
+	if !s.Enabled() {
+		return SMTP{}
+	}
+	if s.Port < 1 || s.Port > 65535 {
+		l.fail("SMTP_PORT must be between 1 and 65535, got %d", s.Port)
+	}
+	if _, err := mail.ParseAddress(s.From); err != nil {
+		l.fail("SMTP_FROM is required when SMTP_HOST is set, for example \"Talanta Tickets <no-reply@example.com>\"")
+	}
+	return s
 }
 
 func LoadWorker() (Worker, error) {
@@ -79,13 +324,17 @@ func newLoader() *Loader { return &Loader{} }
 
 func (l *Loader) base() Base {
 	b := Base{
-		AppEnv:      l.str("APP_ENV", EnvDevelopment),
+		// Unset means production: a server that lost its env file must not come up with
+		// development shortcuts switched on.
+		AppEnv:      l.str("APP_ENV", EnvProduction),
 		DatabaseURL: l.Required("DATABASE_URL"),
 	}
 	switch b.AppEnv {
 	case EnvDevelopment, EnvTest, EnvProduction:
 	default:
+		// Exact, case-sensitive match: "Production" or "prod" is a typo to fix, not a mode.
 		l.fail("APP_ENV must be development, test or production, got %q", b.AppEnv)
+		b.AppEnv = EnvProduction
 	}
 	if err := b.LogLevel.UnmarshalText([]byte(l.str("LOG_LEVEL", "info"))); err != nil {
 		l.fail("LOG_LEVEL: %v", err)
@@ -134,6 +383,23 @@ func (l *Loader) list(key, fallback string) []string {
 		if part = strings.TrimSpace(part); part != "" {
 			out = append(out, part)
 		}
+	}
+	return out
+}
+
+// Prefixes reads a comma-separated list of CIDRs. A bare address is taken as a single host.
+func (l *Loader) Prefixes(key, fallback string) []netip.Prefix {
+	var out []netip.Prefix
+	for _, part := range l.list(key, fallback) {
+		if p, err := netip.ParsePrefix(part); err == nil {
+			out = append(out, p.Masked())
+			continue
+		}
+		if a, err := netip.ParseAddr(part); err == nil {
+			out = append(out, netip.PrefixFrom(a, a.BitLen()))
+			continue
+		}
+		l.fail("%s: %q is not a CIDR such as 172.16.0.0/12", key, part)
 	}
 	return out
 }

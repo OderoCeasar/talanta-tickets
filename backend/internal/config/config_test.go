@@ -9,11 +9,12 @@ import (
 func TestLoadAPI(t *testing.T) {
 	t.Run("defaults", func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("APP_ENV", "development")
 		cfg, err := LoadAPI()
 		if err != nil {
 			t.Fatalf("LoadAPI: %v", err)
 		}
-		if cfg.Addr != ":8080" || cfg.AppEnv != EnvDevelopment || cfg.IsProduction() {
+		if cfg.Addr != ":8080" || cfg.AppEnv != EnvDevelopment || cfg.IsProduction() || !cfg.AllowDevShortcuts() {
 			t.Fatalf("unexpected defaults: %+v", cfg)
 		}
 	})
@@ -35,6 +36,7 @@ func TestLoadAPI(t *testing.T) {
 
 	t.Run("cors origins are split and trimmed", func(t *testing.T) {
 		t.Setenv("DATABASE_URL", "postgres://x")
+		t.Setenv("APP_ENV", "development")
 		t.Setenv("CORS_ORIGINS", " https://a.example , https://b.example,")
 		cfg, err := LoadAPI()
 		if err != nil {

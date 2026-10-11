@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"golang.org/x/crypto/argon2"
@@ -23,9 +24,10 @@ const (
 )
 
 // Upper bounds accepted when reading a stored hash. The cost comes from the hash string, so
-// without a ceiling a tampered row could make one login attempt allocate gigabytes.
+// without a ceiling a tampered row could make one login attempt allocate gigabytes. 64 MiB is
+// over three times what HashPassword writes, which leaves room to raise the cost later.
 const (
-	maxArgonMemoryKiB = 1 << 20 // 1 GiB
+	maxArgonMemoryKiB = 64 * 1024
 	maxArgonTime      = 16
 	maxArgonThreads   = 16
 	maxArgonKeyLen    = 128
@@ -66,14 +68,21 @@ func VerifyPassword(password, encoded string) (bool, error) {
 		return false, ErrInvalidHash
 	}
 
-	var version int
-	if _, err := fmt.Sscanf(parts[2], "v=%d", &version); err != nil || version != argon2.Version {
+	// Each field is parsed whole. Sscanf would stop at the first byte it does not understand
+	// and accept "v=19junk", so two different strings could name the same hash.
+	version, ok := phcUint(parts[2], "v=", 32)
+	if !ok || version != argon2.Version {
 		return false, ErrInvalidHash
 	}
 
-	var memory, time uint32
-	var threads uint8
-	if _, err := fmt.Sscanf(parts[3], "m=%d,t=%d,p=%d", &memory, &time, &threads); err != nil {
+	params := strings.Split(parts[3], ",")
+	if len(params) != 3 {
+		return false, ErrInvalidHash
+	}
+	memory, okM := phcUint(params[0], "m=", 32)
+	time, okT := phcUint(params[1], "t=", 32)
+	threads, okP := phcUint(params[2], "p=", 8)
+	if !okM || !okT || !okP {
 		return false, ErrInvalidHash
 	}
 	if memory == 0 || memory > maxArgonMemoryKiB || time == 0 || time > maxArgonTime ||
@@ -90,7 +99,23 @@ func VerifyPassword(password, encoded string) (bool, error) {
 		return false, ErrInvalidHash
 	}
 
-	got := argon2.IDKey([]byte(password), salt, time, memory, threads, uint32(len(want)))
+	got := argon2.IDKey([]byte(password), salt, uint32(time), uint32(memory), uint8(threads), uint32(len(want)))
 	// Constant time, so how many leading bytes matched cannot be measured from outside.
 	return subtle.ConstantTimeCompare(got, want) == 1, nil
+}
+
+// phcUint reads one "name=number" field of a PHC string: the exact prefix, then decimal digits
+// and nothing else (no sign, no spaces, no leading zero, no trailing bytes).
+func phcUint(field, prefix string, bits int) (uint64, bool) {
+	digits, found := strings.CutPrefix(field, prefix)
+	if !found || digits == "" || (len(digits) > 1 && digits[0] == '0') {
+		return 0, false
+	}
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.ParseUint(digits, 10, bits)
+	return n, err == nil
 }

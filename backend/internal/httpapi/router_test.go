@@ -34,7 +34,7 @@ func TestHealth(t *testing.T) {
 			rec := httptest.NewRecorder()
 			req := httptest.NewRequest(http.MethodGet, tt.path, nil)
 
-			NewRouter(logger, fakeDB{err: tt.dbErr}).ServeHTTP(rec, req)
+			NewRouter(Deps{Logger: logger, DB: fakeDB{err: tt.dbErr}}).ServeHTTP(rec, req)
 
 			if rec.Code != tt.wantStatus {
 				t.Fatalf("status = %d, want %d", rec.Code, tt.wantStatus)
