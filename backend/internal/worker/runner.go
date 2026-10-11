@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -29,9 +30,17 @@ func Run(ctx context.Context, logger *slog.Logger, jobs ...Job) {
 		}()
 	}
 	wg.Wait()
+	// With no jobs registered the process must still stay up until it is told to stop,
+	// otherwise the container exits and the orchestrator restarts it in a loop.
+	<-ctx.Done()
 }
 
 func loop(ctx context.Context, logger *slog.Logger, job Job) {
+	// time.NewTicker panics on a non-positive interval, which would take every job down.
+	if job.Interval <= 0 {
+		logger.Error("job not started: interval must be positive", "interval", job.Interval)
+		return
+	}
 	ticker := time.NewTicker(job.Interval)
 	defer ticker.Stop()
 
@@ -57,7 +66,7 @@ func runOnce(ctx context.Context, logger *slog.Logger, job Job) {
 	err := func() (err error) {
 		defer func() {
 			if r := recover(); r != nil {
-				err = fmt.Errorf("panic: %v", r)
+				err = fmt.Errorf("panic: %v\n%s", r, debug.Stack())
 			}
 		}()
 		return job.Run(runCtx)

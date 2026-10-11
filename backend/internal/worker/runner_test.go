@@ -68,3 +68,55 @@ func TestRunOnceAppliesTimeout(t *testing.T) {
 		t.Fatal("job context had no deadline")
 	}
 }
+
+func TestRunWithNoJobsBlocksUntilCancel(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, logger)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("Run returned before cancel")
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+}
+
+func TestRunSkipsJobWithZeroInterval(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+
+	ran := make(chan struct{}, 1)
+	done := make(chan struct{})
+	go func() {
+		Run(ctx, logger,
+			Job{Name: "broken", Run: func(context.Context) error { return nil }},
+			Job{Name: "good", Interval: time.Hour, Run: func(context.Context) error {
+				select {
+				case ran <- struct{}{}:
+				default:
+				}
+				return nil
+			}},
+		)
+		close(done)
+	}()
+
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the good job did not run beside a misconfigured one")
+	}
+	cancel()
+	<-done
+}

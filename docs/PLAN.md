@@ -49,13 +49,13 @@ touch only their own folders and start as soon as the OpenAPI contract exists.
 |---|---|---|---|
 | M1 | Foundation: compose (db, migrate, api, worker, adminer), Makefile, config, logging (CI already exists and is left as is) | lead | `code-reviewer` |
 | M2 | Schema corrections, sqlc, seeder (~60,000 seats, two events, one user per role) | `db-architect` | `code-reviewer` |
-| M3 | OpenAPI contract for the whole API, error mapping, auth (OTP, password + TOTP, JWT) | `go-api-engineer` | `code-reviewer` |
+| M3 | OpenAPI contract for the whole API, error mapping, auth (OTP, password with optional TOTP, JWT), staff invitations, first-admin bootstrap | `go-api-engineer` | `code-reviewer` |
 | M4 | Events, categories, layout endpoints, publish | `go-api-engineer` | `code-reviewer` |
 | M5 | Seat map levels 1–3 and the changed-since poll | `go-api-engineer` | `code-reviewer` |
 | M6 | Holds, best available, sweeper, limits, concurrency tests | `booking-concurrency-engineer` | `code-reviewer` |
 | M7 | Bookings, payments (mock + Daraja), tickets, SMS mock | `payments-engineer`, then `ticketing-gate-engineer` | `code-reviewer` |
 | M8 | Mobile fan flow | `mobile-engineer` (starts after M3's contract) | `code-reviewer` |
-| M9 | Admin web | `admin-web-engineer` (starts after M3's contract) | `code-reviewer` |
+| M9 | Admin web (login, invite staff and set-password pages first, then events, layout, pricing, sales) | `admin-web-engineer` (starts after M3's contract) | `code-reviewer` |
 | M10 | Gate mode: manifest, scan upload (backend), offline scanning (mobile) | `ticketing-gate-engineer`, `mobile-engineer` | `code-reviewer` |
 | M11 | Load test, end-to-end journeys, README, diagrams | `qa-engineer`, lead | `code-reviewer` |
 
