@@ -14,6 +14,7 @@ import (
 	"math/big"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"regexp"
 	"slices"
@@ -31,6 +32,8 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi/contracttest"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments/mock"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/testdb"
@@ -103,7 +106,7 @@ func uncoveredOperations() []string {
 	}
 	seen := contract.Seen()
 	var missing []string
-	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations, m7TicketOperations) {
+	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations, m7TicketOperations, m7PaymentOperations) {
 		var success, failure bool
 		for _, s := range seen {
 			name, status, _ := strings.Cut(s, " ")
@@ -119,7 +122,7 @@ func uncoveredOperations() []string {
 		if !success {
 			missing = append(missing, op+": no success answer")
 		}
-		if !failure {
+		if !failure && !slices.Contains(operationsThatOnlyAnswer200, op) {
 			missing = append(missing, op+": no error answer")
 		}
 	}
@@ -248,6 +251,13 @@ type envConfig struct {
 	venueLockWait time.Duration
 	// ticketKeys is the ticket keyring; nil means a fresh random key with the ID k1.
 	ticketKeys *ticketing.Keyring
+	// paymentPolicy is the payment service's policy; zero values mean the defaults, except
+	// that reconciliation takes no lease unless a test asks for one.
+	paymentPolicy payments.Policy
+	// provider replaces the mock payment provider (a provider that is down, one that counts).
+	provider func(m *mock.Provider) payments.Provider
+	// callbackAllowed is MPESA_CALLBACK_ALLOWED_CIDRS; empty allows every address.
+	callbackAllowed []netip.Prefix
 }
 
 type envOption func(*envConfig)
@@ -270,19 +280,25 @@ func withOTPCountries(codes ...string) envOption {
 
 // env is one API instance (its own limiter, clock, SMS and mail boxes) on the shared database.
 type env struct {
-	t        *testing.T
-	router   http.Handler
-	events   *events.Service
-	venues   *venue.Service
-	holds    *booking.Service
-	tickets  *ticketing.Service
-	auth     *auth.Service
-	q        *store.Queries
-	clock    *clock
-	sms      *smsBox
-	mail     *mailBox
-	logs     *syncBuffer
-	contract *contracttest.Contract
+	t       *testing.T
+	router  http.Handler
+	events  *events.Service
+	venues  *venue.Service
+	holds   *booking.Service
+	tickets *ticketing.Service
+	// payments is the payment service; mock is its provider, whose callbacks the test
+	// delivers by hand (timers) and whose clock the test moves (mockClock).
+	payments  *payments.Service
+	mock      *mock.Provider
+	timers    *mockTimers
+	mockClock *clock
+	auth      *auth.Service
+	q         *store.Queries
+	clock     *clock
+	sms       *smsBox
+	mail      *mailBox
+	logs      *syncBuffer
+	contract  *contracttest.Contract
 	// remoteAddr is the TCP peer of the next requests.
 	remoteAddr string
 	// ticketSeed is the private seed of the ticket signing key when newEnv made the key
@@ -347,7 +363,41 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 		DB: db.Pool, Logger: logger, Keys: cfg.ticketKeys, SMS: e.sms, PublicBaseURL: testPublicBaseURL,
 	})
 	require.NoError(t, err)
+	// The mock provider is built as in development even for a "production" API, so those
+	// tests can show the header is refused before any provider is reached.
+	e.timers, e.mockClock = &mockTimers{}, &clock{}
+	e.mock, err = mock.New(mock.Config{Allowed: true, Logger: logger, Now: e.mockClock.Now, After: e.timers.After})
+	require.NoError(t, err)
+	var provider payments.Provider = e.mock
+	if cfg.provider != nil {
+		provider = cfg.provider(e.mock)
+	}
+	if cfg.paymentPolicy.ReconcileLease == 0 {
+		cfg.paymentPolicy.ReconcileLease = -1
+	}
+	e.payments, err = payments.NewService(payments.Config{
+		DB: db.Pool, Logger: logger, Provider: provider, Tickets: e.tickets, Policy: cfg.paymentPolicy,
+	})
+	require.NoError(t, err)
+	// The mock's callback goes through the same function the webhook uses, here on the
+	// goroutine that fires the timer, so a test sees the result as soon as it has fired it.
+	e.mock.SetSink(func(ctx context.Context, cb payments.Callback) {
+		fin, err := e.payments.HandleCallback(ctx, cb)
+		e.timers.record(fin, err)
+	})
+	t.Cleanup(e.payments.Wait)
+	// Reconciliation looks at every live payment in the database, and the tests share one.
+	// A test that leaves a payment in flight (many do, on purpose) must not have it turn up
+	// in the next test's reconciliation run, so whatever is still live when a test ends is
+	// closed here. Tests in this package do not run in parallel.
+	t.Cleanup(func() {
+		exec(t, `UPDATE payments SET status = 'FAILED', completed_at = now(), result_desc = 'closed at the end of its test' WHERE status IN ('INITIATED', 'PENDING')`)
+	})
 	e.router = httpapi.NewRouter(httpapi.Deps{
+		Payments:             e.payments,
+		AllowMockOutcome:     cfg.devShortcuts,
+		MpesaCallbackAllowed: cfg.callbackAllowed,
+
 		Events:      e.events,
 		Venues:      e.venues,
 		Holds:       e.holds,

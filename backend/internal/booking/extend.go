@@ -49,12 +49,24 @@ type Extension struct {
 // which is what makes "release" and "start a payment" take turns: whichever comes second
 // sees what the first did.
 //
+// The wait for the event is bounded by eventLockWait (zero means no limit): when an
+// organiser's publish, cancel or edit keeps the event longer, the answer is EVENT_BUSY and
+// the transaction is aborted (the caller must roll back).
+//
+// Every time is judged by the database clock read AFTER the hold's row lock was granted, and
+// the UPDATE itself refuses a hold whose time has run out, so a call that queued behind
+// another transaction can never push out (revive) a hold that expired while it waited.
+//
 // It writes the seats' hold_expires_at. That is the one seat write that need not be the last
 // statement of its transaction: the seats stay HELD, so what the seat map shows does not
 // change, and a poller that misses the stamp misses nothing.
-func ExtendForPayment(ctx context.Context, tx store.DBTX, userID, holdID int64, minRemaining time.Duration) (Extension, error) {
-	if _, err := store.LockEventOfHold(ctx, tx, holdID); errors.Is(err, store.ErrNoRows) {
+func ExtendForPayment(ctx context.Context, tx store.DBTX, userID, holdID int64, minRemaining, eventLockWait time.Duration) (Extension, error) {
+	if _, err := store.LockEventOfHoldWithin(ctx, tx, holdID, eventLockWait); errors.Is(err, store.ErrNoRows) {
 		return Extension{}, domain.ErrNotFound
+	} else if store.IsLockTimeout(err) {
+		busy := domain.EventBusy("This event is being updated. Try again in a moment.")
+		busy.Err = err
+		return Extension{}, busy
 	} else if err != nil {
 		return Extension{}, fmt.Errorf("lock event of hold %d: %w", holdID, err)
 	}
@@ -75,11 +87,13 @@ func ExtendForPayment(ctx context.Context, tx store.DBTX, userID, holdID int64, 
 
 	out := Extension{HoldID: h.ID, EventID: h.EventID, ExpiresAt: h.ExpiresAt, Remaining: h.ExpiresAt.Sub(h.Now)}
 	wanted := h.Now.Add(minRemaining)
-	switch {
-	case h.ExtendedAt != nil:
-		out.AlreadyExtended = true
-		return out, nil
-	case !h.ExpiresAt.Before(wanted):
+	if h.ExtendedAt != nil || !h.ExpiresAt.Before(wanted) {
+		// Nothing moves, but the caller still needs to know how many seats the hold has:
+		// it compares that with the booking's items before it starts a payment.
+		out.AlreadyExtended = h.ExtendedAt != nil
+		if out.Seats, err = store.CountHeldSeatsOfHold(ctx, tx, h.ID); err != nil {
+			return Extension{}, fmt.Errorf("count seats of hold %d: %w", holdID, err)
+		}
 		return out, nil
 	}
 
@@ -92,7 +106,10 @@ func ExtendForPayment(ctx context.Context, tx store.DBTX, userID, holdID int64, 
 		return Extension{}, fmt.Errorf("extend hold %d: %w", holdID, err)
 	}
 	if moved != 1 {
-		return Extension{}, fmt.Errorf("extend hold %d: changed under its row lock", holdID)
+		// The row is locked, so its status and extended_at are what was read above: the
+		// only condition of the UPDATE that can have turned false is the expiry, between
+		// the clock read and the write.
+		return Extension{}, domain.HoldExpiredError(h.ID, h.ExpiresAt)
 	}
 	seats, err := store.ExtendSeatsOfHold(ctx, tx, h.ID, wanted)
 	if err != nil {
@@ -103,13 +120,13 @@ func ExtendForPayment(ctx context.Context, tx store.DBTX, userID, holdID int64, 
 }
 
 // ExtendForPayment is the package function of the same name in a transaction of its own,
-// with the policy's payment window. The payment flow should prefer the package function so
-// the extension commits or rolls back together with the payment row.
+// with the policy's payment window and event lock wait. The payment flow uses the package
+// function so the extension commits or rolls back together with the payment row.
 func (s *Service) ExtendForPayment(ctx context.Context, userID, holdID int64) (Extension, error) {
 	var out Extension
 	err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
 		var err error
-		out, err = ExtendForPayment(ctx, tx, userID, holdID, s.policy.PaymentWindow)
+		out, err = ExtendForPayment(ctx, tx, userID, holdID, s.policy.PaymentWindow, s.policy.EventLockWait)
 		return err
 	})
 	return out, err
@@ -117,3 +134,9 @@ func (s *Service) ExtendForPayment(ctx context.Context, userID, holdID int64) (E
 
 // PaymentWindow is the least time a hold must have left when a payment starts.
 func (s *Service) PaymentWindow() time.Duration { return s.policy.PaymentWindow }
+
+// EventLockWait is how long a request waits for an event an organiser has locked.
+func (s *Service) EventLockWait() time.Duration { return s.policy.EventLockWait }
+
+// FeeBPS is the booking fee in basis points of the subtotal.
+func (s *Service) FeeBPS() int { return s.policy.BookingFeeBPS }

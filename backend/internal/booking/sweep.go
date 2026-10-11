@@ -92,7 +92,7 @@ func (s *Service) sweepBatch(ctx context.Context, total *SweepResult) (n int, sk
 		if err != nil {
 			return fmt.Errorf("expire lapsed holds: %w", err)
 		}
-		bookings, err := store.CloseUnpaidBookingsOfHolds(ctx, tx, ids, "EXPIRED")
+		bookings, err := closeUnpaidBookings(ctx, tx, ids, domain.BookingExpired)
 		if err != nil {
 			return fmt.Errorf("expire bookings of lapsed holds: %w", err)
 		}

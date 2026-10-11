@@ -487,3 +487,124 @@ One line each: what was chosen and why. Newest at the bottom.
   import it.
 - **`contracttest` reads `text/html` and `image/png` bodies as strings.** kin-openapi has no
   decoder for either, and the web ticket page and the QR image are in the contract.
+- **Bookings and payments (M7): one function finishes a payment, in one transaction.**
+  `payments.Service.Finish` is where the M-Pesa callback, a repeat of it, the mock provider
+  and reconciliation all end. It locks, in the system's order, the event (shared), the
+  booking's hold, the booking and the payment, and then reads the payment's status: a
+  second final state is refused by `domain.TransitionPayment`, which is what makes a
+  duplicate callback, and a callback racing a reconciliation run, change nothing.
+- **LOCK ORDER, extended for M7.** After (3) the hold row: (4) the booking row, then the
+  payment row, then a refund row; `event_seats` is still written last, followed only by
+  ticket issue. Every transaction that touches a booking, its payments or its refunds
+  first takes the event shared and the booking's hold. Two statements take one payment row
+  with nothing else and wait for nothing afterwards, so they cannot be part of a deadlock:
+  recording that the provider accepted a request (`store.LockPaymentAlone`) and
+  reconciliation's claim (`store.ClaimPaymentsForReconcile`, `FOR UPDATE SKIP LOCKED`).
+  The comments are in `internal/store/payments.go`.
+- **The provider is called outside any transaction.** Starting a payment commits its row
+  (`INITIATED`, with the hold extended) and only then calls M-Pesa. Called inside, a slow
+  Safaricom would keep the event's share lock, and every organiser edit, cancel and hold
+  queued behind it would wait on Safaricom. The price is a window in which the row exists
+  and the request has not been sent; reconciliation closes such a row after 60 seconds.
+- **A booking's reference is `TLT-` and six of `ABCDEFGHJKMNPQRSTUVWXYZ23456789`, from
+  crypto/rand.** No 0/O/1/I/L: a reference is read out over the phone and typed at a gate.
+  About 887 million values; a collision is retried under a savepoint.
+- **One hold, one live booking, decided at the hold's row lock.** Two `POST /bookings` for
+  one hold take turns there, so the second finds the first's booking whichever key it
+  carries: the same key replays it (200), another key answers `HOLD_ALREADY_BOOKED`. The
+  `bookings_live_hold_key` and `(user_id, idempotency_key)` unique indexes stand behind
+  that and are answered the same way, never as a 500. A replay is looked up before any
+  lock, so it works when the event is busy or the hold has ended.
+- **A payment needs 2 minutes left on its hold (`payments.Policy.MinHoldRemaining`), not
+  6.** The first payment pushes the hold out to 6 minutes (correction 4). A hold is extended
+  once, so a retry after a wrong PIN finds less; requiring 6 again would refuse every
+  retry. Two minutes covers one PIN prompt, which M-Pesa itself gives up on after about a
+  minute. A result that arrives after the hold has run out is still handled correctly (see
+  below), so the number protects the fan's time, not the inventory.
+- **A successful payment sells through the hold's STORED status (correction 5).** `ACTIVE`,
+  even past its expiry: the seat statement (`store.SellSeatsOfHold`, `hold_id` matches and
+  status still `HELD`) finds out whether the hold still has every seat, and sells all or
+  none. `EXPIRED` or `RELEASED`: the seats went back on sale; they are not taken back, even
+  if they happen to be free, because that would be a second hold made without the hold
+  rules. So a late payment for a booking the sweeper already expired is refunded.
+- **PAID and CONVERTED are written under a savepoint and undone when the sale comes up
+  short.** The order inside is payment, booking, hold, then the seats, then the tickets at
+  once. `Sold != n` rolls the savepoint back and the payment is recorded with a refund. So
+  does a refusal from `ticketing.IssueForBooking` (the seats sold are not exactly the
+  booking's): two independent guards, and breaking either one alone leaves the tests green.
+- **Wrong amount: payment `FAILED` with `failure_reason: wrong_amount`, booking
+  `REFUND_REQUIRED`.** §8.2 says "FAILED + refund queue" and the contract's `BookingStatus`
+  says the booking is `REFUND_REQUIRED`; both hold. No new column: a `FAILED` payment whose
+  `result_code` is 0 (M-Pesa said paid, we refused) is the wrong-amount case, and
+  `domain.PaymentFailureReason` reads it that way. The refund is for what was actually
+  paid, and the alert kind is `AMOUNT_MISMATCH`.
+- **`TIMEOUT` is our verdict, so M-Pesa can overrule it.** `TIMEOUT -> SUCCESS` and
+  `TIMEOUT -> FAILED` are legal; `SUCCESS` and `FAILED` are final. Otherwise money that
+  arrived after we stopped waiting could not be recorded. A second `SUCCESS` for a booking
+  another payment already paid is recorded and refunded on its own: the booking stays
+  `PAID` and its tickets are not touched.
+- **`CANCELLED`, `EXPIRED` and `FAILED` bookings may become `REFUND_REQUIRED`; `REFUNDED`
+  may too.** A late success has to be recordable on a booking we had given up on, and a
+  booking whose refunds were all paid can receive yet another payment. `PAID` has exactly
+  one way out (`REFUND_REQUIRED`, on event cancel). Booking status `FAILED` is not written
+  by anything: a booking whose payment failed stays `PENDING_PAYMENT` while its hold lives
+  and becomes `EXPIRED` when the hold is gone, the same as one that was never paid for.
+- **Status writes ask the transition rule with the row's real status.** The hold flow
+  passed constants (`TransitionHold(ACTIVE, EXPIRED)`), which can never refuse. Bookings
+  and payments are now read under their row lock in whatever status they have
+  (`store.LockBookingsOfHolds`, `LockBookingsOfEvent`, `LockBooking`, `LockPayment`) and
+  `domain.TransitionBooking` / `TransitionPayment` are asked with that. A booking the rule
+  will not move (`PAID`, `REFUND_REQUIRED`) is left alone by a release, a sweep or a
+  take-over instead of being filtered out by a WHERE clause. Event cancel asks once per
+  status actually present among the event's bookings, which costs one extra pass over rows
+  it rewrites anyway.
+- **The callback is believed only as far as it can be checked.** Matched by
+  `CheckoutRequestID` to a payment that is still open; the `Amount` must equal the booking
+  total; the source address must be in `MPESA_CALLBACK_ALLOWED_CIDRS` (resolved by
+  `httpapi.ClientIP`, so a forged `X-Forwarded-For` does not help). A "paid" with no
+  readable amount is not applied: the provider is asked (STK query, authenticated) and that
+  answer is used. A receipt already recorded on another payment is treated the same way
+  (a replay). Daraja's STK query names no amount; a query that says "paid" is taken for the
+  amount we asked for, because an STK prompt cannot be paid in part.
+- **The webhook answers before it works.** It checks the address and the envelope, hands
+  the callback to a bounded background runner (`payments.Background`, 256 at once, tied to
+  shutdown) and answers 200. Work that cannot start, or that fails (the event is locked by
+  a cancel), is left to reconciliation: the callback is an optimisation, never the only way
+  a payment gets finished. The ticket SMS runs on the same runner, after the commit.
+- **Reconciliation claims payments with a lease.** `FOR UPDATE SKIP LOCKED` plus a
+  `last_queried_at` stamp written by the same statement: two workers never ask about one
+  payment, and a payment a callback is finishing is skipped. `query_attempts` counts the
+  claims. After 5 minutes without a final answer the payment is `TIMEOUT` and the
+  organiser gets a `PAYMENT_UNRESOLVED` alert, because money may have moved.
+- **The mock provider keeps no state.** Its checkout request ID carries the outcome, the
+  amount and the time, so the worker (another process) answers a status query for a
+  payment the API started. It is refused twice in production: `config.LoadPayments` will
+  not select it and `mock.New` will not build it.
+- **Production needs M-Pesa fully configured or does not start.** `PAYMENT_PROVIDER`
+  defaults to `mpesa` in production and `mock` in development and test. With `mpesa`, a
+  missing `MPESA_*` variable is a startup error in every environment: nothing falls back to
+  the mock. The two secrets are `config.Secret`, which prints as `[redacted]` in fmt, slog
+  and JSON, because `config.API` is printed.
+- **The Daraja client retries network errors only, and an STK push only when the
+  connection could not be made.** A push that timed out after it was sent may have reached
+  Daraja; sending it again would put a second prompt on the fan's phone. The token and the
+  query are safe to repeat and are retried on any network error (twice). A call that got
+  any HTTP response is never retried. Amounts go to Daraja in whole shillings and a
+  booking total that is not a multiple of 100 cents is refused, not rounded.
+- **Completing a refund never touches seats.** A `REFUND_REQUIRED` booking of a live event
+  owns no sold seat (it got that way because its payment could not sell), and a cancelled
+  event's sold seats stay `SOLD` on purpose. There is no operation that refunds one paid
+  booking of a live event; adding one needs a rule for putting its seats back on sale,
+  which does not exist. `SOLD -> AVAILABLE` is still not a legal seat move.
+- **The sales summary and the payment flow do not share a cache key.** A payment does not
+  drop the events service's 3-second counts cache; the dashboard was already documented as
+  a few seconds behind.
+- **`internal/testinvariants` has two sets of rules.** `Check` (inventory) is unchanged, so
+  the earlier tests that write `SOLD` seats and bookings straight into the tables as
+  fixtures keep passing. `CheckLedger` adds the payment rules (a sold seat has one paid
+  booking item, a converted hold and one live ticket; a paid booking has its money and its
+  tickets; money that bought nothing has a refund) and every payment test ends with it. A
+  test proves each ledger rule fires on a deliberately corrupt state.
+- **No new Go dependency and no migration 000009 for M7 bookings and payments.**
+- **Fonts are bundled, not fetched from Google at run time.** The app must render with no
+  network, and the admin site makes no third-party requests.

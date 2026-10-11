@@ -16,6 +16,8 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments/providers"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ticketing"
@@ -143,6 +145,34 @@ func run() error {
 		return err
 	}
 
+	// The provider is the one the configuration names; production cannot name the mock and
+	// an incomplete M-Pesa configuration has already stopped the start.
+	provider, mockProvider, err := providers.New(cfg.Payments, cfg.Base, logger)
+	if err != nil {
+		return err
+	}
+	paymentPolicy := payments.DefaultPolicy()
+	paymentPolicy.HoldWindow, paymentPolicy.EventLockWait = holdPolicy.PaymentWindow, holdPolicy.EventLockWait
+	paymentService, err := payments.NewService(payments.Config{
+		DB: pool, Logger: logger, Provider: provider, Tickets: ticketService, Policy: paymentPolicy,
+	})
+	if err != nil {
+		return err
+	}
+	if mockProvider != nil {
+		logger.Warn("payments use the MOCK provider: no money moves. X-Mock-Outcome chooses what a payment does", "app_env", cfg.AppEnv)
+		// The mock's "callback" goes where the real one goes after the webhook has parsed
+		// it, on the same background runner.
+		mockProvider.SetSink(func(ctx context.Context, cb payments.Callback) { paymentService.HandleCallbackAsync(ctx, cb) })
+	} else if cfg.Payments.Provider == config.ProviderNone {
+		logger.Warn("payments are OFF: no provider is configured, so every attempt to pay is answered 'not available'. Set the MPESA_* variables to take payments")
+	} else {
+		logger.Info("payments go through M-Pesa (Daraja)", "mpesa_env", cfg.Payments.Mpesa.Env, "short_code", cfg.Payments.Mpesa.ShortCode)
+	}
+	if len(cfg.Payments.CallbackAllowedCIDRs) == 0 {
+		logger.Warn("MPESA_CALLBACK_ALLOWED_CIDRS is not set: the M-Pesa callback is accepted from any address")
+	}
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
@@ -158,6 +188,11 @@ func run() error {
 			PublishTimeout: publishTimeout,
 			Holds:          holdService,
 			Tickets:        ticketService,
+			Payments:       paymentService,
+			Pool:           pool,
+
+			AllowMockOutcome:     cfg.AllowDevShortcuts(),
+			MpesaCallbackAllowed: cfg.Payments.CallbackAllowedCIDRs,
 		}),
 		// Each bound closes one way a slow or silent client can hold a connection open.
 		ReadHeaderTimeout: 10 * time.Second,
@@ -186,7 +221,11 @@ func run() error {
 	// Give in-flight requests a moment to finish before the container is killed.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+	// Callback work and ticket SMS already started are allowed to finish (each has its own
+	// deadline) before the pool is closed under them.
+	paymentService.Wait()
+	return err
 }
 
 // newMailer picks SMTP when SMTP_HOST is set and the logging mock otherwise.

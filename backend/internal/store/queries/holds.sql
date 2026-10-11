@@ -100,9 +100,12 @@ UPDATE holds SET status = sqlc.arg(status) WHERE id = sqlc.arg(id) AND status = 
 
 -- name: ExtendHold :execrows
 -- Correction 4: pushes one ACTIVE, never-extended hold's expiry out and records that it was
--- done. extended_at IS NULL is what makes a second extension impossible.
+-- done. extended_at IS NULL is what makes a second extension impossible. The expiry
+-- condition is judged by the clock at the moment of the write: a hold whose time has run out
+-- is never revived, whatever an earlier read made of it (zero rows -> HOLD_EXPIRED).
 UPDATE holds SET expires_at = sqlc.arg(expires_at), extended_at = clock_timestamp()
-WHERE id = sqlc.arg(id) AND status = 'ACTIVE' AND extended_at IS NULL;
+WHERE id = sqlc.arg(id) AND status = 'ACTIVE' AND extended_at IS NULL
+  AND expires_at > clock_timestamp();
 
 -- name: ListCategoryBlocks :many
 -- Best available, step 1: the blocks that have seats of one category, with what ranks a

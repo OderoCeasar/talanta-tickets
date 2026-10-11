@@ -5,6 +5,14 @@ x-backend-env: &backend-env
   APP_ENV: development
   DATABASE_URL: postgres://talanta:talanta@db:5432/talanta?sslmode=disable
   LOG_LEVEL: ${LOG_LEVEL:-info}
+  # The api issues tickets when a callback arrives and the worker when it reconciles a
+  # payment, so both must sign with the same key. This one is for local use only; it is not
+  # a secret and must never be set on a real server.
+  TICKET_SIGNING_KEY: "ANPnb0qYpmdUcWk2UDFJJZBZmbLGvra4cXlMZ41wkYU="
+  TICKET_SIGNING_KEY_ID: k1
+  PUBLIC_BASE_URL: http://localhost:8080
+  # No money moves: the mock provider plays M-Pesa. X-Mock-Outcome picks what a payment does.
+  PAYMENT_PROVIDER: mock
 
 services:
   db:

@@ -13,7 +13,11 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments/providers"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/ticketing"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/worker"
 )
 
@@ -29,8 +33,19 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Reconciliation finishes payments, and finishing a payment issues tickets: the worker
+	// signs with the same key as the API (read straight into a signer, never a config field).
+	keyLoader := config.NewLoader()
+	ticketKeys := ticketing.LoadKeyring(keyLoader, cfg.Base)
+	if err := keyLoader.Err(); err != nil {
+		return err
+	}
 	logger := config.NewLogger(cfg.Base, "worker")
 	slog.SetDefault(logger)
+	if ticketKeys.Ephemeral {
+		logger.Warn("TICKET_SIGNING_KEY IS NOT SET: tickets issued by the worker (when reconciliation finishes a payment) are signed " +
+			"with a key made up at startup that the API does not know. Set the same TICKET_SIGNING_KEY for the API and the worker.")
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -51,9 +66,33 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	jobs := jobs(cfg, pool, holds, logger)
-	logger.Info("worker started", "jobs", len(jobs))
+	// The same provider as the API (config.LoadPayments is shared): reconciliation has to ask
+	// whoever the payment was sent to. The mock is given no callback sink here: the worker
+	// only queries.
+	provider, mockProvider, err := providers.New(cfg.Payments, cfg.Base, logger)
+	if err != nil {
+		return err
+	}
+	if mockProvider != nil {
+		logger.Warn("payment reconciliation uses the MOCK provider: no money moves", "app_env", cfg.AppEnv)
+	}
+	tickets, err := ticketing.NewService(ticketing.Config{
+		DB: pool, Logger: logger, Keys: ticketKeys, PublicBaseURL: cfg.PublicBaseURL,
+		SMS: notify.LogSMS{Logger: logger, Production: cfg.IsProduction()},
+	})
+	if err != nil {
+		return err
+	}
+	pay, err := payments.NewService(payments.Config{DB: pool, Logger: logger, Provider: provider, Tickets: tickets})
+	if err != nil {
+		return err
+	}
+
+	jobs := jobs(cfg, pool, holds, pay, logger)
+	logger.Info("worker started", "jobs", len(jobs), "payment_provider", cfg.Payments.Provider)
 	worker.Run(ctx, logger, jobs...)
+	// Ticket SMS started by the last reconciliation run are allowed to finish.
+	pay.Wait()
 	logger.Info("worker stopped")
 	return nil
 }
@@ -64,10 +103,36 @@ const (
 )
 
 // jobs lists the background work. Each owner adds its job here.
-func jobs(cfg config.Worker, db store.DBTX, holds sweeper, logger *slog.Logger) []worker.Job {
+func jobs(cfg config.Worker, db store.DBTX, holds sweeper, pay reconciler, logger *slog.Logger) []worker.Job {
 	return []worker.Job{
 		authCleanupJob(db, logger),
 		holdSweeperJob(cfg, holds, logger),
+		reconcileJob(cfg, pay, logger),
+	}
+}
+
+// reconciler is the part of the payment service the worker runs.
+type reconciler interface {
+	Reconcile(ctx context.Context) (payments.ReconcileResult, error)
+}
+
+// reconcileJob settles payments whose callback never came (see payments.Service.Reconcile),
+// every RECONCILE_INTERVAL.
+func reconcileJob(cfg config.Worker, pay reconciler, logger *slog.Logger) worker.Job {
+	return worker.Job{
+		Name:     "payment-reconciliation",
+		Interval: cfg.ReconcileInterval,
+		// A run asks the provider about up to a batch of payments, one after another.
+		Timeout: 5 * time.Minute,
+		Run: func(ctx context.Context) error {
+			n, err := pay.Reconcile(ctx)
+			if n.Claimed > 0 {
+				logger.InfoContext(ctx, "payment reconciliation", "job", "payment-reconciliation",
+					"claimed", n.Claimed, "sold", n.Sold, "refunds", n.Refunds, "failed", n.Failed,
+					"timed_out", n.TimedOut, "still_pending", n.Pending, "errors", n.Errors)
+			}
+			return err
+		},
 	}
 }
 

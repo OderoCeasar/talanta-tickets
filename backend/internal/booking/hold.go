@@ -47,16 +47,23 @@ func (s *Service) Hold(ctx context.Context, userID, eventID int64, seatIDs []int
 	ids := slices.Clone(seatIDs)
 	slices.Sort(ids)
 
-	var holdID int64
+	var out Hold
 	err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
-		var err error
-		holdID, err = s.holdTx(ctx, tx, userID, eventID, ids)
+		holdID, err := s.holdTx(ctx, tx, userID, eventID, ids)
+		if err != nil {
+			return err
+		}
+		// The answer is built here, inside the transaction. Read after the commit, a failed
+		// read answered 500 to a fan who by then held the seats and could not know it.
+		// These are plain reads: they take no lock and wait for none, so the seat write
+		// before them is still, in effect, the last thing this transaction does.
+		out, err = s.load(ctx, store.New(tx), userID, holdID)
 		return err
 	})
 	if err != nil {
 		return Hold{}, err
 	}
-	return s.Get(ctx, userID, holdID)
+	return out, nil
 }
 
 // admit runs the checks that come before any seat is looked at, taking the first two locks
@@ -214,7 +221,7 @@ func (s *Service) closeTakenOverHolds(ctx context.Context, tx pgx.Tx, won []stor
 	if len(emptied) == 0 {
 		return nil
 	}
-	if _, err := store.CloseUnpaidBookingsOfHolds(ctx, tx, emptied, "EXPIRED"); err != nil {
+	if _, err := closeUnpaidBookings(ctx, tx, emptied, domain.BookingExpired); err != nil {
 		return fmt.Errorf("expire bookings of taken-over holds: %w", err)
 	}
 	return nil

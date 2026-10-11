@@ -187,6 +187,20 @@ type CancelResult struct {
 	HoldsReleased     int
 }
 
+// bookingAfterCancel says what a booking in status `from` becomes when its event is
+// cancelled: an unpaid one is CANCELLED, a paid one is owed its money back. Anything else
+// stays as it is (moves is false). A payment that is still in flight is not looked at: if it
+// succeeds afterwards, the payment flow finds the event cancelled and queues the refund.
+func bookingAfterCancel(from domain.BookingStatus) (to domain.BookingStatus, moves bool) {
+	switch from {
+	case domain.BookingPendingPayment:
+		return domain.BookingCancelled, true
+	case domain.BookingPaid:
+		return domain.BookingRefundRequired, true
+	}
+	return from, false
+}
+
 // cancelRefundReason is stored on every refund queued by a cancellation.
 const cancelRefundReason = "The event was cancelled"
 
@@ -230,6 +244,24 @@ func (s *Service) Cancel(ctx context.Context, eventID int64) (CancelResult, erro
 		})
 		if err != nil {
 			return fmt.Errorf("void tickets of event %d: %w", eventID, err)
+		}
+		// The bookings, locked, in the statuses they really have. The rule for what a
+		// booking may become is domain.TransitionBooking; it is asked once per status that is
+		// actually present, before either UPDATE below runs. Statuses with no target here
+		// (already closed, already owed a refund) are not touched.
+		present, err := store.LockBookingsOfEvent(ctx, tx, eventID)
+		if err != nil {
+			return fmt.Errorf("lock bookings of event %d: %w", eventID, err)
+		}
+		for status := range present {
+			from := domain.BookingStatus(status)
+			to, moves := bookingAfterCancel(from)
+			if !moves {
+				continue
+			}
+			if err := domain.TransitionBooking(from, to); err != nil {
+				return fmt.Errorf("cancel event %d: %w", eventID, err)
+			}
 		}
 		unpaid, err := q.CancelUnpaidBookingsOfEvent(ctx, eventID)
 		if err != nil {

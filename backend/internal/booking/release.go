@@ -62,9 +62,11 @@ func (s *Service) Release(ctx context.Context, userID, holdID int64) error {
 			return fmt.Errorf("look for a live payment of hold %d: %w", holdID, err)
 		}
 
-		to, bookingTo := domain.HoldReleased, "CANCELLED"
-		if domain.EffectiveHoldStatus(domain.HoldActive, h.ExpiresAt, h.Now) == domain.HoldExpired {
-			to, bookingTo = domain.HoldExpired, "EXPIRED"
+		// h.Now was read after the row lock was granted (store.LockHold), so a release that
+		// queued behind another transaction labels the hold by the time it actually ran.
+		to, bookingTo := domain.HoldReleased, domain.BookingCancelled
+		if domain.EffectiveHoldStatus(domain.HoldStatus(h.Status), h.ExpiresAt, h.Now) == domain.HoldExpired {
+			to, bookingTo = domain.HoldExpired, domain.BookingExpired
 		}
 		if err := errors.Join(
 			domain.TransitionHold(domain.HoldStatus(h.Status), to),
@@ -75,7 +77,7 @@ func (s *Service) Release(ctx context.Context, userID, holdID int64) error {
 		if _, err := q.SetHoldStatus(ctx, store.SetHoldStatusParams{ID: holdID, Status: string(to)}); err != nil {
 			return fmt.Errorf("close hold %d: %w", holdID, err)
 		}
-		if _, err := store.CloseUnpaidBookingsOfHolds(ctx, tx, []int64{holdID}, bookingTo); err != nil {
+		if _, err := closeUnpaidBookings(ctx, tx, []int64{holdID}, bookingTo); err != nil {
 			return fmt.Errorf("close booking of hold %d: %w", holdID, err)
 		}
 		// The seat write, last.

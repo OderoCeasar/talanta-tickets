@@ -97,6 +97,10 @@ type API struct {
 	// OTPGlobalHourlyLimit and OTPGlobalDailyLimit cap sign-in SMS across all phones.
 	OTPGlobalHourlyLimit int
 	OTPGlobalDailyLimit  int
+
+	// Payments is the payment provider and the M-Pesa callback allowlist. Its secrets are
+	// of type Secret, which prints as "[redacted]" wherever this struct is printed.
+	Payments Payments
 }
 
 // TrustNoProxies is the TRUSTED_PROXY_CIDRS value that says "the API is exposed directly:
@@ -141,6 +145,12 @@ type Worker struct {
 	Base
 	SweepInterval     time.Duration
 	ReconcileInterval time.Duration
+	// Payments is the same provider configuration the API loads: reconciliation must ask
+	// the provider the API sent the payment to.
+	Payments Payments
+	// PublicBaseURL is the origin of the ticket link in the SMS sent when reconciliation
+	// finishes a payment (PUBLIC_BASE_URL, as for the API).
+	PublicBaseURL string
 }
 
 func LoadAPI() (API, error) {
@@ -171,6 +181,10 @@ func LoadAPI() (API, error) {
 	cfg.JWTSecret, cfg.JWTSecretIsDevDefault = l.jwtSecret(cfg.Base)
 	cfg.BootstrapAdmin = l.bootstrapAdmin()
 	cfg.SMTP = l.smtp()
+	cfg.Payments = LoadPayments(l, cfg.Base)
+	if cfg.IsProduction() && cfg.Payments.Provider == ProviderMpesa && len(cfg.Payments.CallbackAllowedCIDRs) == 0 {
+		l.fail("MPESA_CALLBACK_ALLOWED_CIDRS is required when APP_ENV=production: the networks Safaricom's callbacks come from. The callback is unauthenticated; without the list anyone can post one")
+	}
 
 	if cfg.WriteTimeout <= cfg.RequestTimeout {
 		l.fail("HTTP_WRITE_TIMEOUT (%s) must be longer than REQUEST_TIMEOUT (%s), or slow answers are cut off mid-write", cfg.WriteTimeout, cfg.RequestTimeout)
@@ -330,6 +344,8 @@ func LoadWorker() (Worker, error) {
 		SweepInterval:     l.duration("SWEEP_INTERVAL", 30*time.Second),
 		ReconcileInterval: l.duration("RECONCILE_INTERVAL", 30*time.Second),
 	}
+	cfg.Payments = LoadPayments(l, cfg.Base)
+	cfg.PublicBaseURL = l.publicBaseURL(cfg.Base)
 	return cfg, l.err()
 }
 

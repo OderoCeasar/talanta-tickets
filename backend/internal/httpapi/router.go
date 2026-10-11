@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -14,7 +15,9 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ticketing"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/venue"
 )
@@ -54,6 +57,9 @@ type RateLimits struct {
 	// page to make the server draw QR codes all day. Loose like the other per-IP limits: on
 	// a match day a stand of fans opens the page from one address. Zero switches it off.
 	WebTicketPerIP ratelimit.Rule
+	// CheckoutPerUser covers the two writes of checkout together: creating a booking and
+	// starting a payment. A fan does each a handful of times; a zero limit switches it off.
+	CheckoutPerUser ratelimit.Rule
 }
 
 // DefaultRateLimits is what production runs.
@@ -70,6 +76,7 @@ func DefaultRateLimits() RateLimits {
 		HoldPerUser:      ratelimit.Rule{Limit: 20, Window: time.Minute},
 		HoldPerIP:        ratelimit.Rule{Limit: 3000, Window: time.Minute},
 		WebTicketPerIP:   ratelimit.Rule{Limit: 3000, Window: time.Minute},
+		CheckoutPerUser:  ratelimit.Rule{Limit: 30, Window: time.Minute},
 	}
 }
 
@@ -111,6 +118,18 @@ type Deps struct {
 
 	// Tickets is the ticket service (M7): the ticket endpoints and the web ticket page.
 	Tickets *ticketing.Service
+
+	// Payments is the payment service (M7): STK push, the M-Pesa callback, alerts, refunds.
+	Payments *payments.Service
+	// Pool is the database pool the booking answers read their tickets through. Nil means
+	// DB, when DB is a pool.
+	Pool store.DBTX
+	// AllowMockOutcome is config.Base.AllowDevShortcuts(): whether the X-Mock-Outcome header
+	// is read. False (the zero value, and production) refuses the header with 403.
+	AllowMockOutcome bool
+	// MpesaCallbackAllowed are the networks the M-Pesa callback is accepted from. Empty
+	// allows every address, which production's configuration refuses.
+	MpesaCallbackAllowed []netip.Prefix
 }
 
 // Server holds the dependencies handlers and middleware share. Handlers are its methods.
@@ -129,6 +148,11 @@ type Server struct {
 	holds *booking.Service
 
 	tickets *ticketing.Service
+
+	payments         *payments.Service
+	pool             store.DBTX
+	allowMockOutcome bool
+	callbackAllowed  []netip.Prefix
 }
 
 // NewRouter builds the API. Every route sits under /v1 because the admin web app is served
@@ -161,6 +185,11 @@ func NewRouter(d Deps) http.Handler {
 	s.events, s.venues, s.publishTimeout = d.Events, d.Venues, d.PublishTimeout
 	s.holds = d.Holds
 	s.tickets = d.Tickets
+	if d.Pool == nil {
+		d.Pool, _ = d.DB.(store.DBTX)
+	}
+	s.payments, s.pool = d.Payments, d.Pool
+	s.allowMockOutcome, s.callbackAllowed = d.AllowMockOutcome, d.MpesaCallbackAllowed
 
 	r := chi.NewRouter()
 	// Order matters: the ID and the caller's address first so every later line can log
@@ -192,6 +221,7 @@ func NewRouter(d Deps) http.Handler {
 //	sign-in    /auth/*: no token is looked at
 //	public     no token needed (OptionalAuth still identifies a signed-in caller)
 //	web page   the HTML ticket page from the SMS link: no token is looked at
+//	webhook    the M-Pesa callback: no token is looked at, always 200
 //	signed-in  any role
 //	fan        FAN only
 //	staff      ORGANISER and ADMIN, everything under /admin
@@ -215,6 +245,12 @@ func (s *Server) routes(v1 chi.Router) {
 	// browser, and its answers are HTML, never the JSON error shape.
 	v1.Group(func(r chi.Router) {
 		s.webTicketRoutes(r)
+	})
+
+	// The M-Pesa callback. Called by Safaricom, with no token; like the web ticket page it
+	// must not be turned into a 401 by a stray Authorization header: it always answers 200.
+	v1.Group(func(r chi.Router) {
+		s.webhookRoutes(r)
 	})
 
 	// Signed in, any role.
@@ -283,7 +319,7 @@ func (s *Server) signInRoutes(r chi.Router) {
 func (s *Server) publicRoutes(r chi.Router) {
 	// M4/M5: events, categories and the three seat map levels.
 	s.publicEventRoutes(r)
-	// M7: the M-Pesa callback mounts here. (The web ticket page has its own group.)
+	// (The web ticket page and the M-Pesa callback have their own groups.)
 }
 
 // signedInRoutes: any role. Paths are relative to /v1.
@@ -309,13 +345,15 @@ func (s *Server) fanRoutes(r chi.Router) {
 	// M7: /me/tickets, /tickets/{ticketId} and its QR image.
 	s.fanTicketRoutes(r)
 	// M7: bookings, payments, /me/bookings.
+	s.fanBookingRoutes(r)
 }
 
 // staffRoutes: ORGANISER and ADMIN. Paths are relative to /v1/admin.
 func (s *Server) staffRoutes(r chi.Router) {
 	// M4: venues, blocks, templates, events, categories, assignments, sales.
 	s.staffEventRoutes(r)
-	// M7: alerts and refunds mount here.
+	// M7: alerts and refunds.
+	s.staffPaymentRoutes(r)
 }
 
 // adminRoutes: ADMIN only. Paths are relative to /v1/admin.
