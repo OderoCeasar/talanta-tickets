@@ -64,7 +64,18 @@ WHERE e.id = $1;
 -- waits, sees the event is no longer DRAFT and is refused; event_seats.category_id can never
 -- differ from the painting. Two publishes of one event also queue here, and the second finds
 -- the event already published.
-SELECT * FROM events WHERE id = $1 FOR UPDATE;
+--
+-- Before the row lock it takes the event's GATE: a transaction-level advisory lock on the
+-- event, exclusive. Holds take the same gate shared (store/holds.go, lockEventForHold). The
+-- row lock alone starves a writer: Postgres lets a new FOR SHARE join the ones already on a
+-- row even while a FOR UPDATE is waiting for it, so during a rush of holds a cancel or a
+-- price change waited until the rush was over (measured: the whole of a 1,000-request storm).
+-- Advisory locks queue in order, so with the gate a writer waits only for the holds already
+-- in flight, and the holds that arrive after it wait for it. Order: gate, then row.
+WITH gate AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtextextended('talanta:event:' || sqlc.arg(id)::bigint::text, 0))
+)
+SELECT e.* FROM events e, gate WHERE e.id = sqlc.arg(id) FOR UPDATE OF e;
 
 -- name: ListPublicEvents :many
 -- The fan's list: published events only, soonest kickoff first, keyset-paged on

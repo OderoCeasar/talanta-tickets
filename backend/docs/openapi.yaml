@@ -518,7 +518,7 @@ paths:
       tags: [Me]
       summary: The caller's active holds
       description: |
-        **Role:** FAN. Only `ACTIVE`, unexpired holds. Not paged: the ticket limit keeps it
+        **Role:** FAN. Only `ACTIVE`, unexpired holds, newest first. Not paged: the ticket limit keeps it
         to a handful. Lets the app find a hold again after a restart, to resume checkout or
         release the seats.
       parameters:
@@ -834,8 +834,8 @@ paths:
         physical seat IDs.
 
         The per-user limit counts seats in the caller's active holds plus seats in their
-        paid bookings for the event. A fan who wants different seats releases the old hold
-        first.
+        paid bookings for the event (and seats of a booking whose payment is still in
+        progress). A fan who wants different seats releases the old hold first.
 
         Rate limited per user and per IP.
       requestBody:
@@ -906,6 +906,10 @@ paths:
         category and holds them, trying a few runs if others get there first. A group is
         never split across a gap or an aisle. The answer has the same shape as
         `POST /holds`; the app shows the seats on the map using `block_id`.
+
+        Only `STANDARD` seats are handed out, unless the category has no run of them at
+        all: then a run may include `RESTRICTED_VIEW` seats. `ACCESSIBLE` and `COMPANION`
+        seats are never handed out here; they are picked on the map.
 
         409 `NO_ADJACENT_SEATS` means no run was found or every attempt lost a race;
         asking again, or for fewer seats, may succeed.
@@ -3681,7 +3685,7 @@ components:
     Hold:
       type: object
       additionalProperties: false
-      required: [id, event_id, status, expires_at, remaining_seconds, extended, booking_reference, currency, subtotal_cents, seats, created_at]
+      required: [id, event_id, status, expires_at, remaining_seconds, extended, booking_reference, currency, subtotal_cents, fee_cents, total_cents, seats, created_at]
       properties:
         id: { $ref: '#/components/schemas/Id' }
         event_id: { $ref: '#/components/schemas/Id' }
@@ -3695,10 +3699,31 @@ components:
             - { $ref: '#/components/schemas/BookingReference' }
             - { type: 'null' }
         currency: { $ref: '#/components/schemas/Currency' }
-        subtotal_cents: { type: integer, format: int64, description: 'Sum of the seats'' prices, before any fee.' }
+        subtotal_cents:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            Sum of the held seats' category prices now. An estimate: the binding prices are
+            the ones copied onto the booking when it is created.
+        fee_cents:
+          type: integer
+          format: int64
+          minimum: 0
+          description: |
+            The booking fee a booking made from this hold would charge on `subtotal_cents`,
+            in whole cents, rounded down. Zero when there is no fee. An estimate, like
+            `subtotal_cents`.
+        total_cents:
+          type: integer
+          format: int64
+          minimum: 0
+          description: '`subtotal_cents + fee_cents`: what the fan will be asked to pay, at current prices.'
         seats:
           type: array
-          description: Ordered by block, row, then seat number.
+          description: |
+            Ordered by block, row, then seat number. The seats that belong to the hold now:
+            empty once the hold is `EXPIRED` or `RELEASED` (the amounts are then zero).
           items: { $ref: '#/components/schemas/HoldSeat' }
         created_at: { type: string, format: date-time }
       example:
@@ -3711,6 +3736,8 @@ components:
         booking_reference: null
         currency: KES
         subtotal_cents: 100000
+        fee_cents: 2500
+        total_cents: 102500
         created_at: '2026-10-11T09:15:00Z'
         seats:
           - event_seat_id: 910001

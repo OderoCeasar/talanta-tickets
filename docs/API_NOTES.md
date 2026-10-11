@@ -351,3 +351,39 @@ the 16 random bytes in each UUID.
 - **Rate limit.** Public event and seat map reads share 12,000 requests a minute per IP
   (`RateLimits.PublicReadPerIP`): loose on purpose, because a stadium of phones shares a
   few addresses and each polls an open block every 5 seconds.
+
+## Holds behaviour (M6)
+
+- **All or nothing.** `POST /holds` holds every seat asked for or none. A seat that is held,
+  sold, blocked, not part of the event, or does not exist is listed in
+  `details.unavailable_seat_ids`, in ascending order. A loser of a race may be told about one
+  seat or several of its seats, never about a seat it did not ask for.
+- **Order of checks:** body (400), event exists and is not a draft (404), event on sale and
+  inside the sales window (409), ticket limit (422), then the seats (409). Best available
+  checks the category (404) after the limit.
+- **Clock.** `expires_at`, `remaining_seconds`, the sales window and "has this hold run out"
+  are all judged by the database clock. `remaining_seconds` is rounded down.
+- **Status.** `status` is the effective one: an `ACTIVE` hold past `expires_at` is reported
+  `EXPIRED` at once, whether or not the sweeper has closed it, and is left out of
+  `GET /me/holds`. Its seats are shown as available on the seat map and can be held by anyone.
+- **Seats of an ended hold.** `seats` lists what belongs to the hold now. A hold that is
+  `EXPIRED` or `RELEASED` has an empty list and zero amounts; a `CONVERTED` one still lists
+  its (sold) seats.
+- **Amounts.** `subtotal_cents`, `fee_cents` and `total_cents` are an estimate at the
+  categories' prices now; the booking copies the binding prices. The fee is `BOOKING_FEE_BPS`
+  basis points of the subtotal in whole cents, rounded down (default 0).
+- **Ticket limit.** Counts seats in the caller's live holds, in `PAID` bookings, and in a
+  `PENDING_PAYMENT` booking that has a payment in flight. Each seat counts once.
+  `details.remaining` is how many more may be held now.
+- **Best available.** Neighbouring seats are consecutive seat numbers of one row of one
+  block. STANDARD seats only, unless the category has no run of them at all (then
+  restricted-view seats may be included); accessible and companion seats are never handed
+  out. `details.available` counts every free seat of the category, of any type.
+- **Release.** Frees only seats still held by that hold. Releasing a hold whose time had
+  already run out records it as `EXPIRED` (its unpaid booking `EXPIRED`); otherwise
+  `RELEASED` (booking `CANCELLED`). 409 `PAYMENT_IN_PROGRESS` while a payment is `INITIATED`
+  or `PENDING`.
+- **Rate limit.** 20 hold creations a minute per user and 3,000 per IP, `POST /holds` and
+  `POST /holds/best-available` counted together. Reading and releasing are not limited.
+- **`SOLD_OUT`.** A hold is refused with `EVENT_NOT_ON_SALE` for a stored `SOLD_OUT` event,
+  as the contract says. Nothing sets that status yet (see "Not in the contract").

@@ -22,7 +22,7 @@ func clearAPIEnv(t *testing.T) {
 		"TRUSTED_PROXY_CIDRS", "CLIENT_IP_HEADER",
 		"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT", "REQUEST_TIMEOUT",
 		"DB_STATEMENT_TIMEOUT", "DB_IDLE_IN_TX_TIMEOUT",
-		"SMTP_ALLOW_PLAINTEXT", "ARGON2_MAX_CONCURRENT",
+		"SMTP_ALLOW_PLAINTEXT", "ARGON2_MAX_CONCURRENT", "BOOKING_FEE_BPS",
 		"OTP_ALLOWED_COUNTRY_CODES", "OTP_GLOBAL_HOURLY_LIMIT", "OTP_GLOBAL_DAILY_LIMIT",
 	} {
 		t.Setenv(k, "")
@@ -386,5 +386,26 @@ func TestArgon2OTPAndSMTPPlaintextSettings(t *testing.T) {
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), key)
 		})
+	}
+}
+
+// BOOKING_FEE_BPS: no fee unless set, whole basis points from 0 to 10,000.
+func TestLoadAPI_BookingFee(t *testing.T) {
+	clearAPIEnv(t)
+	t.Setenv("APP_ENV", "development")
+	cfg, err := LoadAPI()
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.BookingFeeBPS)
+
+	t.Setenv("BOOKING_FEE_BPS", "250")
+	cfg, err = LoadAPI()
+	require.NoError(t, err)
+	assert.Equal(t, 250, cfg.BookingFeeBPS)
+
+	for _, bad := range []string{"-1", "10001", "2.5", "five"} {
+		t.Setenv("BOOKING_FEE_BPS", bad)
+		_, err := LoadAPI()
+		require.Error(t, err, bad)
+		assert.Contains(t, err.Error(), "BOOKING_FEE_BPS", bad)
 	}
 }

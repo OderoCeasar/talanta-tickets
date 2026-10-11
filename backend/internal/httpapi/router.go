@@ -11,6 +11,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
@@ -41,6 +42,12 @@ type RateLimits struct {
 	// every five seconds by every fan looking at it, so this one is the loosest of all: it
 	// only stops a single client hammering the API. A zero limit switches it off.
 	PublicReadPerIP ratelimit.Rule
+	// HoldPerUser and HoldPerIP cover creating a hold (POST /holds and best available). The
+	// per-user one is the real limit: a fan picks seats a handful of times, a script
+	// cycling holds to keep seats off sale does not. Per IP is loose like the others. A
+	// zero limit switches either off.
+	HoldPerUser ratelimit.Rule
+	HoldPerIP   ratelimit.Rule
 }
 
 // DefaultRateLimits is what production runs.
@@ -54,6 +61,8 @@ func DefaultRateLimits() RateLimits {
 		InvitationPerIP:  ratelimit.Rule{Limit: 30, Window: 15 * time.Minute},
 		SensitivePerUser: ratelimit.Rule{Limit: 10, Window: 15 * time.Minute},
 		PublicReadPerIP:  ratelimit.Rule{Limit: 12000, Window: time.Minute},
+		HoldPerUser:      ratelimit.Rule{Limit: 20, Window: time.Minute},
+		HoldPerIP:        ratelimit.Rule{Limit: 3000, Window: time.Minute},
 	}
 }
 
@@ -88,6 +97,9 @@ type Deps struct {
 	// and outlasts RequestTimeout. Zero means 55 seconds. It must stay under the server's
 	// write timeout.
 	PublishTimeout time.Duration
+
+	// Holds is the seat hold service (M6).
+	Holds *booking.Service
 }
 
 // Server holds the dependencies handlers and middleware share. Handlers are its methods.
@@ -102,6 +114,8 @@ type Server struct {
 	events         *events.Service
 	venues         *venue.Service
 	publishTimeout time.Duration
+
+	holds *booking.Service
 }
 
 // NewRouter builds the API. Every route sits under /v1 because the admin web app is served
@@ -132,6 +146,7 @@ func NewRouter(d Deps) http.Handler {
 	}
 	s := &Server{log: d.Logger, db: d.DB, auth: d.Auth, tokens: d.Tokens, limiter: d.Limiter, limits: *d.RateLimits}
 	s.events, s.venues, s.publishTimeout = d.Events, d.Venues, d.PublishTimeout
+	s.holds = d.Holds
 
 	r := chi.NewRouter()
 	// Order matters: the ID and the caller's address first so every later line can log
@@ -267,8 +282,10 @@ func (s *Server) signedInRoutes(r chi.Router) {
 }
 
 // fanRoutes: FAN only. Paths are relative to /v1.
-func (s *Server) fanRoutes(chi.Router) {
-	// M6: holds. M7: bookings, payments, tickets, /me/holds, /me/bookings, /me/tickets.
+func (s *Server) fanRoutes(r chi.Router) {
+	// M6: holds and /me/holds.
+	s.fanHoldRoutes(r)
+	// M7: bookings, payments, tickets, /me/bookings, /me/tickets.
 }
 
 // staffRoutes: ORGANISER and ADMIN. Paths are relative to /v1/admin.
