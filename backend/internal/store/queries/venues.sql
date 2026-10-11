@@ -85,3 +85,102 @@ FROM seats s
 JOIN blocks b ON b.id = s.block_id
 JOIN stands st ON st.id = b.stand_id
 WHERE st.venue_id = $1 AND s.is_active;
+
+-- name: LockVenueForLayoutChange :one
+-- Locks: the one venues row, FOR NO KEY UPDATE, until the transaction ends.
+-- Why: deleting a block or replacing its seats must not run while an event of the venue is
+-- being published. Publish holds this row FOR SHARE while it copies seats into event_seats;
+-- without the lock a delete could remove seats that an uncommitted publish has just
+-- referenced, and one of the two would die on the foreign key. NO KEY, because nothing here
+-- changes the venue's id, so inserts that reference the venue (new events, new stands) are
+-- not held up.
+SELECT id FROM venues WHERE id = $1 FOR NO KEY UPDATE;
+
+-- name: LockVenueForPublish :one
+-- Locks: the one venues row, FOR SHARE, until the transaction ends.
+-- Why: the other half of LockVenueForLayoutChange. Publish reads every active seat of the
+-- venue and inserts a row per seat; the shared lock keeps blocks and seats from being
+-- deleted or regenerated under it. Shared, so several events can be published at once.
+SELECT id FROM venues WHERE id = $1 FOR SHARE;
+
+-- name: LockBlock :one
+-- Locks: the one blocks row, FOR UPDATE, until the transaction ends.
+-- Why: move, regenerate and delete each read the block and then rewrite its seats; two of
+-- them at once on one block would interleave their seat writes.
+SELECT * FROM blocks WHERE id = $1 FOR UPDATE;
+
+-- name: GetBlockWithVenue :one
+SELECT sqlc.embed(b), st.venue_id, v.plan_width, v.plan_height
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+JOIN venues v ON v.id = st.venue_id
+WHERE b.id = $1;
+
+-- name: ListBlockStandsByVenue :many
+-- Which stand each block is in, without the outlines.
+SELECT b.id AS block_id, b.stand_id
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1;
+
+-- name: CountActiveSeatsByBlockForVenue :many
+SELECT s.block_id, count(*)::bigint AS seats
+FROM seats s
+JOIN blocks b ON b.id = s.block_id
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1 AND s.is_active
+GROUP BY s.block_id;
+
+-- name: CountActiveSeatsByBlock :one
+SELECT count(*)::bigint FROM seats WHERE block_id = $1 AND is_active;
+
+-- name: ListBlockIDsWithInventoryByVenue :many
+-- Blocks that some event was published with. Probes event_seats once per (event, block)
+-- through its (event_id, block_id, …) index instead of scanning it.
+SELECT b.id
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1
+  AND EXISTS (
+      SELECT 1 FROM events e
+      WHERE e.venue_id = st.venue_id
+        AND EXISTS (SELECT 1 FROM event_seats es WHERE es.event_id = e.id AND es.block_id = b.id));
+
+-- name: ListEventIDsWithInventoryForBlock :many
+SELECT e.id
+FROM events e
+WHERE e.venue_id = sqlc.arg(venue_id)
+  AND EXISTS (SELECT 1 FROM event_seats es WHERE es.event_id = e.id AND es.block_id = sqlc.arg(block_id))
+ORDER BY e.id;
+
+-- name: UpdateBlock :one
+UPDATE blocks
+SET code = $2, label = $3, origin_x = $4, origin_y = $5, rotation_deg = $6, arc_radius = $7,
+    seat_pitch_x = $8, seat_pitch_y = $9, outline = $10
+WHERE id = $1
+RETURNING *;
+
+-- name: SetBlockLayout :one
+UPDATE blocks
+SET outline = $2, row_count = $3, seats_per_row = $4, numbering_direction = $5
+WHERE id = $1
+RETURNING *;
+
+-- name: DeleteBlock :execrows
+DELETE FROM blocks WHERE id = $1;
+
+-- name: DeleteRowsByBlock :execrows
+-- Seats and row category overrides go with their rows (ON DELETE CASCADE).
+DELETE FROM rows WHERE block_id = $1;
+
+-- name: UpdateSeatPositions :execrows
+-- Moves many seats at once: the three arrays are parallel.
+UPDATE seats s
+SET x = u.x, y = u.y
+FROM (
+    -- Set-returning functions side by side in one SELECT list are zipped row by row.
+    SELECT unnest(sqlc.arg(ids)::bigint[]) AS id,
+           unnest(sqlc.arg(xs)::float8[]) AS x,
+           unnest(sqlc.arg(ys)::float8[]) AS y
+) AS u
+WHERE s.id = u.id;

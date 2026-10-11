@@ -34,6 +34,17 @@ const (
 	RightToLeft Direction = "RTL"
 )
 
+// LabelScheme is how rows are named.
+type LabelScheme string
+
+const (
+	// LabelsAlpha names rows A…Z, AA, AB, … It is the zero value's meaning too.
+	LabelsAlpha LabelScheme = "ALPHA"
+	// LabelsNumeric names rows 1, 2, 3, … A seat label then has a dash between the row and
+	// the seat number ("12-14"), because "1214" could be row 1, 12 or 121.
+	LabelsNumeric LabelScheme = "NUMERIC"
+)
+
 // Limits on one block. They exist so a typo in the admin form cannot ask the server for
 // millions of seats; no real block comes near them.
 const (
@@ -56,6 +67,8 @@ type BlockParams struct {
 	Rows           int
 	SeatsPerRow    int
 	Numbering      Direction
+	// Labels is the row naming scheme. Empty means LabelsAlpha.
+	Labels LabelScheme
 	// RowOffsets shifts each row along local x so rows need not start level. Nil means none;
 	// otherwise it must have one entry per row.
 	RowOffsets []float64
@@ -104,6 +117,40 @@ type Layout struct {
 	Outline []Point
 }
 
+// Bounds is an axis-aligned box in plan coordinates.
+type Bounds struct {
+	MinX, MinY, MaxX, MaxY float64
+}
+
+// BoundsOf is the smallest box around the given points; ok is false when there are none.
+func BoundsOf(points []Point) (b Bounds, ok bool) {
+	for i, p := range points {
+		if i == 0 {
+			b = Bounds{MinX: p.X, MinY: p.Y, MaxX: p.X, MaxY: p.Y}
+			continue
+		}
+		b.MinX, b.MaxX = math.Min(b.MinX, p.X), math.Max(b.MaxX, p.X)
+		b.MinY, b.MaxY = math.Min(b.MinY, p.Y), math.Max(b.MaxY, p.Y)
+	}
+	return b, len(points) > 0
+}
+
+// Within reports whether the box lies inside [0, width] × [0, height].
+func (b Bounds) Within(width, height float64) bool {
+	return b.MinX >= 0 && b.MinY >= 0 && b.MaxX <= width && b.MaxY <= height
+}
+
+// SeatBounds is the box around every seat of a layout, grown by half the larger seat pitch
+// so a seat drawn at the edge is not cut off. ok is false for a layout with no seats.
+func SeatBounds(seats []Point, pitchX, pitchY float64) (Bounds, bool) {
+	b, ok := BoundsOf(seats)
+	if !ok {
+		return b, false
+	}
+	pad := math.Max(pitchX, pitchY) / 2
+	return Bounds{MinX: round2(b.MinX - pad), MinY: round2(b.MinY - pad), MaxX: round2(b.MaxX + pad), MaxY: round2(b.MaxY + pad)}, true
+}
+
 // SeatCount is the number of seats in the layout.
 func (l Layout) SeatCount() int {
 	n := 0
@@ -116,45 +163,60 @@ func (l Layout) SeatCount() int {
 // ErrInvalidParams is wrapped by every validation failure from Generate.
 var ErrInvalidParams = errors.New("invalid block parameters")
 
-func invalid(format string, args ...any) error {
-	return fmt.Errorf("%w: %s", ErrInvalidParams, fmt.Sprintf(format, args...))
+// ParamError is a validation failure that knows which setting is at fault, so a form can
+// show the message beside the right input. It wraps ErrInvalidParams.
+type ParamError struct {
+	// Field is one of: rows, seats_per_row, seat_pitch, arc_radius, numbering_direction,
+	// row_label_scheme, row_offsets, placement.
+	Field string
+	// Reason is the message without the "invalid block parameters" prefix.
+	Reason string
+}
+
+func (e *ParamError) Error() string { return ErrInvalidParams.Error() + ": " + e.Reason }
+func (e *ParamError) Unwrap() error { return ErrInvalidParams }
+
+func invalid(field, format string, args ...any) error {
+	return &ParamError{Field: field, Reason: fmt.Sprintf(format, args...)}
 }
 
 // Validate reports whether p can be generated.
 func (p BlockParams) Validate() error {
 	switch {
 	case p.Rows < 1 || p.Rows > MaxRows:
-		return invalid("rows must be between 1 and %d, got %d", MaxRows, p.Rows)
+		return invalid("rows", "rows must be between 1 and %d, got %d", MaxRows, p.Rows)
 	case p.SeatsPerRow < 1 || p.SeatsPerRow > MaxSeatsPerRow:
-		return invalid("seats per row must be between 1 and %d, got %d", MaxSeatsPerRow, p.SeatsPerRow)
+		return invalid("seats_per_row", "seats per row must be between 1 and %d, got %d", MaxSeatsPerRow, p.SeatsPerRow)
 	case !(p.PitchX > 0) || !(p.PitchY > 0):
-		return invalid("seat pitch must be positive, got %g × %g", p.PitchX, p.PitchY)
+		return invalid("seat_pitch", "seat pitch must be positive, got %g × %g", p.PitchX, p.PitchY)
 	case p.ArcRadius < 0:
-		return invalid("arc radius must not be negative, got %g", p.ArcRadius)
+		return invalid("arc_radius", "arc radius must not be negative, got %g", p.ArcRadius)
 	// The outline's front edge sits half a row in front of the first row. A smaller radius
 	// would put that edge behind the centre and the outline would cross itself.
 	case p.ArcRadius > 0 && p.ArcRadius <= p.PitchY/2:
-		return invalid("arc radius %g is too small for a row pitch of %g", p.ArcRadius, p.PitchY)
+		return invalid("arc_radius", "arc radius %g is too small for a row pitch of %g", p.ArcRadius, p.PitchY)
 	case p.Numbering != LeftToRight && p.Numbering != RightToLeft:
-		return invalid("numbering must be %s or %s, got %q", LeftToRight, RightToLeft, p.Numbering)
+		return invalid("numbering_direction", "numbering must be %s or %s, got %q", LeftToRight, RightToLeft, p.Numbering)
+	case p.Labels != "" && p.Labels != LabelsAlpha && p.Labels != LabelsNumeric:
+		return invalid("row_label_scheme", "row labels must be %s or %s, got %q", LabelsAlpha, LabelsNumeric, p.Labels)
 	case p.RowOffsets != nil && len(p.RowOffsets) != p.Rows:
-		return invalid("got %d row offsets for %d rows", len(p.RowOffsets), p.Rows)
+		return invalid("row_offsets", "got %d row offsets for %d rows", len(p.RowOffsets), p.Rows)
 	}
 	for _, v := range []float64{p.OriginX, p.OriginY, p.RotationDeg, p.ArcRadius, p.PitchX, p.PitchY} {
 		if math.IsNaN(v) || math.IsInf(v, 0) {
-			return invalid("values must be finite numbers")
+			return invalid("placement", "values must be finite numbers")
 		}
 	}
 	for i, off := range p.RowOffsets {
 		if math.IsNaN(off) || math.IsInf(off, 0) {
-			return invalid("row offset %d is not a finite number", i)
+			return invalid("row_offsets", "row offset %d is not a finite number", i)
 		}
 	}
 	if p.ArcRadius > 0 {
 		lo, hi := p.extent()
 		// Past a full turn the ends of a row would overlap its own start.
 		if (hi-lo+p.PitchX)/p.ArcRadius >= 2*math.Pi {
-			return invalid("a row %g long does not fit around a radius of %g", hi-lo+p.PitchX, p.ArcRadius)
+			return invalid("seats_per_row", "a row %g long does not fit around a radius of %g", hi-lo+p.PitchX, p.ArcRadius)
 		}
 	}
 	return nil
@@ -169,7 +231,10 @@ func Generate(p BlockParams) (Layout, error) {
 
 	rows := make([]Row, p.Rows)
 	for r := range rows {
-		label := RowLabel(r)
+		label, sep := RowLabel(r), ""
+		if p.Labels == LabelsNumeric {
+			label, sep = strconv.Itoa(r+1), "-"
+		}
 		row := Row{Index: r, Label: label, XOffset: p.offset(r), Seats: make([]Seat, p.SeatsPerRow)}
 		for i := range row.Seats {
 			number := i + 1
@@ -179,7 +244,7 @@ func Generate(p BlockParams) (Layout, error) {
 			pt := place(row.XOffset+float64(i)*p.PitchX, float64(r)*p.PitchY)
 			row.Seats[i] = Seat{
 				Number: number,
-				Label:  label + strconv.Itoa(number),
+				Label:  label + sep + strconv.Itoa(number),
 				X:      round2(pt.X),
 				Y:      round2(pt.Y),
 			}

@@ -66,9 +66,9 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 | `EVENT_NOT_READY` | 409 | Publish refused | `problems[]` (same as readiness) |
 | `INVALID_STATE_TRANSITION` | 409 | Publish or cancel not allowed from the current status | `current_status` |
 | `EVENT_NOT_EDITABLE` | 409 | Event is past the status where this edit is allowed | `current_status` |
-| `BLOCK_HAS_INVENTORY` | 409 | Block is used by a published event; cannot delete or regenerate | `event_ids[]` |
+| `BLOCK_HAS_INVENTORY` | 409 | Block is used by a published event, or an event at the venue is being published right now; cannot delete or regenerate | `event_ids[]` (empty in the second case) |
 | `CATEGORY_IN_USE` | 409 | Category has inventory or bookings | `sold, held` |
-| `CONFIRMATION_REQUIRED` | 409 | Price change after sales started needs `confirm: true` | `sold, held` |
+| `CONFIRMATION_REQUIRED` | 409 | Price change after the event has left `DRAFT` needs `confirm: true` | `sold, held` |
 | `ALREADY_EXISTS` | 409 | Unique name or code is taken | `fields[]` |
 | `EMAIL_ALREADY_REGISTERED` | 409 | A user with this email exists | null |
 | `INVITATION_ALREADY_PENDING` | 409 | An unexpired invitation for this email exists | null |
@@ -109,6 +109,14 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `json` | The body is not valid JSON |
 | `content_type` | The body was not sent as `application/json` |
 | `id`, `range`, `cursor` | Path ID, `limit`, or `cursor` is malformed |
+| `datetime` | Not an RFC 3339 time (body field or `from`/`to` query) |
+| `url` | `poster_url` is not an `http(s)` address |
+| `unique` | A list repeats a value (`block_ids`, `row_ids`); also the rule on `ALREADY_EXISTS` |
+| `hexcolor`, `blockcode` | Not `#RRGGBB`; not capitals, digits and dashes |
+| `before_kickoff`, `after_open`, `after_from` | Times in the wrong order (`gates_open_at`, `sales_close_at`, `to`) |
+| `plan_bounds` | The block's outline would leave `[0, plan_width] × [0, plan_height]` |
+| `layout` | The seat geometry cannot be made (for example a row too long for the arc) |
+| `venue` | On `VENUE_MISMATCH`: the block, row, template or event is at another venue |
 
 ## Sign-in behaviour the contract does not spell out
 
@@ -178,8 +186,8 @@ are real tuples.
 
 The answer has `kind: "full"` or `kind: "delta"`. A `since` request can still get `full`
 (marker unreadable or too old, or something other than status changed); the client then
-replaces its cached block. The marker is opaque; the server builds it from
-`event_seats.updated_at` (correction 9).
+replaces its cached block. The marker is opaque. How it works is in "Seat map behaviour"
+below.
 
 ### Seat status letters
 
@@ -191,7 +199,9 @@ replaces its cached block. The marker is opaque; the server builds it from
 | `S` | Sold |
 | `B` | Blocked |
 
-Who holds a seat is never sent. A lapsed hold that the sweeper has not cleared yet is `A`.
+Who holds a seat is never sent: the query selects only "is this hold mine" and "has it
+lapsed", never the hold or its user. A lapsed hold that the sweeper has not cleared yet is
+`A`, to its former holder too.
 
 ### Physical seat — `PhysicalSeatTuple` (`generate-seats`, `GET /admin/blocks/{blockId}/seats`)
 
@@ -215,18 +225,28 @@ that changed, including `X` and `T`, which the device removes.
 
 A point is `[x, y]`; a polygon is an array of points, closed, last point not repeated.
 
-## Estimated sizes (synthetic data, not yet measured on the seeded venue)
+## Measured sizes (seeded Talanta venue, 59,568 seats on sale)
 
-| Payload | Raw | Gzipped |
-|---|---|---|
-| Level 3, 300 seats | 11 KB | 1.7 KB |
-| Level 3, 1,200 seats | 43 KB | 5.2 KB |
-| Level 3, 2,000 seats | 71 KB | 8.0 KB |
-| Manifest, 60,000 tickets | 2.8 MB | 1.4 MB |
+Measured through the real router with `Accept-Encoding: gzip` (chi compress, level 5) by
+`TestSeededVenue_SeatMapPayloadSizes`.
 
-Level 3 meets the 40 KB target raw up to about 1,150 seats, and at every size once gzipped.
-The manifest is bound by the 16 random bytes in each UUID (0.96 MB at best), so it cannot
-get much smaller; it is downloaded once before the match and then by `since`.
+| Payload | Raw | Gzipped | §5.1 target |
+|---|---|---|---|
+| Level 1, 8 stands | 4,800 B (4.7 KB) | 1,584 B | ~4 KB |
+| Level 2, largest stand (14 blocks) | 6,557 B (6.4 KB) | 1,993 B | ~10 KB |
+| Level 3, largest block (1,312 seats, curved) | 43,617 B (42.6 KB) | 14,541 B | ~40 KB |
+| Level 3 poll, nothing changed | 100 B | not compressed | |
+| Level 3 poll, 6 seats changed | 165 B | not compressed | |
+
+Level 3 costs 33 bytes a seat raw, so only blocks above about 1,230 seats pass 40 KB; the
+largest block is 6% over. A curved block's coordinates are irregular and compress to a
+third, not the eighth estimated before measuring. What would shrink it, each a contract
+change: send `x`/`y` only for curved blocks and let the client lay a straight block out
+from origin, rotation and pitch; send the first `event_seat_id` of a row and let the rest
+follow by position; send coordinates as integers in tenths of a plan unit.
+
+The gate manifest (not built yet) was estimated at 2.8 MB raw for 60,000 tickets, bound by
+the 16 random bytes in each UUID.
 
 ## Differences from ARCHITECTURE §10 and §11
 
@@ -269,9 +289,65 @@ get much smaller; it is downloaded once before the match and then by `since`.
 
 - Editing a single seat's type or switching a seat off (`seats.seat_type`, `is_active`).
   The seeder sets them; the editor shows them but cannot change them.
-- Marking an event `COMPLETED`, and moving `PUBLISHED` to `ON_SALE` when sales open. Both
-  are expected to be done by the worker, not by a request.
+- Marking an event `COMPLETED` (expected of the worker) and `SOLD_OUT` (expected of the
+  hold or payment flow). Nothing needs to move `PUBLISHED` to `ON_SALE`: every read derives
+  it from the sales window (see "Event status" below).
 - Blocking and unblocking individual seats after publish.
 - A scan of a QR that cannot be read as a ticket ID is not uploaded (`scan_logs.ticket_id`
   is required).
 - Disabling or changing the role of a staff user.
+
+## Events and inventory behaviour (M4)
+
+- **Event status.** The stored status of a published event is `PUBLISHED` or `ON_SALE`,
+  set once at publish. Every answer carries the *effective* status instead: `ON_SALE`
+  exactly while now is inside `[sales_open_at, sales_close_at)`, `PUBLISHED` outside it.
+  Nothing flips it in the background. `domain.EffectiveEventStatus` is the rule; the list
+  filters use the same rule in SQL. Legal moves of the stored status are one table in
+  `domain.TransitionEvent`.
+- **Publish** takes the event row lock, then checks status, then readiness, then inserts
+  one inventory row per active seat. Painting, category changes, event edits and cancel
+  take the same lock, so the inventory can never disagree with the painting. A repeat on a
+  published event answers 200 with `already_published: true`. It runs under its own request
+  timeout (the server's write timeout less five seconds, 55 s by default) and raises the
+  statement timeout for its own transaction.
+- **Readiness** needs: at least one active seat, at least one category, every active seat
+  painted (row override, else block), every category priced above zero, both ends of the
+  sales window set, close after open and not after kickoff, kickoff in the future.
+- **Cancel** is allowed from every status but `COMPLETED`; see the operation for what it does.
+- **Categories.** A price change once the event has left `DRAFT` needs `confirm: true`. A
+  category can be deleted while nothing points at it (no inventory row, no booking item).
+  `price_cents` is whole cents: `10.5` is refused.
+- **Painting** is allowed only while `DRAFT`. Painting a block does not clear the row
+  overrides inside it.
+- **Lists.** `GET /events` shows `PUBLISHED`, `ON_SALE` and `SOLD_OUT` with kickoff from
+  now (or `from`) on, soonest first. `GET /admin/events` shows everything, latest first.
+  `from` is inclusive and `to` exclusive in both.
+- **Seat generation** replaces a block's rows and seats; the row overrides of draft events
+  on the old rows go with them (the block's own painting stays). `venues.capacity` is
+  recounted on every generate and delete. Seat labels are row label + number (`C14`), with
+  a dash when rows are numbered (`12-14`).
+- **Sales.** Day buckets are Nairobi days (21:00 UTC to 21:00 UTC). `refund_required_cents`
+  is the queued refunds of `REFUND_REQUIRED` bookings, or a booking's total while none is
+  queued. `Payment.failure_reason` is derived from Daraja's result code (1 insufficient
+  funds, 2001 wrong PIN, 1032 cancelled, 1037 timeout) in `domain.PaymentFailureReason`.
+
+## Seat map behaviour (M5)
+
+- **Counts** (level 1, level 2, event `seats_available`/`price_from_cents`, category
+  counts, the sales dashboard) come from one per-event aggregate kept in memory for 3
+  seconds per API process and dropped on publish and cancel. Level 3 is never cached.
+- **`seats_total`** on events, stands, blocks and categories counts every inventory row,
+  blocked ones included. The sales heatmap's block `total` leaves blocked seats out.
+- **Markers.** The server reads the database clock before it selects seats and puts that
+  time, the event and the block into the marker. On `?since=` it returns every seat of the
+  block written after `marker − 20 s`, plus seats whose hold ran out in that span. The 20
+  seconds are the point: `updated_at` is stamped when a row is written, not when its
+  transaction commits, and the pool's statement and idle-in-transaction limits (15 s each)
+  bound how long that gap can be. A client therefore sees a recent change more than once,
+  which is harmless. The answer is `full` instead when the marker is unreadable, for
+  another event or block, from the future, older than 5 minutes, or when the event row
+  itself changed in the same span (a category edit touches it).
+- **Rate limit.** Public event and seat map reads share 12,000 requests a minute per IP
+  (`RateLimits.PublicReadPerIP`): loose on purpose, because a stadium of phones shares a
+  few addresses and each polls an open block every 5 seconds.

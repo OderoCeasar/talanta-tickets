@@ -112,3 +112,123 @@ func TestPhoneHasCountryCode(t *testing.T) {
 	assert.True(t, PhoneHasCountryCode("+14155552671", []string{"254", "1"}))
 	assert.True(t, PhoneHasCountryCode("+255712345678", []string{"254", "255"}))
 }
+
+func TestTransitionEvent(t *testing.T) {
+	legal := map[EventStatus][]EventStatus{
+		EventDraft:     {EventPublished, EventOnSale, EventCancelled},
+		EventPublished: {EventOnSale, EventSoldOut, EventCancelled, EventCompleted},
+		EventOnSale:    {EventPublished, EventSoldOut, EventCancelled, EventCompleted},
+		EventSoldOut:   {EventOnSale, EventPublished, EventCancelled, EventCompleted},
+		EventCancelled: {},
+		EventCompleted: {},
+	}
+	for _, from := range EventStatuses {
+		for _, to := range EventStatuses {
+			want := false
+			for _, ok := range legal[from] {
+				want = want || ok == to
+			}
+			err := TransitionEvent(from, to)
+			if want {
+				assert.NoError(t, err, "%s -> %s", from, to)
+				continue
+			}
+			require.Error(t, err, "%s -> %s must be refused", from, to)
+			assert.Equal(t, CodeInvalidStateTransition, CodeOf(err))
+			var de *Error
+			require.True(t, errors.As(err, &de))
+			assert.Equal(t, EventStateDetails{CurrentStatus: from}, de.Details, "the answer says where the event is")
+		}
+	}
+	// The moves that must never happen, spelt out.
+	assert.Error(t, TransitionEvent(EventCancelled, EventOnSale), "a cancelled event never goes back on sale")
+	assert.Error(t, TransitionEvent(EventCompleted, EventCancelled))
+	assert.Error(t, TransitionEvent(EventDraft, EventSoldOut), "a draft has no inventory to sell out")
+	assert.Error(t, TransitionEvent(EventOnSale, EventDraft), "published is for good")
+	assert.Error(t, TransitionEvent("NOPE", EventPublished))
+}
+
+func TestEffectiveEventStatusAndPublishStatus(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	at := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+
+	// Publish: ON_SALE inside [open, close), PUBLISHED otherwise; a missing open is "open".
+	assert.Equal(t, EventOnSale, PublishStatus(at(-time.Hour), at(time.Hour), now))
+	assert.Equal(t, EventOnSale, PublishStatus(at(0), at(time.Hour), now), "open is inclusive")
+	assert.Equal(t, EventOnSale, PublishStatus(nil, at(time.Hour), now), "no open time: open now")
+	assert.Equal(t, EventPublished, PublishStatus(at(time.Second), at(time.Hour), now))
+	assert.Equal(t, EventPublished, PublishStatus(at(-time.Hour), at(0), now), "close is exclusive")
+
+	// Reads derive the same thing from either stored value, so nothing depends on a flip.
+	for _, stored := range []EventStatus{EventPublished, EventOnSale} {
+		assert.Equal(t, EventOnSale, EffectiveEventStatus(stored, at(-time.Hour), at(time.Hour), now), stored)
+		assert.Equal(t, EventPublished, EffectiveEventStatus(stored, at(time.Hour), at(2*time.Hour), now), stored)
+		assert.Equal(t, EventPublished, EffectiveEventStatus(stored, at(-2*time.Hour), at(-time.Hour), now), stored)
+	}
+	// Everything else is what it is stored as, whatever the window says.
+	for _, stored := range []EventStatus{EventDraft, EventSoldOut, EventCancelled, EventCompleted} {
+		assert.Equal(t, stored, EffectiveEventStatus(stored, at(-time.Hour), at(time.Hour), now))
+	}
+
+	assert.False(t, EventDraft.VisibleToPublic())
+	assert.True(t, EventCancelled.VisibleToPublic())
+	assert.True(t, EventCompleted.VisibleToPublic())
+	assert.False(t, EventStatus("NOPE").VisibleToPublic())
+	assert.False(t, EventCancelled.Editable())
+	assert.False(t, EventDraft.HasInventory())
+}
+
+func TestSeatCodeFor(t *testing.T) {
+	// status, hold lapsed, held by the viewer -> code
+	assert.Equal(t, SeatCodeAvailable, SeatCodeFor(SeatAvailable, false, false))
+	assert.Equal(t, SeatCodeSold, SeatCodeFor(SeatSold, false, false))
+	assert.Equal(t, SeatCodeBlocked, SeatCodeFor(SeatBlocked, false, false))
+	assert.Equal(t, SeatCodeHeld, SeatCodeFor(SeatHeld, false, false), "someone else's hold")
+	assert.Equal(t, SeatCodeMine, SeatCodeFor(SeatHeld, false, true), "the viewer's own hold")
+	assert.Equal(t, SeatCodeAvailable, SeatCodeFor(SeatHeld, true, false), "a lapsed hold is available")
+	assert.Equal(t, SeatCodeAvailable, SeatCodeFor(SeatHeld, true, true), "even to the fan who held it")
+	// "Mine" can only ever come out of a live hold.
+	for _, s := range []SeatStatus{SeatAvailable, SeatSold, SeatBlocked} {
+		assert.NotEqual(t, SeatCodeMine, SeatCodeFor(s, false, true), s)
+	}
+	assert.Equal(t, SeatCodeBlocked, SeatCodeFor("NOPE", false, false), "a seat we cannot explain is not offered")
+
+	assert.Equal(t, []int{0, 1, 2, 3, 0}, []int{
+		SeatTypeCode("STANDARD"), SeatTypeCode("ACCESSIBLE"), SeatTypeCode("COMPANION"), SeatTypeCode("RESTRICTED_VIEW"), SeatTypeCode("?"),
+	})
+}
+
+func TestSalesWindowProblems(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	kickoff := now.Add(48 * time.Hour)
+	at := func(d time.Duration) *time.Time { v := now.Add(d); return &v }
+	codes := func(k time.Time, open, closeAt *time.Time) []ReadinessCode {
+		var out []ReadinessCode
+		for _, p := range SalesWindowProblems(k, open, closeAt, now) {
+			out = append(out, p.Code)
+		}
+		return out
+	}
+	assert.Empty(t, codes(kickoff, at(time.Hour), at(48*time.Hour)))
+	assert.Equal(t, []ReadinessCode{ReadinessSalesWindowMissing}, codes(kickoff, nil, at(time.Hour)))
+	assert.Equal(t, []ReadinessCode{ReadinessSalesWindowMissing}, codes(kickoff, at(time.Hour), nil))
+	assert.Equal(t, []ReadinessCode{ReadinessSalesWindowInvalid}, codes(kickoff, at(2*time.Hour), at(2*time.Hour)))
+	assert.Equal(t, []ReadinessCode{ReadinessSalesWindowInvalid}, codes(kickoff, at(time.Hour), at(49*time.Hour)))
+	assert.Equal(t, []ReadinessCode{ReadinessKickoffInPast}, codes(now, at(-2*time.Hour), at(-time.Hour)))
+
+	assert.Equal(t, "This event cannot be published yet. 1 thing is missing.", EventNotReady(make([]ReadinessProblem, 1)).Message)
+	assert.Equal(t, "This event cannot be published yet. 3 things are missing.", EventNotReady(make([]ReadinessProblem, 3)).Message)
+}
+
+func TestPaymentFailureReason(t *testing.T) {
+	code := func(n int32) *int32 { return &n }
+	assert.Nil(t, PaymentFailureReason("SUCCESS", code(0)))
+	assert.Nil(t, PaymentFailureReason("PENDING", nil))
+	assert.Equal(t, "timeout", *PaymentFailureReason("TIMEOUT", nil))
+	assert.Equal(t, "insufficient_funds", *PaymentFailureReason("FAILED", code(1)))
+	assert.Equal(t, "wrong_pin", *PaymentFailureReason("FAILED", code(2001)))
+	assert.Equal(t, "cancelled", *PaymentFailureReason("FAILED", code(1032)))
+	assert.Equal(t, "timeout", *PaymentFailureReason("FAILED", code(1037)))
+	assert.Equal(t, "other", *PaymentFailureReason("FAILED", code(17)))
+	assert.Equal(t, "other", *PaymentFailureReason("FAILED", nil))
+}

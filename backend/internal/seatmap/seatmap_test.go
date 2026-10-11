@@ -208,3 +208,59 @@ func TestPointJSONIsAPair(t *testing.T) {
 
 	require.Error(t, json.Unmarshal([]byte(`[{"x":1,"y":2}]`), &back))
 }
+
+func TestNumericRowLabels(t *testing.T) {
+	layout, err := Generate(BlockParams{PitchX: 5, PitchY: 8, Rows: 12, SeatsPerRow: 14, Numbering: LeftToRight, Labels: LabelsNumeric})
+	require.NoError(t, err)
+	assert.Equal(t, "1", layout.Rows[0].Label)
+	assert.Equal(t, "12", layout.Rows[11].Label)
+	// "1214" could be row 1, 12 or 121; the dash makes the label unambiguous.
+	assert.Equal(t, "12-14", layout.Rows[11].Seats[13].Label)
+
+	alpha, err := Generate(BlockParams{PitchX: 5, PitchY: 8, Rows: 3, SeatsPerRow: 14, Numbering: LeftToRight})
+	require.NoError(t, err)
+	assert.Equal(t, "C14", alpha.Rows[2].Seats[13].Label, "the default is unchanged")
+
+	_, err = Generate(BlockParams{PitchX: 5, PitchY: 8, Rows: 1, SeatsPerRow: 1, Numbering: LeftToRight, Labels: "ROMAN"})
+	require.ErrorIs(t, err, ErrInvalidParams)
+}
+
+func TestParamErrorNamesTheField(t *testing.T) {
+	cases := map[string]BlockParams{
+		"rows":                {PitchX: 5, PitchY: 8, Rows: 0, SeatsPerRow: 1, Numbering: LeftToRight},
+		"seats_per_row":       {PitchX: 5, PitchY: 8, Rows: 1, SeatsPerRow: 501, Numbering: LeftToRight},
+		"seat_pitch":          {PitchX: 0, PitchY: 8, Rows: 1, SeatsPerRow: 1, Numbering: LeftToRight},
+		"arc_radius":          {PitchX: 5, PitchY: 8, Rows: 1, SeatsPerRow: 1, Numbering: LeftToRight, ArcRadius: 2},
+		"numbering_direction": {PitchX: 5, PitchY: 8, Rows: 1, SeatsPerRow: 1, Numbering: "UP"},
+		"row_offsets":         {PitchX: 5, PitchY: 8, Rows: 2, SeatsPerRow: 1, Numbering: LeftToRight, RowOffsets: []float64{1}},
+	}
+	for field, p := range cases {
+		err := p.Validate()
+		require.ErrorIs(t, err, ErrInvalidParams, field)
+		var pe *ParamError
+		require.ErrorAs(t, err, &pe, field)
+		assert.Equal(t, field, pe.Field)
+		assert.Contains(t, err.Error(), "invalid block parameters: ")
+	}
+	// A row too long for its curve is blamed on the seat count.
+	var pe *ParamError
+	require.ErrorAs(t, BlockParams{PitchX: 5, PitchY: 8, Rows: 1, SeatsPerRow: 100, Numbering: LeftToRight, ArcRadius: 10}.Validate(), &pe)
+	assert.Equal(t, "seats_per_row", pe.Field)
+}
+
+func TestBounds(t *testing.T) {
+	_, ok := BoundsOf(nil)
+	assert.False(t, ok)
+	b, ok := BoundsOf([]Point{{X: 10, Y: 40}, {X: -5, Y: 60}, {X: 30, Y: 20}})
+	require.True(t, ok)
+	assert.Equal(t, Bounds{MinX: -5, MinY: 20, MaxX: 30, MaxY: 60}, b)
+	assert.False(t, b.Within(100, 100), "x below zero")
+	assert.True(t, Bounds{MinX: 0, MinY: 0, MaxX: 100, MaxY: 50}.Within(100, 50), "the edges are inside")
+	assert.False(t, Bounds{MinX: 0, MinY: 0, MaxX: 100.01, MaxY: 50}.Within(100, 50))
+
+	sb, ok := SeatBounds([]Point{{X: 50, Y: 100}, {X: 65, Y: 108}}, 5, 8)
+	require.True(t, ok)
+	assert.Equal(t, Bounds{MinX: 46, MinY: 96, MaxX: 69, MaxY: 112}, sb, "half the larger pitch on every side")
+	_, ok = SeatBounds(nil, 5, 8)
+	assert.False(t, ok)
+}

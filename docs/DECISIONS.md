@@ -190,3 +190,43 @@ One line each: what was chosen and why. Newest at the bottom.
   a `Service` method, because the worker has no JWT secret.
 - **TOTP enrolment still does not ask for the password.** Asking would change the contract
   and the admin UI; it is listed in `docs/STATUS.md` as a known limit instead.
+- **A published event's ON_SALE/PUBLISHED status is derived on every read, not flipped by a job.**
+  Publish stores `ON_SALE` when now is inside `[sales_open_at, sales_close_at)` (no open time
+  means open) and `PUBLISHED` otherwise; after that `domain.EffectiveEventStatus` works the
+  status out from the stored value and the window, so nothing depends on a worker waking up at
+  the right second. The hold service should ask the same function.
+- **Publish and everything that edits what publish copies lock the event row `FOR UPDATE`.**
+  Paint, category create/update/delete, event edit and cancel take the lock and then check the
+  status, so `event_seats.category_id` can never differ from the painting. Publish also holds
+  the venue row `FOR SHARE`; deleting or regenerating a block takes it `FOR NO KEY UPDATE` with
+  a 3-second `lock_timeout` and answers 409 `BLOCK_HAS_INVENTORY` if a publish is in flight.
+- **Publish has its own request timeout: the HTTP write timeout less five seconds (55 s by
+  default).** It took 30.6 s and 44.2 s in two runs for 59,568 seats on the dev laptop, over both the 30 s request
+  timeout and the 15 s statement timeout. `httpapi.routeTimeout` swaps the deadline for that
+  one route and the transaction raises its own `statement_timeout`. No new env var.
+- **The seat map marker is the database clock read before the select, and a poll looks back 20
+  seconds before it.** `updated_at` is stamped at write time, so a transaction can commit a row
+  older than a marker already handed out; 20 s is above the 15 s statement and
+  idle-in-transaction limits that bound such a transaction. The server owns the overlap, the
+  client only echoes the marker. Markers older than 5 minutes get the full block.
+- **A category edit touches the event row, and a poll answers "full" when the event changed
+  since the marker.** That is how a new price or colour reaches an open block without a
+  per-category change stamp.
+- **Availability counts are cached in process for 3 seconds per event, dropped on publish and
+  cancel.** One aggregate (block × category × status) serves level 1, level 2, event and
+  category counts and the sales dashboard; reading it fresh scans about 60,000 rows. Level 3
+  is never cached.
+- **A category price change needs `confirm: true` once the event has left DRAFT**, not only
+  once a seat is held or sold: fans may already be looking at the old price. (Review rule; the
+  contract text was changed to match.)
+- **Seats in numbered rows are labelled `<row>-<seat>` (`12-14`).** `1214` could be row 1, 12
+  or 121. Lettered rows keep `C14`.
+- **Cancelling an event moves unpaid bookings to CANCELLED and paid ones to REFUND_REQUIRED, and
+  frees held seats.** A payment that lands after the cancel then finds no held seat to sell
+  (correction 5) and is refunded by the ordinary path. Refunds are queued with the payment's
+  amount; `refunds.payment_id` is unique, so a payment is never queued twice.
+- **Sales day buckets are Africa/Nairobi days.** The organiser's "today" starts at Nairobi
+  midnight (21:00 UTC), not at 00:00 UTC.
+- **Public reads are rate limited at 12,000 a minute per IP.** Loose for the same reason as the
+  other per-IP limits: thousands of phones share an address, and each polls every 5 seconds.
+- **No new Go dependency for M4/M5.**

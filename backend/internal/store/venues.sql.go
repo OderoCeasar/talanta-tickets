@@ -29,6 +29,51 @@ type CopySeatsParams struct {
 	IsActive   bool
 }
 
+const countActiveSeatsByBlock = `-- name: CountActiveSeatsByBlock :one
+SELECT count(*)::bigint FROM seats WHERE block_id = $1 AND is_active
+`
+
+func (q *Queries) CountActiveSeatsByBlock(ctx context.Context, blockID int64) (int64, error) {
+	row := q.db.QueryRow(ctx, countActiveSeatsByBlock, blockID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const countActiveSeatsByBlockForVenue = `-- name: CountActiveSeatsByBlockForVenue :many
+SELECT s.block_id, count(*)::bigint AS seats
+FROM seats s
+JOIN blocks b ON b.id = s.block_id
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1 AND s.is_active
+GROUP BY s.block_id
+`
+
+type CountActiveSeatsByBlockForVenueRow struct {
+	BlockID int64
+	Seats   int64
+}
+
+func (q *Queries) CountActiveSeatsByBlockForVenue(ctx context.Context, venueID int64) ([]CountActiveSeatsByBlockForVenueRow, error) {
+	rows, err := q.db.Query(ctx, countActiveSeatsByBlockForVenue, venueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CountActiveSeatsByBlockForVenueRow{}
+	for rows.Next() {
+		var i CountActiveSeatsByBlockForVenueRow
+		if err := rows.Scan(&i.BlockID, &i.Seats); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const countActiveSeatsByVenue = `-- name: CountActiveSeatsByVenue :one
 SELECT count(*)
 FROM seats s
@@ -179,6 +224,31 @@ func (q *Queries) CreateVenue(ctx context.Context, arg CreateVenueParams) (Venue
 	return i, err
 }
 
+const deleteBlock = `-- name: DeleteBlock :execrows
+DELETE FROM blocks WHERE id = $1
+`
+
+func (q *Queries) DeleteBlock(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteBlock, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteRowsByBlock = `-- name: DeleteRowsByBlock :execrows
+DELETE FROM rows WHERE block_id = $1
+`
+
+// Seats and row category overrides go with their rows (ON DELETE CASCADE).
+func (q *Queries) DeleteRowsByBlock(ctx context.Context, blockID int64) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteRowsByBlock, blockID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getBlock = `-- name: GetBlock :one
 SELECT id, stand_id, code, label, origin_x, origin_y, rotation_deg, arc_radius, seat_pitch_x, seat_pitch_y, outline, row_count, seats_per_row, numbering_direction FROM blocks WHERE id = $1
 `
@@ -201,6 +271,46 @@ func (q *Queries) GetBlock(ctx context.Context, id int64) (Block, error) {
 		&i.RowCount,
 		&i.SeatsPerRow,
 		&i.NumberingDirection,
+	)
+	return i, err
+}
+
+const getBlockWithVenue = `-- name: GetBlockWithVenue :one
+SELECT b.id, b.stand_id, b.code, b.label, b.origin_x, b.origin_y, b.rotation_deg, b.arc_radius, b.seat_pitch_x, b.seat_pitch_y, b.outline, b.row_count, b.seats_per_row, b.numbering_direction, st.venue_id, v.plan_width, v.plan_height
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+JOIN venues v ON v.id = st.venue_id
+WHERE b.id = $1
+`
+
+type GetBlockWithVenueRow struct {
+	Block      Block
+	VenueID    int64
+	PlanWidth  int32
+	PlanHeight int32
+}
+
+func (q *Queries) GetBlockWithVenue(ctx context.Context, id int64) (GetBlockWithVenueRow, error) {
+	row := q.db.QueryRow(ctx, getBlockWithVenue, id)
+	var i GetBlockWithVenueRow
+	err := row.Scan(
+		&i.Block.ID,
+		&i.Block.StandID,
+		&i.Block.Code,
+		&i.Block.Label,
+		&i.Block.OriginX,
+		&i.Block.OriginY,
+		&i.Block.RotationDeg,
+		&i.Block.ArcRadius,
+		&i.Block.SeatPitchX,
+		&i.Block.SeatPitchY,
+		&i.Block.Outline,
+		&i.Block.RowCount,
+		&i.Block.SeatsPerRow,
+		&i.Block.NumberingDirection,
+		&i.VenueID,
+		&i.PlanWidth,
+		&i.PlanHeight,
 	)
 	return i, err
 }
@@ -258,6 +368,72 @@ func (q *Queries) GetVenueByName(ctx context.Context, name string) (Venue, error
 		&i.PlanHeight,
 	)
 	return i, err
+}
+
+const listBlockIDsWithInventoryByVenue = `-- name: ListBlockIDsWithInventoryByVenue :many
+SELECT b.id
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1
+  AND EXISTS (
+      SELECT 1 FROM events e
+      WHERE e.venue_id = st.venue_id
+        AND EXISTS (SELECT 1 FROM event_seats es WHERE es.event_id = e.id AND es.block_id = b.id))
+`
+
+// Blocks that some event was published with. Probes event_seats once per (event, block)
+// through its (event_id, block_id, …) index instead of scanning it.
+func (q *Queries) ListBlockIDsWithInventoryByVenue(ctx context.Context, venueID int64) ([]int64, error) {
+	rows, err := q.db.Query(ctx, listBlockIDsWithInventoryByVenue, venueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listBlockStandsByVenue = `-- name: ListBlockStandsByVenue :many
+SELECT b.id AS block_id, b.stand_id
+FROM blocks b
+JOIN stands st ON st.id = b.stand_id
+WHERE st.venue_id = $1
+`
+
+type ListBlockStandsByVenueRow struct {
+	BlockID int64
+	StandID int64
+}
+
+// Which stand each block is in, without the outlines.
+func (q *Queries) ListBlockStandsByVenue(ctx context.Context, venueID int64) ([]ListBlockStandsByVenueRow, error) {
+	rows, err := q.db.Query(ctx, listBlockStandsByVenue, venueID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListBlockStandsByVenueRow{}
+	for rows.Next() {
+		var i ListBlockStandsByVenueRow
+		if err := rows.Scan(&i.BlockID, &i.StandID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const listBlocksByStand = `-- name: ListBlocksByStand :many
@@ -335,6 +511,39 @@ func (q *Queries) ListBlocksByVenue(ctx context.Context, venueID int64) ([]Block
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listEventIDsWithInventoryForBlock = `-- name: ListEventIDsWithInventoryForBlock :many
+SELECT e.id
+FROM events e
+WHERE e.venue_id = $1
+  AND EXISTS (SELECT 1 FROM event_seats es WHERE es.event_id = e.id AND es.block_id = $2)
+ORDER BY e.id
+`
+
+type ListEventIDsWithInventoryForBlockParams struct {
+	VenueID int64
+	BlockID int64
+}
+
+func (q *Queries) ListEventIDsWithInventoryForBlock(ctx context.Context, arg ListEventIDsWithInventoryForBlockParams) ([]int64, error) {
+	rows, err := q.db.Query(ctx, listEventIDsWithInventoryForBlock, arg.VenueID, arg.BlockID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []int64{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -505,6 +714,111 @@ func (q *Queries) ListVenues(ctx context.Context) ([]Venue, error) {
 	return items, nil
 }
 
+const lockBlock = `-- name: LockBlock :one
+SELECT id, stand_id, code, label, origin_x, origin_y, rotation_deg, arc_radius, seat_pitch_x, seat_pitch_y, outline, row_count, seats_per_row, numbering_direction FROM blocks WHERE id = $1 FOR UPDATE
+`
+
+// Locks: the one blocks row, FOR UPDATE, until the transaction ends.
+// Why: move, regenerate and delete each read the block and then rewrite its seats; two of
+// them at once on one block would interleave their seat writes.
+func (q *Queries) LockBlock(ctx context.Context, id int64) (Block, error) {
+	row := q.db.QueryRow(ctx, lockBlock, id)
+	var i Block
+	err := row.Scan(
+		&i.ID,
+		&i.StandID,
+		&i.Code,
+		&i.Label,
+		&i.OriginX,
+		&i.OriginY,
+		&i.RotationDeg,
+		&i.ArcRadius,
+		&i.SeatPitchX,
+		&i.SeatPitchY,
+		&i.Outline,
+		&i.RowCount,
+		&i.SeatsPerRow,
+		&i.NumberingDirection,
+	)
+	return i, err
+}
+
+const lockVenueForLayoutChange = `-- name: LockVenueForLayoutChange :one
+SELECT id FROM venues WHERE id = $1 FOR NO KEY UPDATE
+`
+
+// Locks: the one venues row, FOR NO KEY UPDATE, until the transaction ends.
+// Why: deleting a block or replacing its seats must not run while an event of the venue is
+// being published. Publish holds this row FOR SHARE while it copies seats into event_seats;
+// without the lock a delete could remove seats that an uncommitted publish has just
+// referenced, and one of the two would die on the foreign key. NO KEY, because nothing here
+// changes the venue's id, so inserts that reference the venue (new events, new stands) are
+// not held up.
+func (q *Queries) LockVenueForLayoutChange(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, lockVenueForLayoutChange, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const lockVenueForPublish = `-- name: LockVenueForPublish :one
+SELECT id FROM venues WHERE id = $1 FOR SHARE
+`
+
+// Locks: the one venues row, FOR SHARE, until the transaction ends.
+// Why: the other half of LockVenueForLayoutChange. Publish reads every active seat of the
+// venue and inserts a row per seat; the shared lock keeps blocks and seats from being
+// deleted or regenerated under it. Shared, so several events can be published at once.
+func (q *Queries) LockVenueForPublish(ctx context.Context, id int64) (int64, error) {
+	row := q.db.QueryRow(ctx, lockVenueForPublish, id)
+	var id_2 int64
+	err := row.Scan(&id_2)
+	return id_2, err
+}
+
+const setBlockLayout = `-- name: SetBlockLayout :one
+UPDATE blocks
+SET outline = $2, row_count = $3, seats_per_row = $4, numbering_direction = $5
+WHERE id = $1
+RETURNING id, stand_id, code, label, origin_x, origin_y, rotation_deg, arc_radius, seat_pitch_x, seat_pitch_y, outline, row_count, seats_per_row, numbering_direction
+`
+
+type SetBlockLayoutParams struct {
+	ID                 int64
+	Outline            json.RawMessage
+	RowCount           int32
+	SeatsPerRow        int32
+	NumberingDirection string
+}
+
+func (q *Queries) SetBlockLayout(ctx context.Context, arg SetBlockLayoutParams) (Block, error) {
+	row := q.db.QueryRow(ctx, setBlockLayout,
+		arg.ID,
+		arg.Outline,
+		arg.RowCount,
+		arg.SeatsPerRow,
+		arg.NumberingDirection,
+	)
+	var i Block
+	err := row.Scan(
+		&i.ID,
+		&i.StandID,
+		&i.Code,
+		&i.Label,
+		&i.OriginX,
+		&i.OriginY,
+		&i.RotationDeg,
+		&i.ArcRadius,
+		&i.SeatPitchX,
+		&i.SeatPitchY,
+		&i.Outline,
+		&i.RowCount,
+		&i.SeatsPerRow,
+		&i.NumberingDirection,
+	)
+	return i, err
+}
+
 const setVenueCapacityFromSeats = `-- name: SetVenueCapacityFromSeats :execrows
 UPDATE venues v
 SET capacity = (
@@ -519,6 +833,87 @@ WHERE v.id = $1
 
 func (q *Queries) SetVenueCapacityFromSeats(ctx context.Context, id int64) (int64, error) {
 	result, err := q.db.Exec(ctx, setVenueCapacityFromSeats, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const updateBlock = `-- name: UpdateBlock :one
+UPDATE blocks
+SET code = $2, label = $3, origin_x = $4, origin_y = $5, rotation_deg = $6, arc_radius = $7,
+    seat_pitch_x = $8, seat_pitch_y = $9, outline = $10
+WHERE id = $1
+RETURNING id, stand_id, code, label, origin_x, origin_y, rotation_deg, arc_radius, seat_pitch_x, seat_pitch_y, outline, row_count, seats_per_row, numbering_direction
+`
+
+type UpdateBlockParams struct {
+	ID          int64
+	Code        string
+	Label       string
+	OriginX     float64
+	OriginY     float64
+	RotationDeg float64
+	ArcRadius   *float64
+	SeatPitchX  float64
+	SeatPitchY  float64
+	Outline     json.RawMessage
+}
+
+func (q *Queries) UpdateBlock(ctx context.Context, arg UpdateBlockParams) (Block, error) {
+	row := q.db.QueryRow(ctx, updateBlock,
+		arg.ID,
+		arg.Code,
+		arg.Label,
+		arg.OriginX,
+		arg.OriginY,
+		arg.RotationDeg,
+		arg.ArcRadius,
+		arg.SeatPitchX,
+		arg.SeatPitchY,
+		arg.Outline,
+	)
+	var i Block
+	err := row.Scan(
+		&i.ID,
+		&i.StandID,
+		&i.Code,
+		&i.Label,
+		&i.OriginX,
+		&i.OriginY,
+		&i.RotationDeg,
+		&i.ArcRadius,
+		&i.SeatPitchX,
+		&i.SeatPitchY,
+		&i.Outline,
+		&i.RowCount,
+		&i.SeatsPerRow,
+		&i.NumberingDirection,
+	)
+	return i, err
+}
+
+const updateSeatPositions = `-- name: UpdateSeatPositions :execrows
+UPDATE seats s
+SET x = u.x, y = u.y
+FROM (
+    -- Set-returning functions side by side in one SELECT list are zipped row by row.
+    SELECT unnest($1::bigint[]) AS id,
+           unnest($2::float8[]) AS x,
+           unnest($3::float8[]) AS y
+) AS u
+WHERE s.id = u.id
+`
+
+type UpdateSeatPositionsParams struct {
+	Ids []int64
+	Xs  []float64
+	Ys  []float64
+}
+
+// Moves many seats at once: the three arrays are parallel.
+func (q *Queries) UpdateSeatPositions(ctx context.Context, arg UpdateSeatPositionsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, updateSeatPositions, arg.Ids, arg.Xs, arg.Ys)
 	if err != nil {
 		return 0, err
 	}

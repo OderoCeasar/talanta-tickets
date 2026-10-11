@@ -136,12 +136,46 @@ func recoverer(next http.Handler) http.Handler {
 // timeout bounds how long a request may work. Database calls and outside calls take the
 // request context, so they are cancelled when it runs out and the handler answers through
 // WriteError like any other failure.
+//
+// The context from before the deadline is kept on the request so one route can swap the
+// deadline for its own (routeTimeout); a deadline cannot otherwise be pushed out once set.
 func timeout(d time.Duration) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx, cancel := context.WithTimeout(r.Context(), d)
+			untimed := r.Context()
+			ctx, cancel := context.WithTimeout(context.WithValue(untimed, untimedKey{}, untimed), d)
 			defer cancel()
 			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+type untimedKey struct{}
+
+// rebasedContext carries the values of one context and the lifetime of another.
+type rebasedContext struct {
+	context.Context // values: logger, principal, request ID, …
+	life            context.Context
+}
+
+func (c rebasedContext) Deadline() (time.Time, bool) { return c.life.Deadline() }
+func (c rebasedContext) Done() <-chan struct{}       { return c.life.Done() }
+func (c rebasedContext) Err() error                  { return c.life.Err() }
+
+// routeTimeout gives the routes it wraps their own time limit in place of the router-wide
+// one. It still ends when the client goes away or the server shuts down, because the new
+// deadline hangs off the context the router-wide timeout started from.
+func routeTimeout(d time.Duration) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			base, ok := r.Context().Value(untimedKey{}).(context.Context)
+			if !ok {
+				// Not behind timeout(): there is no router-wide deadline to replace.
+				base = r.Context()
+			}
+			life, cancel := context.WithTimeout(base, d)
+			defer cancel()
+			next.ServeHTTP(w, r.WithContext(rebasedContext{Context: r.Context(), life: life}))
 		})
 	}
 }
