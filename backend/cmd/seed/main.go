@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/signal"
 	"time"
@@ -41,7 +42,7 @@ func run() error {
 	defer pool.Close()
 
 	res, err := Seed(ctx, pool, Options{
-		Production: os.Getenv("APP_ENV") == "production",
+		Production: !isLocalDevelopment(os.Getenv("APP_ENV"), databaseURL),
 		Now:        time.Now(),
 	})
 	if err != nil {
@@ -49,4 +50,23 @@ func run() error {
 	}
 	res.Print(os.Stdout)
 	return nil
+}
+
+// isLocalDevelopment decides whether demo events and demo logins may be created. Both
+// conditions must hold, so neither a forgotten APP_ENV nor a production DATABASE_URL pasted
+// into a developer's shell can put public passwords or a made-up match on a real database.
+func isLocalDevelopment(appEnv, databaseURL string) bool {
+	if appEnv != "development" && appEnv != "test" {
+		return false
+	}
+	u, err := url.Parse(databaseURL)
+	if err != nil {
+		return false
+	}
+	switch u.Hostname() {
+	// "db" is the Postgres service name in the local docker-compose.yml.
+	case "localhost", "127.0.0.1", "::1", "db":
+		return true
+	}
+	return false
 }

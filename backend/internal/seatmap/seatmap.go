@@ -131,6 +131,10 @@ func (p BlockParams) Validate() error {
 		return invalid("seat pitch must be positive, got %g × %g", p.PitchX, p.PitchY)
 	case p.ArcRadius < 0:
 		return invalid("arc radius must not be negative, got %g", p.ArcRadius)
+	// The outline's front edge sits half a row in front of the first row. A smaller radius
+	// would put that edge behind the centre and the outline would cross itself.
+	case p.ArcRadius > 0 && p.ArcRadius <= p.PitchY/2:
+		return invalid("arc radius %g is too small for a row pitch of %g", p.ArcRadius, p.PitchY)
 	case p.Numbering != LeftToRight && p.Numbering != RightToLeft:
 		return invalid("numbering must be %s or %s, got %q", LeftToRight, RightToLeft, p.Numbering)
 	case p.RowOffsets != nil && len(p.RowOffsets) != p.Rows:

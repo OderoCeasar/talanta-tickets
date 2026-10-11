@@ -68,3 +68,12 @@ One line each: what was chosen and why. Newest at the bottom.
   already committed.
 - **Venue template assignments are stored by block/row id and category name.** Ids are stable
   within a venue; categories are per event and do not exist until the template is applied.
+- **An unset `APP_ENV` means production.** Review found that defaulting to development left
+  every dev shortcut switched on wherever the variable was forgotten. Dev shortcuts now need an
+  explicit `development` or `test`.
+- **The seeder creates demo events and demo logins only when `APP_ENV` is `development` or
+  `test` and the database host is local.** Two conditions, so neither a forgotten variable nor a
+  production `DATABASE_URL` in a developer's shell can put public passwords on a real database.
+- **Local migrations run with the `migrate/migrate:v4.17.1` image; tests use the v4.20.1
+  library.** The image tag matches what the production compose file already runs, which is not
+  ours to change.

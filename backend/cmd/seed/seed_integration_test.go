@@ -61,19 +61,25 @@ func TestSeed(t *testing.T) {
 	require.NoError(t, err)
 	t.Logf("first run: layout %s, total %s, seat checks batched: %v", prod.Layout, prod.Total, prod.SeatChecksBatched)
 
-	t.Run("production run creates the venue but no demo users", func(t *testing.T) {
+	t.Run("production run creates the venue but no demo users or events", func(t *testing.T) {
 		assert.True(t, prod.DemoUsersRefused)
 		assert.Zero(t, prod.Count("users").Total, "demo users have public passwords and must not exist in production")
+		assert.Zero(t, prod.Count("events").Total, "a made-up match must not go on sale in production")
+		assert.Zero(t, prod.Count("event_seats").Total)
+		assert.EqualValues(t, 1, prod.Count("venue_templates").Total)
 		assert.EqualValues(t, 59580, prod.Count("seats").Inserted)
 	})
 
 	dev, err := Seed(ctx, pool, Options{Now: now})
 	require.NoError(t, err)
 
-	t.Run("development run adds only the users", func(t *testing.T) {
+	t.Run("development run adds only the demo events and users", func(t *testing.T) {
 		assert.False(t, dev.DemoUsersRefused)
 		assert.EqualValues(t, 4, dev.Count("users").Inserted)
-		assert.EqualValues(t, 4, dev.Inserted(), "everything else was already there")
+		assert.EqualValues(t, 2, dev.Count("events").Inserted)
+		for _, table := range []string{"venues", "stands", "blocks", "rows", "seats", "venue_templates"} {
+			assert.Zero(t, dev.Count(table).Inserted, "%s was already there", table)
+		}
 		assert.EqualValues(t, 1, count(t, pool, `SELECT count(*) FROM users WHERE role = 'FAN' AND phone_e164 = $1`, demoFanPhone))
 		assert.EqualValues(t, 1, count(t, pool, `SELECT count(*) FROM users WHERE role = 'GATE_STAFF' AND phone_e164 = $1`, demoGatePhone))
 		assert.EqualValues(t, 4, count(t, pool, `SELECT count(DISTINCT role) FROM users`))

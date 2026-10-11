@@ -5,7 +5,7 @@ One line each. Updated at the end of every milestone.
 ## Done
 
 - M1 Foundation: `make dev` brings up db, migrate, api, worker, adminer; `make test` and `make lint` pass. CI workflow left as it was (deployment files are off limits).
-- M2 Schema and seed: migrations 000002–000006 go up/down/up; seeder makes 59,580 seats (layout 2.8 s) and inserts 0 rows on a second run.
+- M2 Schema and seed: migrations 000002–000007 go up/down/up; seeder makes 59,580 seats (layout 2.8 s) and inserts 0 rows on a second run.
 - API contract: `backend/docs/openapi.yaml` (72 operations), lints clean, TypeScript types generate.
 
 ## Partly done
@@ -31,6 +31,9 @@ One line each. Updated at the end of every milestone.
 
 ## For the owner to do in production (not done by this build)
 
+- Set `APP_ENV=production` in `/opt/talanta/.env`. From the auth milestone on, an unset `APP_ENV` is treated as production (fail closed), but say it explicitly.
+- Before merging the schema commit, check production has no rows that migration 000002 rejects, or the migrate step fails and leaves the schema marked dirty: `SELECT count(*) FROM users WHERE phone_e164 !~ '^\+[1-9][0-9]{7,14}$';` and `SELECT lower(email), count(*) FROM users WHERE email IS NOT NULL GROUP BY 1 HAVING count(*) > 1;` must both return nothing.
+- The venue layout exists only after the seeder runs. Against production it creates the venue and the template only: no demo events and no demo users.
 - Migration 000005 adds NOT NULL columns to `tickets` and `scan_logs`; it fails if production already has rows in those tables.
 - The worker (`cmd/worker`: hold sweeper, payment reconciliation) is not in the production image or compose file. Until it is, expired holds are still reclaimed at hold time, but unpaid bookings are not expired and payments are not reconciled.
 - New env vars for `/opt/talanta/.env` will be listed here as each milestone adds them.

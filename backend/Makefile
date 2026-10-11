@@ -1,12 +1,14 @@
 .PHONY: run worker build tidy test test-integration lint fmt
 
 DATABASE_URL ?= postgres://talanta:talanta@localhost:5434/talanta?sslmode=disable
+# Unset means production to the Go binaries, so local targets say development out loud.
+APP_ENV ?= development
 
 run: ## Run the API against local Postgres (needs `make db-up migrate-up` from the repo root)
-	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/api
+	APP_ENV="$(APP_ENV)" DATABASE_URL="$(DATABASE_URL)" go run ./cmd/api
 
 worker: ## Run the background worker against local Postgres
-	DATABASE_URL="$(DATABASE_URL)" go run ./cmd/worker
+	APP_ENV="$(APP_ENV)" DATABASE_URL="$(DATABASE_URL)" go run ./cmd/worker
 
 build: ## Build every binary into bin/
 	go build -o bin/ ./cmd/...

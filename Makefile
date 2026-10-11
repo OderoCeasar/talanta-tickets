@@ -3,6 +3,8 @@
 
 DATABASE_URL ?= postgres://talanta:talanta@localhost:5434/talanta?sslmode=disable
 MIGRATIONS := backend/migrations
+# Unset means production to the Go binaries, so local targets say development out loud.
+APP_ENV ?= development
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
@@ -47,7 +49,7 @@ db-reset: ## Wipe the local database and rebuild it from migrations
 	docker compose run --rm migrate
 
 seed: ## Build the made-up Talanta venue, two demo events and one user per role
-	cd backend && DATABASE_URL="$(DATABASE_URL)" go run ./cmd/seed
+	cd backend && APP_ENV="$(APP_ENV)" DATABASE_URL="$(DATABASE_URL)" go run ./cmd/seed
 
 sqlc: ## Regenerate the Go query code (needs the sqlc CLI, v1.31.1)
 	cd backend && sqlc generate

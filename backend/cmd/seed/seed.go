@@ -48,7 +48,9 @@ var seededTables = []string{
 
 // Options controls one run of the seeder.
 type Options struct {
-	// Production is true when APP_ENV=production. The demo users are not created then.
+	// Production is true unless the run is explicitly a local development one (see main.go).
+	// Demo events and demo users are not created then: a made-up match must never go on sale
+	// to real fans, and the demo passwords are public.
 	Production bool
 	// Now is the time demo event dates are worked out from.
 	Now time.Time
@@ -156,18 +158,19 @@ func Seed(ctx context.Context, pool *pgxpool.Pool, opts Options) (Result, error)
 		return res, err
 	}
 
-	if err := timed("demo events and publish", func() error {
-		return ensureEvents(ctx, tx, venueID, templateID, opts.Now)
-	}); err != nil {
-		return res, err
-	}
-
 	if opts.Production {
 		res.DemoUsersRefused = true
-	} else if err := timed("demo users", func() error {
-		return ensureUsers(ctx, q)
-	}); err != nil {
-		return res, err
+	} else {
+		if err := timed("demo events and publish", func() error {
+			return ensureEvents(ctx, tx, venueID, templateID, opts.Now)
+		}); err != nil {
+			return res, err
+		}
+		if err := timed("demo users", func() error {
+			return ensureUsers(ctx, q)
+		}); err != nil {
+			return res, err
+		}
 	}
 
 	after, err := countTables(ctx, tx)
@@ -629,7 +632,7 @@ func (r Result) Print(w io.Writer) {
 	}
 
 	if r.DemoUsersRefused {
-		fmt.Fprintln(w, "\nAPP_ENV=production: demo users were NOT created. Their passwords are public.")
+		fmt.Fprintln(w, "\nNot a local development run: demo events and demo users were NOT created.\nSet APP_ENV=development and use a local database to get them.")
 		return
 	}
 	fmt.Fprintln(w, "\nDemo logins (development only)")
