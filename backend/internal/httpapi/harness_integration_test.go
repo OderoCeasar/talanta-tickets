@@ -16,6 +16,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"regexp"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +25,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
@@ -100,7 +102,7 @@ func uncoveredOperations() []string {
 	}
 	seen := contract.Seen()
 	var missing []string
-	for _, op := range append(append([]string{}, m3Operations...), m4m5Operations...) {
+	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations) {
 		var success, failure bool
 		for _, s := range seen {
 			name, status, _ := strings.Cut(s, " ")
@@ -235,7 +237,11 @@ type envConfig struct {
 	limits       httpapi.RateLimits
 	mailErr      error
 	// eventPolicy is the events service's policy; zero values mean the defaults.
-	eventPolicy  events.Policy
+	eventPolicy events.Policy
+	// holdPolicy is the hold service's policy; zero values mean the defaults.
+	holdPolicy booking.Policy
+	// holdDB is the pool the hold service runs on; nil means the shared one.
+	holdDB       booking.DB
 	otpCountries []string
 }
 
@@ -263,6 +269,7 @@ type env struct {
 	router   http.Handler
 	events   *events.Service
 	venues   *venue.Service
+	holds    *booking.Service
 	auth     *auth.Service
 	q        *store.Queries
 	clock    *clock
@@ -279,6 +286,10 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	cfg := envConfig{devShortcuts: true, policy: auth.DefaultPolicy(), limits: httpapi.DefaultRateLimits()}
 	for _, opt := range opts {
 		opt(&cfg)
+	}
+
+	if cfg.holdDB == nil {
+		cfg.holdDB = db.Pool
 	}
 
 	e := &env{
@@ -313,9 +324,12 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	e.events, err = events.NewService(events.Config{DB: db.Pool, Logger: logger, Policy: cfg.eventPolicy, Now: e.clock.Now})
 	require.NoError(t, err)
 	e.venues = venue.NewService(db.Pool)
+	e.holds, err = booking.NewService(booking.Config{DB: cfg.holdDB, Logger: logger, Policy: cfg.holdPolicy})
+	require.NoError(t, err)
 	e.router = httpapi.NewRouter(httpapi.Deps{
 		Events:      e.events,
 		Venues:      e.venues,
+		Holds:       e.holds,
 		Logger:      logger,
 		DB:          db.Pool,
 		Auth:        svc,

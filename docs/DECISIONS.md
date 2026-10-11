@@ -230,3 +230,94 @@ One line each: what was chosen and why. Newest at the bottom.
 - **Public reads are rate limited at 12,000 a minute per IP.** Loose for the same reason as the
   other per-IP limits: thousands of phones share an address, and each polls every 5 seconds.
 - **No new Go dependency for M4/M5.**
+- **Lock order, fixed for the whole system (M6).** Any transaction that takes more than one of
+  these takes them in this order: (0) the event's *gate*, an advisory lock on the event id;
+  (1) the event row; (2) the (user, event) advisory lock; (3) hold rows, in id order;
+  (4) `event_seats` rows, in id order, and the hold's booking and payments. A hold's seats,
+  booking and payments are only touched by a transaction that already has that hold's row
+  lock, so their order among themselves does not matter. Holding seats, release, the payment
+  extension and the sweeper take the event *shared*; publish, cancel and every edit take it
+  exclusive (`LockEvent`). The comments on each statement are in `internal/store/holds.go`.
+- **A hold takes the event row `FOR SHARE`, not `FOR KEY SHARE`.** Both conflict with the
+  `FOR UPDATE` that cancel and publish take, so either would stop a cancel interleaving with a
+  hold. But a plain `UPDATE events` (status, sales window) takes `FOR NO KEY UPDATE`, which
+  `FOR KEY SHARE` lets through and `FOR SHARE` does not. With `FOR SHARE` no writer of the
+  event row can run during a hold, whether or not it remembered to lock first. The status and
+  the sales window are checked under that lock, by the database clock.
+- **The event has a gate (an advisory lock) in front of its row lock.** Measured before it
+  existed: a cancel issued during a 1,000-request hold storm got the row only when the storm
+  was over (3.3 s, 4.1 s and 8.0 s in three runs, with every one of the 500 seats held first).
+  Postgres lets a new `FOR SHARE` join the ones already on a row even while a `FOR UPDATE` is
+  waiting, so a steady stream of holds starves the organiser. Advisory locks queue in arrival
+  order. Holds take the gate shared and `LockEvent` takes it exclusive, both before the row
+  lock, so a writer waits only for the holds already in flight (0.7 to 1.2 s in eleven runs of
+  the same test under `-race`, the cancel's own work included, with 118 to 258 holds getting
+  in before it and the rest refused).
+- **The hold statement is two statements of one transaction: lock, then write.** §6.2 locks
+  and writes in one statement. Here `SELECT … ORDER BY id FOR UPDATE` picks and locks the free
+  seats, and the `UPDATE` of those same rows is the last statement before commit. A seat's
+  `updated_at` is stamped when the row is written and the seat map's poll looks back 20
+  seconds, so nothing that might wait may come between that write and the commit. The same
+  rule holds for release, the sweeper and selling: the `event_seats` write is last.
+- **A lapsed hold is closed by whoever takes its last seat.** The hold statement reclaims seats
+  of a hold whose time has run out (no sweeper needed). The old hold rows are locked *before*
+  the seats (lock order), and one that has no seat left afterwards becomes `EXPIRED` with its
+  unpaid booking. One that still has seats stays `ACTIVE` in the table until they go too or
+  the sweeper closes it; every read reports it as `EXPIRED` (`domain.EffectiveHoldStatus`).
+- **The per-user ticket limit counts seats, once each:** seats held by the user's live holds,
+  seats of `PAID` bookings, and seats of a `PENDING_PAYMENT` booking that has a payment still
+  in flight (so a hold that lapses while M-Pesa is deciding keeps counting). An unpaid booking
+  with no live payment and no live hold does not count: its seats are back on sale.
+- **Best available reads without locking and lets the hold statement decide (correction 2).**
+  "Best" is: the block nearest the middle of its stand (lower tier first on a tie), in it the
+  row nearest the pitch, in it the run nearest the middle of the row. Blocks are read a few
+  at a time, best first (1, then 3, then 11 …), and the search stops when it has enough runs,
+  so the usual request reads one block. The category's blocks come from the event's painting,
+  which is frozen at publish, not from a count over the inventory. No new index was needed
+  (no migration 000008): the plans are in the M6 report and asserted by
+  `TestSeededVenue_HoldQueriesDoNotScanTheInventoryTable`.
+- **Best available tries six runs, and spreads out after a lost race.** The first try takes
+  the best run. Each later try picks at random among a growing window of the best runs (8,
+  32, 128, 512, 2,048): if every loser went for the next best run, a crowd would collide
+  again and again with one winner a round. Then it answers `NO_ADJACENT_SEATS`.
+- **Best available hands out STANDARD seats.** A run may include `RESTRICTED_VIEW` seats only
+  when the category has no run of standard seats at all. `ACCESSIBLE` and `COMPANION` seats
+  are never handed out by best available; they can be picked by hand on the map. A run never
+  crosses a gap: a seat that is taken, blocked or switched off, a seat of an excluded type,
+  the end of a row, or an aisle (the edge of a block).
+- **A hold is extended for a payment only when it needs it, and then only once.** With six
+  minutes or more left nothing changes and the one extension is kept for a later attempt.
+  Otherwise the expiry moves to now + 6 minutes on the hold and on its seats and
+  `holds.extended_at` is set. A second call changes nothing and says so.
+- **Selling a hold's seats is all or nothing in one statement.** `store.SellSeatsOfHold` flips
+  seats to `SOLD` only where `hold_id` matches and the status is still `HELD`, and only if as
+  many as the booking expects are still there; otherwise it flips none and returns the short
+  count (correction 5). A sold seat keeps its `hold_id` as the record of which hold bought it.
+- **The sweeper is driven from `holds`, takes each event shared with `SKIP LOCKED`, and runs
+  under an advisory lock.** It never waits: a hold a release or payment is working on, and an
+  event an organiser is editing, are left for the next run. A second sweeper leaves at once.
+  It retries a batch once on SQLSTATE 40P01, which the lock order is meant to make impossible.
+- **The worker's pool has the API's session limits (15 s statement, 15 s idle in
+  transaction).** The sweeper locks hold and seat rows; a stuck one must not sit on them. The
+  values are constants in `cmd/worker/main.go` because `config.Worker` has no fields for them.
+- **Holds never write the `events` row.** Any write to it makes every poll of every block
+  answer with the full block for 20 seconds, so nothing on the hold path flips `SOLD_OUT`.
+- **Hold creation is limited to 20 a minute per user and 3,000 a minute per IP**
+  (`RateLimits.HoldPerUser`, `HoldPerIP`), `POST /holds` and best available counted together.
+  Reading and releasing a hold are not limited: a fan must always be able to give seats back.
+- **A hold shows the fee and total (`fee_cents`, `total_cents`), as an estimate.** The fee is
+  `BOOKING_FEE_BPS` basis points of the subtotal, whole cents, rounded down, computed by
+  `domain.BookingFeeCents`, the one function the booking code must also use.
+- **`internal/testinvariants` holds the inventory invariant checker.** Ordinary Go, no build
+  tag, read-only, so any test package can call `testinvariants.Check(t, db, eventID)`.
+- **No new Go dependency for M6.**
+- **Admin unit tests run on `vitest` 3.2.7.** The same runner and version the shared package and
+  the mobile app already use (no new package in the lockfile); it covers the admin's pure logic:
+  shillings to cents, Nairobi time, drag-box hit-testing and the heatmap colour scale.
+- **No chart or map library in the admin.** The sales chart, the heatmap and the layout editor are
+  plain SVG: one path per block (96), seats drawn only for one open block.
+- **The admin asks for hourly sales only for the last 48 hours.** The API refuses more than 2,000
+  buckets and its default range starts at the first paid booking; day buckets use the default.
+- **The admin switches off editing while its own publish request is in flight.** A write that
+  waits on the publish lock can answer 500 after about 15 seconds; the site tracks the publish
+  with a TanStack mutation key and disables event edits and block edits until it answers.

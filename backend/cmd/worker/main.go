@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/worker"
@@ -34,23 +35,65 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	pool, err := store.Open(ctx, cfg.DatabaseURL)
+	// The same session limits as the API's pool (DB_STATEMENT_TIMEOUT and
+	// DB_IDLE_IN_TX_TIMEOUT default to these): the sweeper locks hold and seat rows, and a
+	// stuck sweeper transaction must not be able to sit on them.
+	pool, err := store.OpenWithOptions(ctx, cfg.DatabaseURL, store.Options{
+		StatementTimeout: workerStatementTimeout,
+		IdleInTxTimeout:  workerIdleInTxTimeout,
+	})
 	if err != nil {
 		return err
 	}
 	defer pool.Close()
 
-	jobs := jobs(cfg, pool, logger)
+	holds, err := booking.NewService(booking.Config{DB: pool, Logger: logger})
+	if err != nil {
+		return err
+	}
+	jobs := jobs(cfg, pool, holds, logger)
 	logger.Info("worker started", "jobs", len(jobs))
 	worker.Run(ctx, logger, jobs...)
 	logger.Info("worker stopped")
 	return nil
 }
 
+const (
+	workerStatementTimeout = 15 * time.Second
+	workerIdleInTxTimeout  = 15 * time.Second
+)
+
 // jobs lists the background work. Each owner adds its job here.
-func jobs(_ config.Worker, db store.DBTX, logger *slog.Logger) []worker.Job {
+func jobs(cfg config.Worker, db store.DBTX, holds sweeper, logger *slog.Logger) []worker.Job {
 	return []worker.Job{
 		authCleanupJob(db, logger),
+		holdSweeperJob(cfg, holds, logger),
+	}
+}
+
+// sweeper is the part of the hold service the worker runs.
+type sweeper interface {
+	Sweep(ctx context.Context) (booking.SweepResult, error)
+}
+
+// holdSweeperJob closes holds whose time has run out (see booking.Service.Sweep). Nothing
+// waits for it: a lapsed hold's seats can be held by anyone the moment it lapses.
+func holdSweeperJob(cfg config.Worker, holds sweeper, logger *slog.Logger) worker.Job {
+	return worker.Job{
+		Name:     "hold-sweeper",
+		Interval: cfg.SweepInterval,
+		Timeout:  time.Minute,
+		Run: func(ctx context.Context) error {
+			n, err := holds.Sweep(ctx)
+			if err != nil {
+				return err
+			}
+			if n.Holds > 0 {
+				logger.InfoContext(ctx, "hold sweep", "job", "hold-sweeper",
+					"holds_expired", n.Holds, "seats_freed", n.Seats, "bookings_expired", n.Bookings)
+			}
+			return nil
+		},
 	}
 }
 

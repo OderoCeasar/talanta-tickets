@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 )
 
 const (
@@ -81,6 +83,10 @@ type API struct {
 	// SMTP is empty (Host == "") when no mail server is configured; mail is then only logged.
 	SMTP SMTP
 
+	// BookingFeeBPS is the booking fee in basis points of the subtotal (250 = 2.5%). Zero,
+	// the default, means no fee. The sum is done by domain.BookingFeeCents.
+	BookingFeeBPS int
+
 	// Argon2MaxConcurrent caps password hashing and verification running at once.
 	Argon2MaxConcurrent int
 	// OTPCountryCodes are the calling codes (digits, no plus) sign-in SMS may be sent to.
@@ -149,6 +155,8 @@ func LoadAPI() (API, error) {
 		DBStatementTimeout: l.duration("DB_STATEMENT_TIMEOUT", 15*time.Second),
 		DBIdleInTxTimeout:  l.duration("DB_IDLE_IN_TX_TIMEOUT", 15*time.Second),
 
+		BookingFeeBPS: l.Int("BOOKING_FEE_BPS", 0),
+
 		Argon2MaxConcurrent:  l.Int("ARGON2_MAX_CONCURRENT", 4),
 		OTPCountryCodes:      l.list("OTP_ALLOWED_COUNTRY_CODES", "254"),
 		OTPGlobalHourlyLimit: l.Int("OTP_GLOBAL_HOURLY_LIMIT", 2000),
@@ -162,6 +170,9 @@ func LoadAPI() (API, error) {
 
 	if cfg.WriteTimeout <= cfg.RequestTimeout {
 		l.fail("HTTP_WRITE_TIMEOUT (%s) must be longer than REQUEST_TIMEOUT (%s), or slow answers are cut off mid-write", cfg.WriteTimeout, cfg.RequestTimeout)
+	}
+	if cfg.BookingFeeBPS < 0 || cfg.BookingFeeBPS > domain.MaxBookingFeeBPS {
+		l.fail("BOOKING_FEE_BPS must be from 0 to %d (basis points), got %d", domain.MaxBookingFeeBPS, cfg.BookingFeeBPS)
 	}
 	if cfg.Argon2MaxConcurrent < 1 {
 		l.fail("ARGON2_MAX_CONCURRENT must be at least 1, got %d", cfg.Argon2MaxConcurrent)

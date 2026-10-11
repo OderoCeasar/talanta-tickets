@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
@@ -107,6 +108,13 @@ func run() error {
 		return err
 	}
 
+	holdPolicy := booking.DefaultPolicy()
+	holdPolicy.BookingFeeBPS = cfg.BookingFeeBPS
+	holdService, err := booking.NewService(booking.Config{DB: pool, Logger: logger, Policy: holdPolicy})
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
@@ -120,6 +128,7 @@ func run() error {
 			Events:         eventService,
 			Venues:         venue.NewService(pool),
 			PublishTimeout: publishTimeout,
+			Holds:          holdService,
 		}),
 		// Each bound closes one way a slow or silent client can hold a connection open.
 		ReadHeaderTimeout: 10 * time.Second,

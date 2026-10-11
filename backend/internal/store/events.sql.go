@@ -430,7 +430,10 @@ func (q *Queries) ListPublicEvents(ctx context.Context, arg ListPublicEventsPara
 }
 
 const lockEvent = `-- name: LockEvent :one
-SELECT id, venue_id, title, competition, home_team, away_team, kickoff_at, gates_open_at, poster_url, status, sales_open_at, sales_close_at, max_tickets_per_user, created_at, updated_at, published_at FROM events WHERE id = $1 FOR UPDATE
+WITH gate AS MATERIALIZED (
+    SELECT pg_advisory_xact_lock(hashtextextended('talanta:event:' || $1::bigint::text, 0))
+)
+SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kickoff_at, e.gates_open_at, e.poster_url, e.status, e.sales_open_at, e.sales_close_at, e.max_tickets_per_user, e.created_at, e.updated_at, e.published_at FROM events e, gate WHERE e.id = $1 FOR UPDATE OF e
 `
 
 // Locks: the one events row, FOR UPDATE, until the transaction ends.
@@ -441,6 +444,14 @@ SELECT id, venue_id, title, competition, home_team, away_team, kickoff_at, gates
 // waits, sees the event is no longer DRAFT and is refused; event_seats.category_id can never
 // differ from the painting. Two publishes of one event also queue here, and the second finds
 // the event already published.
+//
+// Before the row lock it takes the event's GATE: a transaction-level advisory lock on the
+// event, exclusive. Holds take the same gate shared (store/holds.go, lockEventForHold). The
+// row lock alone starves a writer: Postgres lets a new FOR SHARE join the ones already on a
+// row even while a FOR UPDATE is waiting for it, so during a rush of holds a cancel or a
+// price change waited until the rush was over (measured: the whole of a 1,000-request storm).
+// Advisory locks queue in order, so with the gate a writer waits only for the holds already
+// in flight, and the holds that arrive after it wait for it. Order: gate, then row.
 func (q *Queries) LockEvent(ctx context.Context, id int64) (Event, error) {
 	row := q.db.QueryRow(ctx, lockEvent, id)
 	var i Event
