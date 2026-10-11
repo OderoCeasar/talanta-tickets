@@ -112,7 +112,7 @@ func TestAccessTokenForgeriesAreRefused(t *testing.T) {
 		"garbage":                        "not.a.jwt",
 		"two parts":                      parts[0] + "." + parts[1],
 		"tampered payload":               parts[0] + "." + adminPayload + "." + parts[2],
-		"tampered signature":             parts[0] + "." + parts[1] + "." + flipLast(parts[2]),
+		"tampered signature":             parts[0] + "." + parts[1] + "." + flipFirst(parts[2]),
 		"signature stripped":             parts[0] + "." + parts[1] + ".",
 		"alg none":                       b64(`{"alg":"none","typ":"JWT"}`) + "." + adminPayload + ".",
 		"alg none, signed header reused": sign(t, jwt.SigningMethodNone, jwt.UnsafeAllowNoneSignatureType, valid()),
@@ -239,11 +239,13 @@ func TestMFAGuard(t *testing.T) {
 
 func itoa(n int64) string { return strconv.FormatInt(n, 10) }
 
-func flipLast(s string) string {
-	last := s[len(s)-1]
+// flipFirst changes the first character of a base64url string. The first character, not the
+// last: the last one of an unpadded 32-byte signature carries two bits that decoding ignores,
+// so swapping it can leave the signature bytes unchanged and the token still genuine.
+func flipFirst(s string) string {
 	repl := byte('A')
-	if last == 'A' {
+	if s[0] == 'A' {
 		repl = 'B'
 	}
-	return s[:len(s)-1] + string(repl)
+	return string(repl) + s[1:]
 }
