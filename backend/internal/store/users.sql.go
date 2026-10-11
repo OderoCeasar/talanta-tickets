@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"time"
 )
 
 const countAdminUsers = `-- name: CountAdminUsers :one
@@ -101,6 +102,26 @@ func (q *Queries) CreateUser(ctx context.Context, arg CreateUserParams) (User, e
 	return i, err
 }
 
+const enableTOTP = `-- name: EnableTOTP :execrows
+UPDATE users SET totp_enabled = TRUE
+WHERE id = $1 AND NOT totp_enabled AND totp_secret = $2::text
+`
+
+type EnableTOTPParams struct {
+	ID         int64
+	TotpSecret string
+}
+
+// Turns TOTP on only for the secret the code was checked against. No row means the secret
+// changed (setup was run again) or TOTP is already on.
+func (q *Queries) EnableTOTP(ctx context.Context, arg EnableTOTPParams) (int64, error) {
+	result, err := q.db.Exec(ctx, enableTOTP, arg.ID, arg.TotpSecret)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getUserByEmail = `-- name: GetUserByEmail :one
 SELECT id, phone_e164, name, email, role, created_at, password_hash, totp_secret, totp_enabled FROM users WHERE lower(email) = lower($1::text)
 `
@@ -162,6 +183,102 @@ func (q *Queries) GetUserByPhone(ctx context.Context, phoneE164 *string) (User, 
 		&i.TotpEnabled,
 	)
 	return i, err
+}
+
+const listStaffUsers = `-- name: ListStaffUsers :many
+SELECT id, name, email, role, totp_enabled, created_at,
+       lower(coalesce(name, ''))::text AS sort_name
+FROM users
+WHERE role IN ('ORGANISER', 'ADMIN')
+  AND ($1::text IS NULL OR role = $1::text)
+  AND ($2::bigint IS NULL
+       OR (lower(coalesce(name, '')), id) > ($3::text, $2::bigint))
+ORDER BY lower(coalesce(name, '')), id
+LIMIT $4
+`
+
+type ListStaffUsersParams struct {
+	Role      *string
+	AfterID   *int64
+	AfterName *string
+	PageSize  int32
+}
+
+type ListStaffUsersRow struct {
+	ID          int64
+	Name        *string
+	Email       *string
+	Role        string
+	TotpEnabled bool
+	CreatedAt   time.Time
+	SortName    string
+}
+
+// Organisers and admins by name, then id so the order is total. Keyset paging: the caller
+// passes the last row's sort name and id.
+func (q *Queries) ListStaffUsers(ctx context.Context, arg ListStaffUsersParams) ([]ListStaffUsersRow, error) {
+	rows, err := q.db.Query(ctx, listStaffUsers,
+		arg.Role,
+		arg.AfterID,
+		arg.AfterName,
+		arg.PageSize,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListStaffUsersRow{}
+	for rows.Next() {
+		var i ListStaffUsersRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Name,
+			&i.Email,
+			&i.Role,
+			&i.TotpEnabled,
+			&i.CreatedAt,
+			&i.SortName,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockAdminBootstrap = `-- name: LockAdminBootstrap :exec
+SELECT pg_advisory_xact_lock(hashtextextended('talanta:bootstrap-admin', 0))
+`
+
+// Serialises "is there an admin yet? no: create one" across API instances starting together.
+// A transaction-level advisory lock: it is released at commit or rollback, so a crashed
+// instance cannot leave it held. The key is fixed and used by nothing else.
+func (q *Queries) LockAdminBootstrap(ctx context.Context) error {
+	_, err := q.db.Exec(ctx, lockAdminBootstrap)
+	return err
+}
+
+const setPendingTOTPSecret = `-- name: SetPendingTOTPSecret :execrows
+UPDATE users SET totp_secret = $1::text
+WHERE id = $2 AND NOT totp_enabled
+`
+
+type SetPendingTOTPSecretParams struct {
+	TotpSecret string
+	ID         int64
+}
+
+// Setup: store a secret that is not in force yet. No row means TOTP is already on, and the
+// live secret must not be replaced from under it.
+func (q *Queries) SetPendingTOTPSecret(ctx context.Context, arg SetPendingTOTPSecretParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setPendingTOTPSecret, arg.TotpSecret, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const setUserPasswordHash = `-- name: SetUserPasswordHash :execrows

@@ -17,6 +17,11 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
   Tiny lists (categories, venues, templates, my holds, gate events) are `{ items }` only.
 - Another user's hold, booking, payment or ticket answers 404, not 403.
 - 429 always carries `Retry-After` (seconds).
+- Every answer carries `X-Request-Id`. A client may send its own (8 to 64 characters of
+  `A-Z a-z 0-9 - _`) and it is used; anything else is replaced.
+- Request bodies are JSON only (`Content-Type: application/json`), at most 1 MiB, with
+  unknown fields refused. An unknown path or a wrong method answers 404 `NOT_FOUND`.
+- A fan (or gate steward) calling anything under `/admin`, existing or not, gets 403.
 
 ## Error shape
 
@@ -87,6 +92,46 @@ refreshes its token on any 401 does not mistake them for an expired session.
 
 429 is declared on the auth endpoints, the public reads, holds, bookings and payments. Admin
 and gate routes are not rate limited.
+
+## Validation details
+
+`details.fields[].field` is the JSON name of the request body field (`email`,
+`new_password`, `seat_ids[2]`, `inner.name`), or the query, path or header name
+(`limit`, `cursor`, `invitationId`, `Content-Type`). Two special values: `body` (the body is
+missing, is not JSON, or is not a single object) and the name of an unknown field.
+
+| `rule` | Meaning |
+|---|---|
+| `required` | Missing or empty |
+| `email`, `e164`, `number`, `len`, `min`, `max`, `oneof`, `gte`, `lte` | The value breaks that rule |
+| `type` | Wrong JSON type (a number where a string is expected) |
+| `unknown` | The body has a field the endpoint does not accept |
+| `json` | The body is not valid JSON |
+| `content_type` | The body was not sent as `application/json` |
+| `id`, `range`, `cursor` | Path ID, `limit`, or `cursor` is malformed |
+
+## Sign-in behaviour the contract does not spell out
+
+- **Phones.** Clients should send E.164 (the contract's `Phone` pattern). The server also
+  accepts the Kenyan local forms `07…`, `01…` and `2547…`/`2541…`, with spaces or dashes, and
+  stores and returns E.164, so one number is always one account.
+- **OTP limits.** One code per phone per 60 s, five per phone per hour, five verify
+  attempts per code (the sixth answers 429 `OTP_ATTEMPTS_EXCEEDED` even with the right
+  code). A new code retires the old one. A staff account is never signed in by phone code.
+- **Refresh.** 400 only for a malformed body; 401 only when the token is unknown, expired,
+  revoked or reused; 429 leaves the token unused and still good. A stale `Authorization`
+  header on `/auth/*` is ignored. Two refreshes racing with the same token count as reuse
+  and end the session, so a client must not refresh in parallel.
+- **Access token claims:** `sub` (user id as a string), `role`, `sid` (session), `iat`,
+  `exp`, `jti`. HS256.
+- **Staff sign-in limits.** Ten password attempts per email per 15 minutes (cleared by a
+  good sign-in), thirty per IP. An `mfa_token` lives 5 minutes, allows five codes and works
+  once; a TOTP code that has signed the user in is refused if replayed.
+- **Invitations.** A dead link is reported (404/410) before the form is validated. Accept
+  takes the role from the invitation only. `invite_url` is `ADMIN_BASE_URL/invite/<token>`.
+- **Per-IP limits** (per 10 or 15 minutes unless said): OTP request 300, OTP verify 600,
+  login 30, TOTP verify 30, invitation preview and accept 30 together, refresh 1,200 a
+  minute. Password change and TOTP settings: 10 per user per 15 minutes.
 
 ## Compact array layouts
 

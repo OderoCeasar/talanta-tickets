@@ -78,6 +78,19 @@ func (q *Queries) GetRefreshTokenByHash(ctx context.Context, tokenHash []byte) (
 	return i, err
 }
 
+const lockRefreshTokenFamily = `-- name: LockRefreshTokenFamily :exec
+SELECT pg_advisory_xact_lock(hashtextextended('talanta:refresh-family:' || $1::uuid::text, 0))
+`
+
+// Serialises every change to one sign-in's token chain: rotation, reuse detection and logout.
+// Without it a rotation could insert the next token just after a reuse was detected and the
+// family revoked, leaving a live token in a revoked family. Transaction-level advisory lock
+// keyed by the family id; released at commit or rollback.
+func (q *Queries) LockRefreshTokenFamily(ctx context.Context, familyID pgtype.UUID) error {
+	_, err := q.db.Exec(ctx, lockRefreshTokenFamily, familyID)
+	return err
+}
+
 const markRefreshTokenUsed = `-- name: MarkRefreshTokenUsed :execrows
 UPDATE refresh_tokens SET used_at = now()
 WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
@@ -88,6 +101,25 @@ WHERE id = $1 AND used_at IS NULL AND revoked_at IS NULL AND expires_at > now()
 // is a thief.
 func (q *Queries) MarkRefreshTokenUsed(ctx context.Context, id int64) (int64, error) {
 	result, err := q.db.Exec(ctx, markRefreshTokenUsed, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeOtherRefreshTokenFamilies = `-- name: RevokeOtherRefreshTokenFamilies :execrows
+UPDATE refresh_tokens SET revoked_at = now()
+WHERE user_id = $1 AND family_id <> $2 AND revoked_at IS NULL
+`
+
+type RevokeOtherRefreshTokenFamiliesParams struct {
+	UserID       int64
+	KeepFamilyID pgtype.UUID
+}
+
+// Password change: sign out every other session of the user, keep the calling one.
+func (q *Queries) RevokeOtherRefreshTokenFamilies(ctx context.Context, arg RevokeOtherRefreshTokenFamiliesParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeOtherRefreshTokenFamilies, arg.UserID, arg.KeepFamilyID)
 	if err != nil {
 		return 0, err
 	}

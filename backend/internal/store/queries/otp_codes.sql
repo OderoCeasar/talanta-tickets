@@ -27,3 +27,25 @@ SELECT count(*) FROM otp_codes WHERE request_ip = $1 AND created_at >= sqlc.arg(
 
 -- name: DeleteOTPCodesCreatedBefore :execrows
 DELETE FROM otp_codes WHERE created_at < sqlc.arg(before);
+
+-- name: GetLatestOpenOTPCode :one
+-- The newest code that has not been used or retired, whether or not it has run out of time,
+-- so verify can tell "expired" from "never asked".
+SELECT * FROM otp_codes
+WHERE phone_e164 = $1 AND consumed_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 1;
+
+-- name: RetireOTPCodesForPhone :execrows
+-- Asking for a new code kills every earlier one for the phone, so only one code is ever
+-- guessable at a time. consumed_at doubles as "retired".
+UPDATE otp_codes SET consumed_at = now()
+WHERE phone_e164 = $1 AND consumed_at IS NULL;
+
+-- name: ClaimOTPAttempt :one
+-- Counts one verify attempt, right or wrong, before the code is compared. No row means the
+-- attempts are used up (or the code is gone); parallel guesses cannot get more than
+-- max_attempts tries between them because the count and the check are one statement.
+UPDATE otp_codes SET attempts = attempts + 1
+WHERE id = sqlc.arg(id) AND consumed_at IS NULL AND attempts < sqlc.arg(max_attempts)::int
+RETURNING attempts;

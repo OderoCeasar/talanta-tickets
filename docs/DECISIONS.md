@@ -77,3 +77,53 @@ One line each: what was chosen and why. Newest at the bottom.
 - **Local migrations run with the `migrate/migrate:v4.17.1` image; tests use the v4.20.1
   library.** The image tag matches what the production compose file already runs, which is not
   ours to change.
+- **Admin routing is `react-router-dom` 7.18.4.** The site needs protected routes, a fixed
+  public `/invite/:token` path and "go back to the page you asked for" after sign-in; this is
+  the standard router for a Vite React app and needs no framework.
+- **Admin server data is `@tanstack/react-query` 5.104.1.** Already the fixed choice in
+  `CLAUDE.md` for admin and mobile; it gives every screen its loading, error and retry states.
+- **The two-step setup QR code is drawn with `qrcode-generator` 2.0.4.** An authenticator app
+  needs a QR to scan; this library has no dependencies and only computes the modules, which
+  the admin draws as SVG in the brand ink.
+- **Shared-package tests run on `vitest` 3.2.7, not 5.x.** vitest 5 needs vite 6.4 or newer and
+  the admin is on vite 5; a second vite in the hoisted `node_modules` made
+  `@vitejs/plugin-react` resolve the wrong one. Move to vitest 5 when the admin's vite is raised.
+- **The admin keeps the access token in memory and the refresh token in `sessionStorage`.**
+  No long-lived token in `localStorage`: closing the tab ends the session, and each tab
+  rotates its own refresh token so two tabs cannot trip the server's reuse check.
+- **`ADMIN_API_PROXY_TARGET` can repoint the admin dev proxy.** Unset, `/v1` still goes to
+  `http://localhost:8080`; it exists so the site can be run against a stub when 8080 is busy.
+- **`github.com/go-playground/validator/v10` v10.30.5.** The validator named in `CLAUDE.md`.
+  Used in one place, `httpapi.DecodeJSON`, which turns its errors into `VALIDATION_FAILED`
+  with JSON field names.
+- **`github.com/golang-jwt/jwt/v5` v5.3.1.** The JWT library named in `CLAUDE.md`. HS256 only:
+  the parser is built with `WithValidMethods`, so `alg: none` and other algorithms are refused.
+- **`github.com/getkin/kin-openapi` v0.149.0, in tests only.** `internal/httpapi/contracttest`
+  loads `backend/docs/openapi.yaml` (it reads OpenAPI 3.1) and checks real answers against
+  it. The API binary does not import it.
+- **No CORS or rate-limit dependency.** Both are small enough to own: `httpapi.cors` and
+  `internal/ratelimit` (fixed window, in memory, per process).
+- **`APP_ENV` unset means production.** Dev shortcuts are on only when it is exactly
+  `development` or `test` (`config.Base.AllowDevShortcuts`); nothing asks "is it not
+  production". A server that lost its env file fails closed.
+- **Forwarding headers are believed only from `TRUSTED_PROXY_CIDRS`.** chi's `RealIP` was
+  removed: it trusts `X-Forwarded-For`, `X-Real-IP` and `True-Client-IP` from anyone, which
+  lets a caller pick their own rate-limit bucket. `httpapi.ClientIPResolver` is the one
+  function that reads them.
+- **Per-IP limits are loose, per-phone and per-email limits are tight.** Kenyan mobile networks
+  put thousands of phones behind one address; a tight per-IP limit would lock out a stadium
+  of fans. SMS cost is capped per phone (one code a minute, five an hour).
+- **Access tokens carry `sid` (the refresh-token family) beside `sub`, `role`, `iat`, `exp`,
+  `jti`.** "Change password signs out my other sessions" needs to know which session is
+  calling. The MFA token is signed with a key derived from `JWT_SECRET`, so it can never
+  pass as an access token.
+- **TOTP replay and the MFA token's attempt count are kept in memory.** A used code is refused
+  for the rest of its window and an MFA token dies after five tries or one success, per
+  process. A database column would make it survive restarts and work across instances; the
+  password step stands in front either way.
+- **Pool-wide `statement_timeout` and `idle_in_transaction_session_timeout` (15 s each) for the
+  API.** Set through `store.OpenWithOptions`; `store.SetLocalStatementTimeout` raises the
+  limit inside one transaction (publish). `store.Open` (seeder, worker) sets none.
+- **`/v1/admin` and `/v1/gate` are sub-routers with a catch-all route.** Their auth and role
+  middleware then runs for every path under the prefix, existing or not, so a fan gets 403
+  rather than a 404 that maps the admin API.

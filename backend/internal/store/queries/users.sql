@@ -44,3 +44,34 @@ RETURNING *;
 -- name: CountAdminUsers :one
 -- Guards against removing or demoting the last admin.
 SELECT count(*) FROM users WHERE role = 'ADMIN';
+
+-- name: LockAdminBootstrap :exec
+-- Serialises "is there an admin yet? no: create one" across API instances starting together.
+-- A transaction-level advisory lock: it is released at commit or rollback, so a crashed
+-- instance cannot leave it held. The key is fixed and used by nothing else.
+SELECT pg_advisory_xact_lock(hashtextextended('talanta:bootstrap-admin', 0));
+
+-- name: ListStaffUsers :many
+-- Organisers and admins by name, then id so the order is total. Keyset paging: the caller
+-- passes the last row's sort name and id.
+SELECT id, name, email, role, totp_enabled, created_at,
+       lower(coalesce(name, ''))::text AS sort_name
+FROM users
+WHERE role IN ('ORGANISER', 'ADMIN')
+  AND (sqlc.narg(role)::text IS NULL OR role = sqlc.narg(role)::text)
+  AND (sqlc.narg(after_id)::bigint IS NULL
+       OR (lower(coalesce(name, '')), id) > (sqlc.narg(after_name)::text, sqlc.narg(after_id)::bigint))
+ORDER BY lower(coalesce(name, '')), id
+LIMIT sqlc.arg(page_size);
+
+-- name: SetPendingTOTPSecret :execrows
+-- Setup: store a secret that is not in force yet. No row means TOTP is already on, and the
+-- live secret must not be replaced from under it.
+UPDATE users SET totp_secret = sqlc.arg(totp_secret)::text
+WHERE id = sqlc.arg(id) AND NOT totp_enabled;
+
+-- name: EnableTOTP :execrows
+-- Turns TOTP on only for the secret the code was checked against. No row means the secret
+-- changed (setup was run again) or TOTP is already on.
+UPDATE users SET totp_enabled = TRUE
+WHERE id = sqlc.arg(id) AND NOT totp_enabled AND totp_secret = sqlc.arg(totp_secret)::text;

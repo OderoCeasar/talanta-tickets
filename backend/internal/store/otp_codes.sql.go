@@ -11,6 +11,27 @@ import (
 	"time"
 )
 
+const claimOTPAttempt = `-- name: ClaimOTPAttempt :one
+UPDATE otp_codes SET attempts = attempts + 1
+WHERE id = $1 AND consumed_at IS NULL AND attempts < $2::int
+RETURNING attempts
+`
+
+type ClaimOTPAttemptParams struct {
+	ID          int64
+	MaxAttempts int32
+}
+
+// Counts one verify attempt, right or wrong, before the code is compared. No row means the
+// attempts are used up (or the code is gone); parallel guesses cannot get more than
+// max_attempts tries between them because the count and the check are one statement.
+func (q *Queries) ClaimOTPAttempt(ctx context.Context, arg ClaimOTPAttemptParams) (int32, error) {
+	row := q.db.QueryRow(ctx, claimOTPAttempt, arg.ID, arg.MaxAttempts)
+	var attempts int32
+	err := row.Scan(&attempts)
+	return attempts, err
+}
+
 const consumeOTPCode = `-- name: ConsumeOTPCode :execrows
 UPDATE otp_codes SET consumed_at = now()
 WHERE id = $1 AND consumed_at IS NULL AND expires_at > now()
@@ -128,6 +149,31 @@ func (q *Queries) GetLatestLiveOTPCode(ctx context.Context, phoneE164 string) (O
 	return i, err
 }
 
+const getLatestOpenOTPCode = `-- name: GetLatestOpenOTPCode :one
+SELECT id, phone_e164, code_hash, expires_at, attempts, consumed_at, request_ip, created_at FROM otp_codes
+WHERE phone_e164 = $1 AND consumed_at IS NULL
+ORDER BY created_at DESC, id DESC
+LIMIT 1
+`
+
+// The newest code that has not been used or retired, whether or not it has run out of time,
+// so verify can tell "expired" from "never asked".
+func (q *Queries) GetLatestOpenOTPCode(ctx context.Context, phoneE164 string) (OtpCode, error) {
+	row := q.db.QueryRow(ctx, getLatestOpenOTPCode, phoneE164)
+	var i OtpCode
+	err := row.Scan(
+		&i.ID,
+		&i.PhoneE164,
+		&i.CodeHash,
+		&i.ExpiresAt,
+		&i.Attempts,
+		&i.ConsumedAt,
+		&i.RequestIp,
+		&i.CreatedAt,
+	)
+	return i, err
+}
+
 const incrementOTPAttempts = `-- name: IncrementOTPAttempts :one
 UPDATE otp_codes SET attempts = attempts + 1 WHERE id = $1 RETURNING attempts
 `
@@ -137,4 +183,19 @@ func (q *Queries) IncrementOTPAttempts(ctx context.Context, id int64) (int32, er
 	var attempts int32
 	err := row.Scan(&attempts)
 	return attempts, err
+}
+
+const retireOTPCodesForPhone = `-- name: RetireOTPCodesForPhone :execrows
+UPDATE otp_codes SET consumed_at = now()
+WHERE phone_e164 = $1 AND consumed_at IS NULL
+`
+
+// Asking for a new code kills every earlier one for the phone, so only one code is ever
+// guessable at a time. consumed_at doubles as "retired".
+func (q *Queries) RetireOTPCodesForPhone(ctx context.Context, phoneE164 string) (int64, error) {
+	result, err := q.db.Exec(ctx, retireOTPCodesForPhone, phoneE164)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
