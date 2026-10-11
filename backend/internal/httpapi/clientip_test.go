@@ -7,7 +7,60 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
 )
+
+// resolverFromEnv builds the resolver exactly as cmd/api does, from loaded configuration.
+func resolverFromEnv(t *testing.T) ClientIPResolver {
+	t.Helper()
+	cfg, err := config.LoadAPI()
+	require.NoError(t, err)
+	return ClientIPResolver{TrustedProxies: cfg.TrustedProxies, Header: cfg.ClientIPHeader}
+}
+
+// Caddy passes CF-Connecting-IP through untouched from whoever connects to the origin, so
+// with the default configuration it must not be believed: a caller would pick their own
+// rate-limit bucket (and, later, their own place on the M-Pesa allowlist). The only source is
+// X-Forwarded-For, read from the right past our own proxies.
+func TestClientIP_DefaultConfigIgnoresCFConnectingIP(t *testing.T) {
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("DATABASE_URL", "postgres://x")
+	t.Setenv("JWT_SECRET", "a-private-secret-that-is-long-enough-123")
+	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
+	t.Setenv("CLIENT_IP_HEADER", "")
+
+	// What an attacker sends straight to the origin through Caddy: a forged CF-Connecting-IP
+	// and a forged left-most X-Forwarded-For entry. Caddy appends the address it really saw.
+	forged := func() *http.Request {
+		req := httptest.NewRequest("POST", "/v1/auth/login", nil)
+		req.RemoteAddr = "172.18.0.5:51000"
+		req.Header.Set("CF-Connecting-IP", "1.1.1.1")
+		req.Header.Set("X-Forwarded-For", "6.6.6.6, 197.248.10.20")
+		return req
+	}
+
+	resolver := resolverFromEnv(t)
+	assert.Equal(t, "", resolver.Header, "CLIENT_IP_HEADER is empty unless the operator sets it")
+	assert.Equal(t, "197.248.10.20", resolver.ClientIP(forged()).String())
+
+	// And with no X-Forwarded-For at all, the header still is not believed.
+	req := forged()
+	req.Header.Del("X-Forwarded-For")
+	assert.Equal(t, "172.18.0.5", resolver.ClientIP(req).String())
+
+	// Opt-in, for an origin that only the CDN can reach: the header is used.
+	t.Setenv("CLIENT_IP_HEADER", "CF-Connecting-IP")
+	resolver = resolverFromEnv(t)
+	assert.Equal(t, "1.1.1.1", resolver.ClientIP(forged()).String())
+
+	// "none": nothing is believed, the peer is the client.
+	t.Setenv("TRUSTED_PROXY_CIDRS", "none")
+	resolver = resolverFromEnv(t)
+	assert.Equal(t, "172.18.0.5", resolver.ClientIP(forged()).String())
+}
 
 func TestClientIP(t *testing.T) {
 	proxies := []netip.Prefix{netip.MustParsePrefix("172.16.0.0/12"), netip.MustParsePrefix("10.0.0.0/8")}
@@ -43,6 +96,13 @@ func TestClientIP(t *testing.T) {
 			resolver: ClientIPResolver{TrustedProxies: proxies, Header: "CF-Connecting-IP"},
 			remote:   "172.18.0.5:51000",
 			headers:  map[string][]string{"Cf-Connecting-Ip": {"197.248.10.20"}, "X-Forwarded-For": {"6.6.6.6, 104.16.0.1"}},
+			want:     "197.248.10.20",
+		},
+		{
+			name:     "trusted peer, no header configured: CF-Connecting-IP is ignored, X-Forwarded-For is used",
+			resolver: ClientIPResolver{TrustedProxies: proxies},
+			remote:   "172.18.0.5:51000",
+			headers:  map[string][]string{"Cf-Connecting-Ip": {"1.1.1.1"}, "X-Forwarded-For": {"6.6.6.6, 197.248.10.20"}},
 			want:     "197.248.10.20",
 		},
 		{

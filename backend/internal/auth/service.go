@@ -37,6 +37,14 @@ type Policy struct {
 	LoginPerEmail ratelimit.Rule
 	// MFAMaxAttempts is how many TOTP codes one MFA token may try.
 	MFAMaxAttempts int
+	// TOTPPerUser caps TOTP codes tried against one user at sign-in, across every MFA token.
+	// The per-token cap alone is no cap: each good password mints a new token.
+	TOTPPerUser ratelimit.Rule
+
+	// OTPGlobalHourly and OTPGlobalDaily cap sign-in SMS across all phones. Per-phone limits
+	// do not bound the bill: an attacker simply uses a new number for every request.
+	OTPGlobalHourly ratelimit.Rule
+	OTPGlobalDaily  ratelimit.Rule
 
 	RefreshLifetime time.Duration
 }
@@ -50,6 +58,9 @@ func DefaultPolicy() Policy {
 		OTPPerPhone:     ratelimit.Rule{Limit: 5, Window: time.Hour},
 		LoginPerEmail:   ratelimit.Rule{Limit: 10, Window: 15 * time.Minute},
 		MFAMaxAttempts:  5,
+		TOTPPerUser:     ratelimit.Rule{Limit: 5, Window: 15 * time.Minute},
+		OTPGlobalHourly: ratelimit.Rule{Limit: 2000, Window: time.Hour},
+		OTPGlobalDaily:  ratelimit.Rule{Limit: 10000, Window: 24 * time.Hour},
 		RefreshLifetime: 30 * 24 * time.Hour,
 	}
 }
@@ -71,6 +82,12 @@ type Config struct {
 	Mailer  notify.Mailer
 	Limiter ratelimit.Limiter
 	Policy  Policy
+	// OTPCountryCodes are the calling codes (digits, no plus) a sign-in code may be sent to.
+	// Empty means DefaultOTPCountryCodes.
+	OTPCountryCodes []string
+	// Argon2MaxConcurrent caps password hashing and verification running at once. Zero means
+	// DefaultArgon2MaxConcurrent.
+	Argon2MaxConcurrent int
 	// Now is the clock; nil means time.Now.
 	Now func() time.Time
 }
@@ -90,6 +107,9 @@ type Service struct {
 	policy       Policy
 	now          func() time.Time
 	mfa          *mfaGuard
+	hasher       *passwordHasher
+	// otpCountryCodes is the allow-list for sign-in SMS, as calling codes without the plus.
+	otpCountryCodes []string
 	// dummyHash is verified when a login names an email with no account, so that answer
 	// takes as long as a wrong password does.
 	dummyHash string
@@ -121,6 +141,9 @@ func NewService(cfg Config) (*Service, error) {
 	if cfg.Policy == (Policy{}) {
 		cfg.Policy = DefaultPolicy()
 	}
+	if len(cfg.OTPCountryCodes) == 0 {
+		cfg.OTPCountryCodes = DefaultOTPCountryCodes()
+	}
 
 	filler, err := randomToken(24)
 	if err != nil {
@@ -145,9 +168,20 @@ func NewService(cfg Config) (*Service, error) {
 		policy:       cfg.Policy,
 		now:          cfg.Now,
 		mfa:          newMFAGuard(),
-		dummyHash:    dummy,
+		hasher:       newPasswordHasher(cfg.Argon2MaxConcurrent),
+
+		otpCountryCodes: append([]string(nil), cfg.OTPCountryCodes...),
+		dummyHash:       dummy,
 	}, nil
 }
+
+// PasswordVerifications is how many argon2 verifications the service has completed, real or
+// dummy. Tests use it to prove a login for an unknown email still pays for one.
+func (s *Service) PasswordVerifications() uint64 { return s.hasher.verifies.Load() }
+
+// DefaultOTPCountryCodes is where sign-in SMS may go when OTP_ALLOWED_COUNTRY_CODES is not
+// set: Kenya only.
+func DefaultOTPCountryCodes() []string { return []string{"254"} }
 
 // Tokens is the access-token checker the HTTP layer authenticates requests with.
 func (s *Service) Tokens() *Tokens { return s.tokens }

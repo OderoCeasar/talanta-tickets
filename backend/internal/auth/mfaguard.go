@@ -13,6 +13,9 @@ import (
 //     overheard, or read off a screen — cannot be used again while it is still inside its
 //     ±1 step window.
 //
+// The cap on codes tried per user (not per token) is not here: it is Policy.TOTPPerUser, kept
+// by the rate limiter in VerifyTOTPLogin.
+//
 // It is in memory, per process: with more than one API instance, or across a restart, a
 // replay inside the 90-second window would get through. The password step still stands in
 // front of it. Moving it to the database needs a column on users.

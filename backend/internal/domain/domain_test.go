@@ -100,3 +100,15 @@ func TestNormaliseEmailAndName(t *testing.T) {
 	assert.Equal(t, "Wanjiru Kamau", NormaliseName("  Wanjiru   Kamau\t"))
 	assert.Equal(t, "", NormaliseName(" \n "))
 }
+
+func TestPhoneHasCountryCode(t *testing.T) {
+	kenya := []string{"254"}
+	assert.True(t, PhoneHasCountryCode("+254712345678", kenya))
+	assert.False(t, PhoneHasCountryCode("+255712345678", kenya))
+	assert.False(t, PhoneHasCountryCode("+14155552671", kenya))
+	assert.False(t, PhoneHasCountryCode("254712345678", kenya), "not E.164: no plus")
+	assert.False(t, PhoneHasCountryCode("+254712345678", nil), "an empty list allows nobody")
+	assert.False(t, PhoneHasCountryCode("+254712345678", []string{""}))
+	assert.True(t, PhoneHasCountryCode("+14155552671", []string{"254", "1"}))
+	assert.True(t, PhoneHasCountryCode("+255712345678", []string{"254", "255"}))
+}

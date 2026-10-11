@@ -114,19 +114,39 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 
 - **Phones.** Clients should send E.164 (the contract's `Phone` pattern). The server also
   accepts the Kenyan local forms `07…`, `01…` and `2547…`/`2541…`, with spaces or dashes, and
-  stores and returns E.164, so one number is always one account.
+  stores and returns E.164, so one number is always one account. Sign-in codes are sent only
+  to the calling codes in `OTP_ALLOWED_COUNTRY_CODES` (default `254`); any other number
+  answers 400 `VALIDATION_FAILED` on `phone` (rule `e164`) on both request and verify.
 - **OTP limits.** One code per phone per 60 s, five per phone per hour, five verify
   attempts per code (the sixth answers 429 `OTP_ATTEMPTS_EXCEEDED` even with the right
   code). A new code retires the old one. A staff account is never signed in by phone code.
+  Across all phones at most `OTP_GLOBAL_HOURLY_LIMIT` (2,000) codes an hour and
+  `OTP_GLOBAL_DAILY_LIMIT` (10,000) a day are sent; past that, requests answer 429
+  `RATE_LIMITED` and the API logs an error-level alert.
 - **Refresh.** 400 only for a malformed body; 401 only when the token is unknown, expired,
   revoked or reused; 429 leaves the token unused and still good. A stale `Authorization`
   header on `/auth/*` is ignored. Two refreshes racing with the same token count as reuse
   and end the session, so a client must not refresh in parallel.
 - **Access token claims:** `sub` (user id as a string), `role`, `sid` (session), `iat`,
   `exp`, `jti`. HS256.
-- **Staff sign-in limits.** Ten password attempts per email per 15 minutes (cleared by a
-  good sign-in), thirty per IP. An `mfa_token` lives 5 minutes, allows five codes and works
-  once; a TOTP code that has signed the user in is refused if replayed.
+- **Staff sign-in limits.** Ten password attempts per email per 15 minutes, thirty per IP.
+  The per-email count is cleared by a finished sign-in: the password alone when the user has
+  no TOTP, the TOTP step when they do (a good password followed by no code does not clear
+  it). An `mfa_token` lives 5 minutes, allows five codes and works once; a TOTP code that has
+  signed the user in is refused if replayed. Across all `mfa_token`s, five TOTP codes may be
+  tried per user per 15 minutes; after that `/auth/totp/verify` answers 429 `RATE_LIMITED`
+  with `Retry-After`, even for the right code, until the window ends.
+- **Busy server.** At most `ARGON2_MAX_CONCURRENT` (4) password hashes run at once; other
+  requests wait. One still waiting when its request times out answers 429 `RATE_LIMITED`
+  (`Retry-After: 5`). This applies to login, invitation accept, password change and TOTP
+  disable.
+- **Caller's address.** Forwarding headers are read only on connections from
+  `TRUSTED_PROXY_CIDRS`; the address is then the right-most `X-Forwarded-For` entry that is
+  not one of those proxies. `CLIENT_IP_HEADER` (empty by default) names a single-address
+  header such as `CF-Connecting-IP` to believe first. It may be set only when the origin
+  accepts connections solely from the CDN that writes it, or the proxy overwrites it; a
+  proxy that passes it through would let any caller choose their own rate-limit bucket.
+  Production must set `TRUSTED_PROXY_CIDRS` to a range or to `none` (exposed directly).
 - **Invitations.** A dead link is reported (404/410) before the form is validated. Accept
   takes the role from the invitation only. `invite_url` is `ADMIN_BASE_URL/invite/<token>`.
 - **Per-IP limits** (per 10 or 15 minutes unless said): OTP request 300, OTP verify 600,

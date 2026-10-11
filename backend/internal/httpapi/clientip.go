@@ -19,8 +19,12 @@ import (
 type ClientIPResolver struct {
 	// TrustedProxies are the networks our proxies connect from (TRUSTED_PROXY_CIDRS).
 	TrustedProxies []netip.Prefix
-	// Header is the single-address header the outermost proxy sets (CLIENT_IP_HEADER, by
-	// default CF-Connecting-IP). When it is missing or unreadable, X-Forwarded-For is used.
+	// Header is an optional single-address header to believe before X-Forwarded-For
+	// (CLIENT_IP_HEADER, for example CF-Connecting-IP). Empty by default, and it must stay
+	// empty unless the origin accepts connections only from the CDN that sets it, or our
+	// proxy overwrites it: a proxy that merely passes it through (Caddy does) would hand
+	// any caller the choice of their own address. When it is empty, missing or unreadable,
+	// X-Forwarded-For is used.
 	Header string
 }
 

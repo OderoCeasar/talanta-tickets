@@ -22,16 +22,37 @@ type SMTPConfig struct {
 	Password string
 	// From is the envelope and header sender, for example "Talanta Tickets <no-reply@…>".
 	From string
+	// AllowPlaintext lets mail go to a server that does not offer STARTTLS
+	// (SMTP_ALLOW_PLAINTEXT). Off by default: invitation mail carries a one-time link.
+	AllowPlaintext bool
 	// Timeout covers the whole exchange. net/smtp has no context support, so the deadline is
 	// set on the connection.
 	Timeout time.Duration
 }
 
-// SMTPMailer sends through one SMTP server. Port 465 is implicit TLS; any other port is
-// plain with STARTTLS when the server offers it.
+// ErrSMTPNoTLS means the server did not offer STARTTLS and plaintext is not allowed, so
+// nothing was sent.
+var ErrSMTPNoTLS = errors.New("notify: smtp server does not offer STARTTLS; refusing to send in plaintext (set SMTP_ALLOW_PLAINTEXT=true to allow it)")
+
+// SMTPMailer sends through one SMTP server. Port 465 is implicit TLS; any other port must
+// upgrade with STARTTLS. A server that does not offer it is refused rather than sent to in
+// the clear, because "offer" is exactly what someone in the path can strip. The exceptions
+// are a loopback host (the bytes never leave the machine) and AllowPlaintext.
 type SMTPMailer struct {
 	cfg  SMTPConfig
 	from *mail.Address
+	// dial opens the plain TCP connection; replaceable in tests so a named host can be
+	// served by a local fake.
+	dial func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+// isLoopbackHost reports whether host is this machine by name or by address.
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(strings.TrimSuffix(host, "."), "localhost") {
+		return true
+	}
+	ip := net.ParseIP(strings.Trim(host, "[]"))
+	return ip != nil && ip.IsLoopback()
 }
 
 // NewSMTPMailer checks the settings that would otherwise only fail on the first send.
@@ -49,7 +70,7 @@ func NewSMTPMailer(cfg SMTPConfig) (*SMTPMailer, error) {
 	if cfg.Timeout <= 0 {
 		cfg.Timeout = 10 * time.Second
 	}
-	return &SMTPMailer{cfg: cfg, from: from}, nil
+	return &SMTPMailer{cfg: cfg, from: from, dial: (&net.Dialer{}).DialContext}, nil
 }
 
 func (m *SMTPMailer) SendMail(ctx context.Context, msg Mail) error {
@@ -73,7 +94,7 @@ func (m *SMTPMailer) SendMail(ctx context.Context, msg Mail) error {
 	if m.cfg.Port == 465 {
 		conn, err = (&tls.Dialer{Config: tlsConfig}).DialContext(ctx, "tcp", addr)
 	} else {
-		conn, err = (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+		conn, err = m.dial(ctx, "tcp", addr)
 	}
 	if err != nil {
 		return fmt.Errorf("notify: dial smtp: %w", err)
@@ -94,6 +115,8 @@ func (m *SMTPMailer) SendMail(ctx context.Context, msg Mail) error {
 			if err := c.StartTLS(tlsConfig); err != nil {
 				return fmt.Errorf("notify: starttls: %w", err)
 			}
+		} else if !m.cfg.AllowPlaintext && !isLoopbackHost(m.cfg.Host) {
+			return ErrSMTPNoTLS
 		}
 	}
 	if m.cfg.Username != "" {

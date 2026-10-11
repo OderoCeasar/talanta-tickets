@@ -31,7 +31,7 @@ func (s *Service) BootstrapAdmin(ctx context.Context, rawEmail, password string)
 		return false, nil
 	}
 
-	hash, err := HashPassword(password)
+	hash, err := s.hasher.Hash(ctx, password)
 	if err != nil {
 		return false, err
 	}

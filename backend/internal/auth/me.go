@@ -84,8 +84,11 @@ func checkNewPassword(field, password string) error {
 }
 
 // checkPassword verifies the caller's current password on a signed-in route.
-func (s *Service) checkPassword(u store.User, password string) error {
-	ok, err := VerifyPassword(password, *u.PasswordHash)
+func (s *Service) checkPassword(ctx context.Context, u store.User, password string) error {
+	ok, err := s.hasher.Verify(ctx, password, *u.PasswordHash)
+	if isHashBusy(err) {
+		return err
+	}
 	if err != nil {
 		return fmt.Errorf("user %d: %w", u.ID, err)
 	}
@@ -105,11 +108,11 @@ func (s *Service) ChangePassword(ctx context.Context, who domain.Principal, curr
 	if err := checkNewPassword("new_password", next); err != nil {
 		return err
 	}
-	if err := s.checkPassword(u, current); err != nil {
+	if err := s.checkPassword(ctx, u, current); err != nil {
 		return err
 	}
 	// Hashed before the transaction: argon2 is slow on purpose and must not hold a connection.
-	hash, err := HashPassword(next)
+	hash, err := s.hasher.Hash(ctx, next)
 	if err != nil {
 		return err
 	}
@@ -208,7 +211,7 @@ func (s *Service) DisableTOTP(ctx context.Context, userID int64, password string
 	if !u.TotpEnabled {
 		return domain.User{}, domain.ErrTOTPNotEnabled
 	}
-	if err := s.checkPassword(u, password); err != nil {
+	if err := s.checkPassword(ctx, u, password); err != nil {
 		return domain.User{}, err
 	}
 	if _, err := s.q.SetUserTOTP(ctx, store.SetUserTOTPParams{ID: u.ID, TotpSecret: nil, TotpEnabled: false}); err != nil {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"time"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
@@ -24,11 +25,15 @@ type MFAChallenge struct {
 	ExpiresIn time.Duration
 }
 
+func loginLimitKey(email string) string { return "login:email:" + email }
+
+func totpLimitKey(userID int64) string { return "totp:user:" + strconv.FormatInt(userID, 10) }
+
 // Login is the password step of a staff sign-in.
 func (s *Service) Login(ctx context.Context, rawEmail, password string) (LoginResult, error) {
 	email := domain.NormaliseEmail(rawEmail)
 
-	limitKey := "login:email:" + email
+	limitKey := loginLimitKey(email)
 	if d := s.limiter.Take(limitKey, s.policy.LoginPerEmail); !d.Allowed {
 		return LoginResult{}, domain.RateLimited(ratelimit.RetryAfterSeconds(d.RetryAfter))
 	}
@@ -46,7 +51,11 @@ func (s *Service) Login(ctx context.Context, rawEmail, password string) (LoginRe
 	if canSignIn {
 		hash = *user.PasswordHash
 	}
-	ok, verr := VerifyPassword(password, hash)
+	ok, verr := s.hasher.Verify(ctx, password, hash)
+	if isHashBusy(verr) {
+		// No slot came free: nothing was checked, for a known email or an unknown one alike.
+		return LoginResult{}, verr
+	}
 	if verr != nil && canSignIn {
 		// The stored hash is unreadable. That is our fault, not a wrong password.
 		return LoginResult{}, fmt.Errorf("login: user %d: %w", user.ID, verr)
@@ -55,17 +64,20 @@ func (s *Service) Login(ctx context.Context, rawEmail, password string) (LoginRe
 		return LoginResult{}, domain.ErrInvalidCredentials
 	}
 
-	// A good password clears the count, so a user who mistyped a few times is not locked out
-	// of their next sign-in.
-	s.limiter.Reset(limitKey)
-
 	if user.TotpEnabled {
+		// The count is NOT cleared here. With TOTP on, a good password is only half a
+		// sign-in; clearing it would hand whoever knows the password an endless supply of
+		// password steps, each minting a fresh MFA token. VerifyTOTPLogin clears it.
 		token, _, err := s.tokens.IssueMFA(user.ID)
 		if err != nil {
 			return LoginResult{}, err
 		}
 		return LoginResult{MFA: &MFAChallenge{Token: token, ExpiresIn: MFATokenTTL}}, nil
 	}
+
+	// A finished sign-in clears the count, so a user who mistyped a few times is not locked
+	// out of their next one.
+	s.limiter.Reset(limitKey)
 
 	session, err := s.startSession(ctx, s.q, user)
 	if err != nil {
@@ -83,6 +95,14 @@ func (s *Service) VerifyTOTPLogin(ctx context.Context, mfaToken, code string) (S
 	now := s.now()
 	if !s.mfa.attempt(tokenID, expires, now, s.policy.MFAMaxAttempts) {
 		return Session{}, domain.ErrMFATokenInvalid
+	}
+	// Counted per user and before the code is looked at, so neither a fresh MFA token nor
+	// guesses made in parallel get more tries. Once the cap is reached even the right code is
+	// refused until the window ends; a successful sign-in below clears the count.
+	totpKey := totpLimitKey(userID)
+	if d := s.limiter.Take(totpKey, s.policy.TOTPPerUser); !d.Allowed {
+		s.log.WarnContext(ctx, "totp sign-in refused: too many codes tried for this user", "user_id", userID)
+		return Session{}, domain.RateLimited(ratelimit.RetryAfterSeconds(d.RetryAfter))
 	}
 
 	user, err := s.q.GetUserByID(ctx, userID)
@@ -105,6 +125,12 @@ func (s *Service) VerifyTOTPLogin(ctx context.Context, mfaToken, code string) (S
 	if !s.mfa.finish(tokenID, user.ID, step) {
 		s.log.WarnContext(ctx, "totp code replay refused", "user_id", user.ID)
 		return Session{}, domain.ErrTOTPInvalid
+	}
+
+	// Both steps are done: only now are the password and TOTP counts cleared.
+	s.limiter.Reset(totpKey)
+	if user.Email != nil {
+		s.limiter.Reset(loginLimitKey(domain.NormaliseEmail(*user.Email)))
 	}
 
 	session, err := s.startSession(ctx, s.q, user)

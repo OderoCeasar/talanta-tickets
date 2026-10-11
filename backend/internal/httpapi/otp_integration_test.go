@@ -94,13 +94,14 @@ func TestOTPLogin_GoodCode(t *testing.T) {
 // The three ways Kenyans write a number are one account. The contract tells clients to send
 // E.164; the server accepts local forms as a kindness, hence LenientRequest.
 func TestOTPLogin_LocalPhoneFormatsAreOneAccount(t *testing.T) {
-	e := newEnv(t, withPolicy(func(p *auth.Policy) { p.OTPResendAfter = time.Millisecond }))
+	e := newEnv(t)
 	national := "7" + randDigits(t, 8)
 	e164 := "+254" + national
 
 	var ids []int64
 	for _, form := range []string{"0" + national, "254" + national, e164, "0" + national[:3] + " " + national[3:6] + " " + national[6:]} {
-		time.Sleep(2 * time.Millisecond)
+		// The injected clock steps past the resend gap; nothing here waits on real time.
+		e.clock.Advance(61 * time.Second)
 		rec := e.do("POST", "/auth/otp/request", map[string]string{"phone": form}, "", contracttest.LenientRequest())
 		require.Equal(t, http.StatusOK, rec.Code, "%s: %s", form, rec.Body.String())
 		var body struct {
@@ -328,7 +329,11 @@ func TestOTPRequest_UnsetAppEnvIsProductionAndReturnsNoDevCode(t *testing.T) {
 	t.Setenv("APP_ENV", "")
 	t.Setenv("DATABASE_URL", db.URL)
 	t.Setenv("JWT_SECRET", testSecret)
-	for _, k := range []string{"BOOTSTRAP_ADMIN_EMAIL", "BOOTSTRAP_ADMIN_PASSWORD", "SMTP_HOST", "ADMIN_BASE_URL", "TRUSTED_PROXY_CIDRS", "HTTP_WRITE_TIMEOUT", "REQUEST_TIMEOUT"} {
+	// What production must set, or the config does not load at all.
+	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+	t.Setenv("TRUSTED_PROXY_CIDRS", "none")
+	for _, k := range []string{"BOOTSTRAP_ADMIN_EMAIL", "BOOTSTRAP_ADMIN_PASSWORD", "SMTP_HOST", "HTTP_WRITE_TIMEOUT", "REQUEST_TIMEOUT",
+		"CLIENT_IP_HEADER", "ARGON2_MAX_CONCURRENT", "OTP_ALLOWED_COUNTRY_CODES", "OTP_GLOBAL_HOURLY_LIMIT", "OTP_GLOBAL_DAILY_LIMIT", "SMTP_ALLOW_PLAINTEXT"} {
 		t.Setenv(k, "")
 	}
 	cfg, err := config.LoadAPI()

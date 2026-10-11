@@ -62,6 +62,10 @@ func run() error {
 	}
 	limiter := ratelimit.NewMemory(nil)
 
+	authPolicy := auth.DefaultPolicy()
+	authPolicy.OTPGlobalHourly.Limit = cfg.OTPGlobalHourlyLimit
+	authPolicy.OTPGlobalDaily.Limit = cfg.OTPGlobalDailyLimit
+
 	authService, err := auth.NewService(auth.Config{
 		DB:           pool,
 		Logger:       logger,
@@ -72,6 +76,10 @@ func run() error {
 		SMS:     notify.LogSMS{Logger: logger, Production: cfg.IsProduction()},
 		Mailer:  mailer,
 		Limiter: limiter,
+		Policy:  authPolicy,
+
+		OTPCountryCodes:     cfg.OTPCountryCodes,
+		Argon2MaxConcurrent: cfg.Argon2MaxConcurrent,
 	})
 	if err != nil {
 		return err
@@ -139,5 +147,7 @@ func newMailer(cfg config.API, logger *slog.Logger) (notify.Mailer, error) {
 		Username: cfg.SMTP.Username,
 		Password: cfg.SMTP.Password,
 		From:     cfg.SMTP.From,
+
+		AllowPlaintext: cfg.SMTP.AllowPlaintext,
 	})
 }

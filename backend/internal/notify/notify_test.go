@@ -22,8 +22,8 @@ func capture(level slog.Level) (*slog.Logger, *bytes.Buffer) {
 	return slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{Level: level})), &buf
 }
 
-// In production the mocks must not put codes or invitation links in the normal (info) log.
-func TestLogMocksKeepSecretsOutOfProductionInfoLogs(t *testing.T) {
+// In production the mocks must not put codes or invitation links in the log at any level.
+func TestLogMocksKeepSecretsOutOfProductionLogs(t *testing.T) {
 	ctx := context.Background()
 
 	logger, buf := capture(slog.LevelInfo)
@@ -32,6 +32,19 @@ func TestLogMocksKeepSecretsOutOfProductionInfoLogs(t *testing.T) {
 	assert.NotContains(t, buf.String(), "SECRET-TOKEN-VALUE")
 	assert.NotContains(t, buf.String(), "482913")
 	assert.Contains(t, buf.String(), "a@b.co", "that a mail was not sent is still visible")
+	assert.Contains(t, buf.String(), "+254712345678")
+
+	// Not at debug either: LOG_LEVEL=debug on a production server must not expose them. Every
+	// level is captured here, and nothing of the body or the link may appear.
+	logger, buf = capture(slog.LevelDebug - 4)
+	require.NoError(t, LogMailer{Logger: logger, Production: true}.SendMail(ctx, Mail{To: "a@b.co", Subject: "Invite", Text: "Open " + secretLink}))
+	require.NoError(t, LogSMS{Logger: logger, Production: true}.SendSMS(ctx, "+254712345678", "Your code is 482913"))
+	assert.NotContains(t, buf.String(), "SECRET-TOKEN-VALUE")
+	assert.NotContains(t, buf.String(), "/invite/")
+	assert.NotContains(t, buf.String(), "482913")
+	assert.NotContains(t, buf.String(), "Your code is")
+	assert.NotContains(t, buf.String(), "Open ")
+	assert.Contains(t, buf.String(), "a@b.co")
 	assert.Contains(t, buf.String(), "+254712345678")
 
 	// Outside production the developer needs to read them.
@@ -123,6 +136,60 @@ func TestSMTPMailerSendsAMessage(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("the fake SMTP server received nothing")
 	}
+}
+
+// A server that does not offer STARTTLS is not sent to: the invitation link would cross the
+// network in the clear, and "not offered" is what an attacker in the path makes it look like.
+// The fake server offers no STARTTLS; it is reached under a public-looking name so the
+// loopback exception does not apply.
+func TestSMTPMailerRefusesAServerWithoutSTARTTLS(t *testing.T) {
+	msg := Mail{To: "new.organiser@talanta.test", Subject: "Invite", Text: "Open " + secretLink}
+	viaFake := func(t *testing.T, cfg SMTPConfig) (*SMTPMailer, <-chan string) {
+		t.Helper()
+		host, port, received := fakeSMTP(t)
+		cfg.Port = 587
+		cfg.From = "no-reply@talanta.test"
+		cfg.Timeout = 3 * time.Second
+		m, err := NewSMTPMailer(cfg)
+		require.NoError(t, err)
+		m.dial = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
+		}
+		return m, received
+	}
+
+	t.Run("refused by default, and nothing of the message is sent", func(t *testing.T) {
+		m, received := viaFake(t, SMTPConfig{Host: "smtp.example.com"})
+		err := m.SendMail(context.Background(), msg)
+		require.ErrorIs(t, err, ErrSMTPNoTLS)
+		select {
+		case got := <-received:
+			t.Fatalf("the server received a full exchange: %q", got)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
+	t.Run("SMTP_ALLOW_PLAINTEXT=true sends anyway", func(t *testing.T) {
+		m, received := viaFake(t, SMTPConfig{Host: "smtp.example.com", AllowPlaintext: true})
+		require.NoError(t, m.SendMail(context.Background(), msg))
+		select {
+		case got := <-received:
+			assert.Contains(t, got, "Open "+secretLink)
+		case <-time.After(5 * time.Second):
+			t.Fatal("the fake SMTP server received nothing")
+		}
+	})
+
+	t.Run("a loopback host is allowed without TLS", func(t *testing.T) {
+		for _, host := range []string{"localhost", "127.0.0.1", "::1", "LOCALHOST"} {
+			m, received := viaFake(t, SMTPConfig{Host: host})
+			require.NoError(t, m.SendMail(context.Background(), msg), host)
+			<-received
+		}
+		for _, host := range []string{"smtp.example.com", "localhost.example.com", "10.0.0.5", "mail"} {
+			assert.False(t, isLoopbackHost(host), host)
+		}
+	})
 }
 
 func TestSMTPMailerFailsFastAndCleanly(t *testing.T) {

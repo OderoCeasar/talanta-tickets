@@ -50,9 +50,11 @@ type API struct {
 	CORSOrigins []string
 	// TrustedProxies are the networks our own reverse proxies connect from. Forwarding
 	// headers are believed only on connections from these; empty means trust nobody and use
-	// the TCP peer address.
+	// the TCP peer address. Production must say which it is: a range, or "none".
 	TrustedProxies []netip.Prefix
-	// ClientIPHeader is the header a trusted proxy puts the caller's address in.
+	// ClientIPHeader is a single-address header to believe from a trusted proxy before
+	// X-Forwarded-For. Empty by default: it is safe only when nothing but the CDN that sets
+	// it can reach the origin, or the proxy overwrites it.
 	ClientIPHeader string
 
 	// Server timeouts. WriteTimeout must outlast the slowest handler (event publish).
@@ -78,7 +80,20 @@ type API struct {
 	BootstrapAdmin BootstrapAdmin
 	// SMTP is empty (Host == "") when no mail server is configured; mail is then only logged.
 	SMTP SMTP
+
+	// Argon2MaxConcurrent caps password hashing and verification running at once.
+	Argon2MaxConcurrent int
+	// OTPCountryCodes are the calling codes (digits, no plus) sign-in SMS may be sent to.
+	OTPCountryCodes []string
+	// OTPGlobalHourlyLimit and OTPGlobalDailyLimit cap sign-in SMS across all phones.
+	OTPGlobalHourlyLimit int
+	OTPGlobalDailyLimit  int
 }
+
+// TrustNoProxies is the TRUSTED_PROXY_CIDRS value that says "the API is exposed directly:
+// believe no forwarding header". Production must write it out; an empty value there is
+// refused, because behind a proxy it would put every caller in one rate-limit bucket.
+const TrustNoProxies = "none"
 
 // BootstrapAdmin comes from BOOTSTRAP_ADMIN_EMAIL and BOOTSTRAP_ADMIN_PASSWORD.
 type BootstrapAdmin struct {
@@ -95,6 +110,8 @@ type SMTP struct {
 	Username string
 	Password string
 	From     string
+	// AllowPlaintext (SMTP_ALLOW_PLAINTEXT) permits a server with no STARTTLS.
+	AllowPlaintext bool
 }
 
 func (s SMTP) Enabled() bool { return s.Host != "" }
@@ -123,8 +140,7 @@ func LoadAPI() (API, error) {
 		Base:           l.base(),
 		Addr:           l.str("ADDR", ":8080"),
 		CORSOrigins:    l.list("CORS_ORIGINS", "http://localhost:5173"),
-		TrustedProxies: l.Prefixes("TRUSTED_PROXY_CIDRS", ""),
-		ClientIPHeader: l.str("CLIENT_IP_HEADER", "CF-Connecting-IP"),
+		ClientIPHeader: l.str("CLIENT_IP_HEADER", ""),
 		ReadTimeout:    l.duration("HTTP_READ_TIMEOUT", 15*time.Second),
 		WriteTimeout:   l.duration("HTTP_WRITE_TIMEOUT", 60*time.Second),
 		IdleTimeout:    l.duration("HTTP_IDLE_TIMEOUT", 120*time.Second),
@@ -132,8 +148,14 @@ func LoadAPI() (API, error) {
 
 		DBStatementTimeout: l.duration("DB_STATEMENT_TIMEOUT", 15*time.Second),
 		DBIdleInTxTimeout:  l.duration("DB_IDLE_IN_TX_TIMEOUT", 15*time.Second),
-		AdminBaseURL:       strings.TrimRight(l.str("ADMIN_BASE_URL", "http://localhost:5173"), "/"),
+
+		Argon2MaxConcurrent:  l.Int("ARGON2_MAX_CONCURRENT", 4),
+		OTPCountryCodes:      l.list("OTP_ALLOWED_COUNTRY_CODES", "254"),
+		OTPGlobalHourlyLimit: l.Int("OTP_GLOBAL_HOURLY_LIMIT", 2000),
+		OTPGlobalDailyLimit:  l.Int("OTP_GLOBAL_DAILY_LIMIT", 10000),
 	}
+	cfg.TrustedProxies = l.trustedProxies(cfg.Base)
+	cfg.AdminBaseURL = l.adminBaseURL(cfg.Base)
 	cfg.JWTSecret, cfg.JWTSecretIsDevDefault = l.jwtSecret(cfg.Base)
 	cfg.BootstrapAdmin = l.bootstrapAdmin()
 	cfg.SMTP = l.smtp()
@@ -141,10 +163,71 @@ func LoadAPI() (API, error) {
 	if cfg.WriteTimeout <= cfg.RequestTimeout {
 		l.fail("HTTP_WRITE_TIMEOUT (%s) must be longer than REQUEST_TIMEOUT (%s), or slow answers are cut off mid-write", cfg.WriteTimeout, cfg.RequestTimeout)
 	}
-	if u, err := url.Parse(cfg.AdminBaseURL); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		l.fail("ADMIN_BASE_URL must be an http(s) URL such as https://talanta.example.com, got %q", cfg.AdminBaseURL)
+	if cfg.Argon2MaxConcurrent < 1 {
+		l.fail("ARGON2_MAX_CONCURRENT must be at least 1, got %d", cfg.Argon2MaxConcurrent)
+	}
+	for _, code := range cfg.OTPCountryCodes {
+		if !isCallingCode(code) {
+			l.fail("OTP_ALLOWED_COUNTRY_CODES: %q is not a calling code; write digits only, such as 254", code)
+		}
+	}
+	if cfg.OTPGlobalHourlyLimit < 1 || cfg.OTPGlobalDailyLimit < 1 {
+		l.fail("OTP_GLOBAL_HOURLY_LIMIT and OTP_GLOBAL_DAILY_LIMIT must be at least 1, got %d and %d", cfg.OTPGlobalHourlyLimit, cfg.OTPGlobalDailyLimit)
 	}
 	return cfg, l.err()
+}
+
+// trustedProxies reads TRUSTED_PROXY_CIDRS. Development and test may leave it empty (the TCP
+// peer is the client). Production may not: behind Caddy an empty list makes Caddy's address
+// "the client" for everyone, so every per-IP limit becomes one shared bucket and nobody
+// notices. Production says either a range or TrustNoProxies.
+func (l *Loader) trustedProxies(b Base) []netip.Prefix {
+	raw := l.str("TRUSTED_PROXY_CIDRS", "")
+	if strings.EqualFold(raw, TrustNoProxies) {
+		return nil
+	}
+	if raw == "" && b.IsProduction() {
+		l.fail("TRUSTED_PROXY_CIDRS is required when APP_ENV=production: set it to the network your reverse proxy connects from (for example 172.16.0.0/12), or to %q if the API is exposed directly with no proxy in front", TrustNoProxies)
+		return nil
+	}
+	return l.Prefixes("TRUSTED_PROXY_CIDRS", "")
+}
+
+// adminBaseURL reads ADMIN_BASE_URL, where invitation links point. Production has no default
+// (a link to localhost is useless and looks like it worked) and must be https: the link is a
+// one-time credential.
+func (l *Loader) adminBaseURL(b Base) string {
+	fallback := ""
+	if b.AllowDevShortcuts() {
+		fallback = "http://localhost:5173"
+	}
+	raw := strings.TrimRight(l.str("ADMIN_BASE_URL", fallback), "/")
+	if raw == "" {
+		l.fail("ADMIN_BASE_URL is required when APP_ENV=production, for example https://talanta.example.com")
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		l.fail("ADMIN_BASE_URL must be an http(s) URL such as https://talanta.example.com, got %q", raw)
+		return raw
+	}
+	if b.IsProduction() && u.Scheme != "https" {
+		l.fail("ADMIN_BASE_URL must be https when APP_ENV=production, got %q", raw)
+	}
+	return raw
+}
+
+// isCallingCode reports whether s is one to three digits not starting with zero.
+func isCallingCode(s string) bool {
+	if len(s) < 1 || len(s) > 3 || s[0] == '0' {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // jwtSecret reads JWT_SECRET. Production must set its own; elsewhere a fixed, public default
@@ -197,6 +280,8 @@ func (l *Loader) smtp() SMTP {
 		Username: l.str("SMTP_USERNAME", ""),
 		Password: os.Getenv("SMTP_PASSWORD"),
 		From:     l.str("SMTP_FROM", ""),
+
+		AllowPlaintext: l.Bool("SMTP_ALLOW_PLAINTEXT", false),
 	}
 	if !s.Enabled() {
 		return SMTP{}

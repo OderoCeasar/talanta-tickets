@@ -28,8 +28,8 @@ type Mailer interface {
 // LogSMS is the mock SMS provider: it writes the message to the log instead of sending it.
 //
 // Message bodies carry secrets (sign-in codes). Outside production they are logged at info so
-// a developer can read the code; in production only at debug, so they do not sit in the
-// server's normal logs.
+// a developer can read the code. In production the body is never logged, at any level: a
+// LOG_LEVEL=debug set while chasing a fault must not turn the log into a list of live codes.
 type LogSMS struct {
 	Logger     *slog.Logger
 	Production bool
@@ -38,7 +38,6 @@ type LogSMS struct {
 func (s LogSMS) SendSMS(ctx context.Context, to, body string) error {
 	if s.Production {
 		s.Logger.InfoContext(ctx, "sms not sent: no SMS provider is configured", "to", to)
-		s.Logger.DebugContext(ctx, "sms (mock)", "to", to, "body", body)
 		return nil
 	}
 	s.Logger.InfoContext(ctx, "sms (mock)", "to", to, "body", body)
@@ -46,7 +45,7 @@ func (s LogSMS) SendSMS(ctx context.Context, to, body string) error {
 }
 
 // LogMailer is the mock mail provider. The same rule as LogSMS applies: an invitation email
-// carries the one-time link, which must not be in production logs at info level.
+// carries the one-time link, which must not be in production logs at any level.
 type LogMailer struct {
 	Logger     *slog.Logger
 	Production bool
@@ -55,7 +54,6 @@ type LogMailer struct {
 func (m LogMailer) SendMail(ctx context.Context, mail Mail) error {
 	if m.Production {
 		m.Logger.InfoContext(ctx, "mail not sent: no SMTP server is configured", "to", mail.To, "subject", mail.Subject)
-		m.Logger.DebugContext(ctx, "mail (mock)", "to", mail.To, "subject", mail.Subject, "text", mail.Text)
 		return nil
 	}
 	m.Logger.InfoContext(ctx, "mail (mock)", "to", mail.To, "subject", mail.Subject, "text", mail.Text)

@@ -302,7 +302,7 @@ func (s *Service) AcceptInvitation(ctx context.Context, token, rawName, password
 	}
 	// Hashed before the transaction: argon2 is slow on purpose and must not run while the
 	// invitation row is locked.
-	hash, err := HashPassword(password)
+	hash, err := s.hasher.Hash(ctx, password)
 	if err != nil {
 		return Session{}, err
 	}

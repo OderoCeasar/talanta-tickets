@@ -48,3 +48,19 @@ func NormalisePhone(raw string) (e164 string, ok bool) {
 	}
 	return s, true
 }
+
+// PhoneHasCountryCode reports whether e164, a number as NormalisePhone returns it, belongs to
+// one of the calling codes given as digits without the plus ("254"). Calling codes are
+// prefix-free (no code is the start of another), so a prefix match is exact.
+func PhoneHasCountryCode(e164 string, codes []string) bool {
+	rest, ok := strings.CutPrefix(e164, "+")
+	if !ok {
+		return false
+	}
+	for _, code := range codes {
+		if code != "" && strings.HasPrefix(rest, code) {
+			return true
+		}
+	}
+	return false
+}

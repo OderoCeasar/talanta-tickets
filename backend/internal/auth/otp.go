@@ -27,12 +27,51 @@ type OTPRequested struct {
 var errPhoneFormat = domain.InvalidField("phone", "e164",
 	"Enter the phone number in international format, for example +254712345678.")
 
+// errPhoneCountry is the same kind of answer as a malformed number, on the same field: the
+// number is well formed but in a country sign-in codes are not sent to.
+var errPhoneCountry = domain.InvalidField("phone", "e164",
+	"We cannot send a sign-in code to numbers from this country.")
+
+// otpPhone normalises a phone and refuses countries outside the allow-list. International SMS
+// costs many times a local one, and "send a code to any number in the world" is how SMS
+// pumping fraud is paid for.
+func (s *Service) otpPhone(raw string) (string, error) {
+	phone, ok := domain.NormalisePhone(raw)
+	if !ok {
+		return "", errPhoneFormat
+	}
+	if !domain.PhoneHasCountryCode(phone, s.otpCountryCodes) {
+		return "", errPhoneCountry
+	}
+	return phone, nil
+}
+
+// takeGlobalOTP counts one SMS against the caps across all phones. Reaching a cap is logged at
+// Error because it is the alert: either real demand has outgrown the limit or someone is
+// spending our SMS budget.
+func (s *Service) takeGlobalOTP(ctx context.Context) error {
+	for _, c := range []struct {
+		window string
+		rule   ratelimit.Rule
+	}{
+		{"hour", s.policy.OTPGlobalHourly},
+		{"day", s.policy.OTPGlobalDaily},
+	} {
+		if d := s.limiter.Take("otp:global:"+c.window, c.rule); !d.Allowed {
+			s.log.ErrorContext(ctx, "ALERT: global sign-in SMS cap reached; code requests are being refused",
+				"window", c.window, "limit", c.rule.Limit, "retry_after_seconds", ratelimit.RetryAfterSeconds(d.RetryAfter))
+			return domain.RateLimited(ratelimit.RetryAfterSeconds(d.RetryAfter))
+		}
+	}
+	return nil
+}
+
 // RequestOTP makes a new 6-digit code for the phone and sends it by SMS. The answer is the
 // same whether or not the phone has an account.
 func (s *Service) RequestOTP(ctx context.Context, rawPhone string, ip netip.Addr) (OTPRequested, error) {
-	phone, ok := domain.NormalisePhone(rawPhone)
-	if !ok {
-		return OTPRequested{}, errPhoneFormat
+	phone, err := s.otpPhone(rawPhone)
+	if err != nil {
+		return OTPRequested{}, err
 	}
 
 	// The resend gap is checked first. A refused event is not counted, so a phone tapping
@@ -42,6 +81,11 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string, ip netip.Addr
 	}
 	if d := s.limiter.Take("otp:phone:"+phone, s.policy.OTPPerPhone); !d.Allowed {
 		return OTPRequested{}, domain.RateLimited(ratelimit.RetryAfterSeconds(d.RetryAfter))
+	}
+	// Last, so only requests that would really send an SMS count against the global caps;
+	// checked first, one phone hammering "resend" could use them up without costing a cent.
+	if err := s.takeGlobalOTP(ctx); err != nil {
+		return OTPRequested{}, err
 	}
 
 	code, err := randomDigits(otpDigits)
@@ -91,9 +135,9 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string, ip netip.Addr
 // VerifyOTP exchanges a code for a session. The first good code for a phone creates its fan
 // account; an existing account keeps its role, so a gate steward signs in as gate staff.
 func (s *Service) VerifyOTP(ctx context.Context, rawPhone, code string) (Session, error) {
-	phone, ok := domain.NormalisePhone(rawPhone)
-	if !ok {
-		return Session{}, errPhoneFormat
+	phone, err := s.otpPhone(rawPhone)
+	if err != nil {
+		return Session{}, err
 	}
 	now := s.now()
 

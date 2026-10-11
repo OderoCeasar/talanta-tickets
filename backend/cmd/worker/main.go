@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/auth"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/worker"
@@ -38,7 +40,7 @@ func run() error {
 	}
 	defer pool.Close()
 
-	jobs := jobs(cfg)
+	jobs := jobs(cfg, pool, logger)
 	logger.Info("worker started", "jobs", len(jobs))
 	worker.Run(ctx, logger, jobs...)
 	logger.Info("worker stopped")
@@ -46,6 +48,29 @@ func run() error {
 }
 
 // jobs lists the background work. Each owner adds its job here.
-func jobs(_ config.Worker) []worker.Job {
-	return nil
+func jobs(_ config.Worker, db store.DBTX, logger *slog.Logger) []worker.Job {
+	return []worker.Job{
+		authCleanupJob(db, logger),
+	}
+}
+
+// authCleanupJob deletes sign-in codes and refresh tokens long past any use (see
+// auth.Cleanup for what "long past" means). Hourly is plenty: it bounds table growth, nothing
+// reads the rows it removes.
+func authCleanupJob(db store.DBTX, logger *slog.Logger) worker.Job {
+	return worker.Job{
+		Name:     "auth-cleanup",
+		Interval: time.Hour,
+		Timeout:  5 * time.Minute,
+		Run: func(ctx context.Context) error {
+			n, err := auth.Cleanup(ctx, db, time.Now())
+			if err != nil {
+				return err
+			}
+			if n.OTPCodes > 0 || n.RefreshTokens > 0 {
+				logger.InfoContext(ctx, "auth cleanup", "job", "auth-cleanup", "otp_codes_deleted", n.OTPCodes, "refresh_tokens_deleted", n.RefreshTokens)
+			}
+			return nil
+		},
+	}
 }

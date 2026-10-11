@@ -232,6 +232,7 @@ type envConfig struct {
 	policy       auth.Policy
 	limits       httpapi.RateLimits
 	mailErr      error
+	otpCountries []string
 }
 
 type envOption func(*envConfig)
@@ -246,6 +247,11 @@ func withLimits(fn func(*httpapi.RateLimits)) envOption {
 }
 
 func withMailError(err error) envOption { return func(c *envConfig) { c.mailErr = err } }
+
+// withOTPCountries sets OTP_ALLOWED_COUNTRY_CODES; without it the default (254) applies.
+func withOTPCountries(codes ...string) envOption {
+	return func(c *envConfig) { c.otpCountries = codes }
+}
 
 // env is one API instance (its own limiter, clock, SMS and mail boxes) on the shared database.
 type env struct {
@@ -293,6 +299,8 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 		Limiter:      limiter,
 		Policy:       cfg.policy,
 		Now:          e.clock.Now,
+
+		OTPCountryCodes: cfg.otpCountries,
 	})
 	require.NoError(t, err)
 	e.auth = svc

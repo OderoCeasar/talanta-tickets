@@ -22,17 +22,30 @@ func clearAPIEnv(t *testing.T) {
 		"TRUSTED_PROXY_CIDRS", "CLIENT_IP_HEADER",
 		"HTTP_READ_TIMEOUT", "HTTP_WRITE_TIMEOUT", "HTTP_IDLE_TIMEOUT", "REQUEST_TIMEOUT",
 		"DB_STATEMENT_TIMEOUT", "DB_IDLE_IN_TX_TIMEOUT",
+		"SMTP_ALLOW_PLAINTEXT", "ARGON2_MAX_CONCURRENT",
+		"OTP_ALLOWED_COUNTRY_CODES", "OTP_GLOBAL_HOURLY_LIMIT", "OTP_GLOBAL_DAILY_LIMIT",
 	} {
 		t.Setenv(k, "")
 	}
 	t.Setenv("DATABASE_URL", "postgres://x")
 }
 
+// productionEnv is clearAPIEnv plus the least a production server must set, so each test
+// below can then take one of them away.
+func productionEnv(t *testing.T) {
+	t.Helper()
+	clearAPIEnv(t)
+	t.Setenv("APP_ENV", "production")
+	t.Setenv("JWT_SECRET", goodSecret)
+	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
+	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+}
+
 // Production mode fails closed: a server whose env file was lost must not come up with
 // development shortcuts on.
 func TestAppEnvUnsetMeansProduction(t *testing.T) {
-	clearAPIEnv(t)
-	t.Setenv("JWT_SECRET", goodSecret)
+	productionEnv(t)
+	t.Setenv("APP_ENV", "")
 
 	cfg, err := LoadAPI()
 	require.NoError(t, err)
@@ -66,8 +79,7 @@ func TestAppEnvIsMatchedExactly(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run("APP_ENV="+tc.value, func(t *testing.T) {
-			clearAPIEnv(t)
-			t.Setenv("JWT_SECRET", goodSecret)
+			productionEnv(t)
 			t.Setenv("APP_ENV", tc.value)
 
 			cfg, err := LoadAPI()
@@ -123,9 +135,7 @@ func TestJWTSecretRules(t *testing.T) {
 	})
 
 	t.Run("a set secret is used as is", func(t *testing.T) {
-		clearAPIEnv(t)
-		t.Setenv("APP_ENV", "production")
-		t.Setenv("JWT_SECRET", goodSecret)
+		productionEnv(t)
 		cfg, err := LoadAPI()
 		require.NoError(t, err)
 		assert.Equal(t, goodSecret, string(cfg.JWTSecret))
@@ -155,9 +165,7 @@ func TestJWTSecretRules(t *testing.T) {
 
 func TestBootstrapAdminSettings(t *testing.T) {
 	load := func(t *testing.T, email, password string) (API, error) {
-		clearAPIEnv(t)
-		t.Setenv("APP_ENV", "production")
-		t.Setenv("JWT_SECRET", goodSecret)
+		productionEnv(t)
 		t.Setenv("BOOTSTRAP_ADMIN_EMAIL", email)
 		t.Setenv("BOOTSTRAP_ADMIN_PASSWORD", password)
 		return LoadAPI()
@@ -215,7 +223,7 @@ func TestProxyTimeoutAndURLSettings(t *testing.T) {
 	cfg, err := LoadAPI()
 	require.NoError(t, err)
 	assert.Empty(t, cfg.TrustedProxies, "by default nobody's forwarding headers are believed")
-	assert.Equal(t, "CF-Connecting-IP", cfg.ClientIPHeader)
+	assert.Equal(t, "", cfg.ClientIPHeader, "no single-address header is believed unless the operator opts in")
 	assert.Equal(t, 15*time.Second, cfg.ReadTimeout)
 	assert.Equal(t, 60*time.Second, cfg.WriteTimeout)
 	assert.Equal(t, 120*time.Second, cfg.IdleTimeout)
@@ -233,6 +241,17 @@ func TestProxyTimeoutAndURLSettings(t *testing.T) {
 	assert.Equal(t, "10.1.2.3/32", cfg.TrustedProxies[1].String())
 	assert.Equal(t, "https://talanta.example.com", cfg.AdminBaseURL, "trailing slash dropped so links do not get a double one")
 
+	t.Setenv("CLIENT_IP_HEADER", "CF-Connecting-IP")
+	cfg, err = LoadAPI()
+	require.NoError(t, err)
+	assert.Equal(t, "CF-Connecting-IP", cfg.ClientIPHeader, "the header is still there for those who ask for it")
+	t.Setenv("CLIENT_IP_HEADER", "")
+
+	t.Setenv("TRUSTED_PROXY_CIDRS", "none")
+	cfg, err = LoadAPI()
+	require.NoError(t, err)
+	assert.Empty(t, cfg.TrustedProxies, `"none" trusts nobody`)
+
 	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12,everyone")
 	_, err = LoadAPI()
 	require.ErrorContains(t, err, "TRUSTED_PROXY_CIDRS")
@@ -246,4 +265,126 @@ func TestProxyTimeoutAndURLSettings(t *testing.T) {
 	t.Setenv("HTTP_WRITE_TIMEOUT", "20s")
 	_, err = LoadAPI()
 	require.ErrorContains(t, err, "HTTP_WRITE_TIMEOUT")
+}
+
+// Production must say where its proxy is. An empty list behind Caddy would make Caddy "the
+// client" for every request and put all callers in one rate-limit bucket, silently.
+func TestProductionRequiresTrustedProxiesOrNone(t *testing.T) {
+	for _, env := range []string{"production", ""} {
+		t.Run("empty is refused, APP_ENV="+env, func(t *testing.T) {
+			productionEnv(t)
+			t.Setenv("APP_ENV", env)
+			t.Setenv("TRUSTED_PROXY_CIDRS", "")
+			_, err := LoadAPI()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "TRUSTED_PROXY_CIDRS is required when APP_ENV=production")
+			assert.Contains(t, err.Error(), `"none"`, "the message names the way out")
+		})
+	}
+
+	t.Run("a range is accepted", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
+		cfg, err := LoadAPI()
+		require.NoError(t, err)
+		require.Len(t, cfg.TrustedProxies, 1)
+	})
+
+	for _, v := range []string{"none", "NONE", " none "} {
+		t.Run("explicit "+v+" means exposed directly, trust nobody", func(t *testing.T) {
+			productionEnv(t)
+			t.Setenv("TRUSTED_PROXY_CIDRS", v)
+			cfg, err := LoadAPI()
+			require.NoError(t, err)
+			assert.Empty(t, cfg.TrustedProxies)
+		})
+	}
+
+	for _, env := range []string{"development", "test"} {
+		t.Run("empty stays the default in "+env, func(t *testing.T) {
+			clearAPIEnv(t)
+			t.Setenv("APP_ENV", env)
+			cfg, err := LoadAPI()
+			require.NoError(t, err)
+			assert.Empty(t, cfg.TrustedProxies)
+		})
+	}
+}
+
+// Invitation links are one-time credentials: production must name a real https address.
+func TestAdminBaseURLInProduction(t *testing.T) {
+	t.Run("required", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("ADMIN_BASE_URL", "")
+		_, err := LoadAPI()
+		require.ErrorContains(t, err, "ADMIN_BASE_URL is required when APP_ENV=production")
+	})
+	for _, v := range []string{"http://talanta.example.com", "http://localhost:5173"} {
+		t.Run("must be https: "+v, func(t *testing.T) {
+			productionEnv(t)
+			t.Setenv("ADMIN_BASE_URL", v)
+			_, err := LoadAPI()
+			require.ErrorContains(t, err, "ADMIN_BASE_URL must be https when APP_ENV=production")
+		})
+	}
+	t.Run("https is accepted", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com/")
+		cfg, err := LoadAPI()
+		require.NoError(t, err)
+		assert.Equal(t, "https://talanta.example.com", cfg.AdminBaseURL)
+	})
+	t.Run("development keeps the localhost default and may use http", func(t *testing.T) {
+		clearAPIEnv(t)
+		t.Setenv("APP_ENV", "development")
+		cfg, err := LoadAPI()
+		require.NoError(t, err)
+		assert.Equal(t, "http://localhost:5173", cfg.AdminBaseURL)
+	})
+}
+
+func TestArgon2OTPAndSMTPPlaintextSettings(t *testing.T) {
+	clearAPIEnv(t)
+	t.Setenv("APP_ENV", "development")
+
+	cfg, err := LoadAPI()
+	require.NoError(t, err)
+	assert.Equal(t, 4, cfg.Argon2MaxConcurrent)
+	assert.Equal(t, []string{"254"}, cfg.OTPCountryCodes)
+	assert.Equal(t, 2000, cfg.OTPGlobalHourlyLimit)
+	assert.Equal(t, 10000, cfg.OTPGlobalDailyLimit)
+
+	t.Setenv("ARGON2_MAX_CONCURRENT", "2")
+	t.Setenv("OTP_ALLOWED_COUNTRY_CODES", "254, 255,256")
+	t.Setenv("OTP_GLOBAL_HOURLY_LIMIT", "50")
+	t.Setenv("OTP_GLOBAL_DAILY_LIMIT", "400")
+	t.Setenv("SMTP_HOST", "smtp.example.com")
+	t.Setenv("SMTP_FROM", "a@b.co")
+	cfg, err = LoadAPI()
+	require.NoError(t, err)
+	assert.Equal(t, 2, cfg.Argon2MaxConcurrent)
+	assert.Equal(t, []string{"254", "255", "256"}, cfg.OTPCountryCodes)
+	assert.Equal(t, 50, cfg.OTPGlobalHourlyLimit)
+	assert.Equal(t, 400, cfg.OTPGlobalDailyLimit)
+	assert.False(t, cfg.SMTP.AllowPlaintext, "plaintext mail is off unless asked for")
+
+	t.Setenv("SMTP_ALLOW_PLAINTEXT", "true")
+	cfg, err = LoadAPI()
+	require.NoError(t, err)
+	assert.True(t, cfg.SMTP.AllowPlaintext)
+
+	for key, bad := range map[string]string{
+		"ARGON2_MAX_CONCURRENT":     "0",
+		"OTP_ALLOWED_COUNTRY_CODES": "+254",
+		"OTP_GLOBAL_HOURLY_LIMIT":   "0",
+		"OTP_GLOBAL_DAILY_LIMIT":    "-1",
+		"SMTP_ALLOW_PLAINTEXT":      "maybe",
+	} {
+		t.Run(key+"="+bad, func(t *testing.T) {
+			t.Setenv(key, bad)
+			_, err := LoadAPI()
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), key)
+		})
+	}
 }

@@ -69,38 +69,40 @@ func TestStaffLogin_WrongPasswordAndUnknownEmailLookTheSame(t *testing.T) {
 }
 
 // An unknown email costs one argon2 verification, like a wrong password, so the two cannot
-// be told apart with a stopwatch. Compared against a request that does no hashing at all.
-func TestStaffLogin_UnknownEmailTakesAsLongAsAWrongPassword(t *testing.T) {
+// be told apart with a stopwatch. Counted, not timed: the service reports how many
+// verifications it has completed, and a wall-clock ratio on a loaded CI machine proves
+// nothing either way.
+func TestStaffLogin_UnknownEmailStillVerifiesOneHash(t *testing.T) {
 	e := newEnv(t)
 	u := e.newStaff(domain.RoleAdmin)
 
-	median := func(fn func()) time.Duration {
-		var ds []time.Duration
-		for i := 0; i < 5; i++ {
-			start := time.Now()
-			fn()
-			ds = append(ds, time.Since(start))
-		}
-		for i := range ds {
-			for j := i + 1; j < len(ds); j++ {
-				if ds[j] < ds[i] {
-					ds[i], ds[j] = ds[j], ds[i]
-				}
-			}
-		}
-		return ds[len(ds)/2]
+	verifications := func(fn func()) uint64 {
+		before := e.auth.PasswordVerifications()
+		fn()
+		return e.auth.PasswordVerifications() - before
 	}
-	wrongPassword := median(func() { e.loginRaw(*u.Email, "not-the-password") })
-	e2 := newEnv(t)
-	unknownEmail := median(func() { e2.loginRaw(randEmail(t, "nobody"), "not-the-password") })
-	e3 := newEnv(t)
-	noHashing := median(func() { e3.do("POST", "/auth/login", `{"email":"nope"}`, "") })
 
-	t.Logf("wrong password %s, unknown email %s, no hashing %s", wrongPassword, unknownEmail, noHashing)
-	assert.Greater(t, unknownEmail, 5*noHashing, "an unknown email must still pay for a hash")
-	ratio := float64(unknownEmail) / float64(wrongPassword)
-	assert.Greater(t, ratio, 0.5, "unknown email and wrong password should take about as long")
-	assert.Less(t, ratio, 2.0, "unknown email and wrong password should take about as long")
+	assert.Equal(t, uint64(1), verifications(func() {
+		wantError(t, e.loginRaw(*u.Email, "not-the-password"), http.StatusUnauthorized, domain.CodeInvalidCredentials)
+	}), "wrong password")
+	assert.Equal(t, uint64(1), verifications(func() {
+		wantError(t, e.loginRaw(randEmail(t, "nobody"), "not-the-password"), http.StatusUnauthorized, domain.CodeInvalidCredentials)
+	}), "unknown email: the dummy hash must be verified")
+
+	// An account that exists but cannot sign in by password pays for one too.
+	phone, email := randPhone(t), randEmail(t, "fan")
+	_, err := e.q.CreateUser(context.Background(), store.CreateUserParams{PhoneE164: &phone, Email: &email, Role: "FAN"})
+	require.NoError(t, err)
+	assert.Equal(t, uint64(1), verifications(func() {
+		wantError(t, e.loginRaw(email, "not-the-password"), http.StatusUnauthorized, domain.CodeInvalidCredentials)
+	}), "fan with no password")
+
+	// The control: a request refused before the service is reached hashes nothing, so the
+	// counter really does move only when argon2 runs.
+	assert.Equal(t, uint64(0), verifications(func() {
+		wantFields(t, e.do("POST", "/auth/login", `{"email":"nope"}`, ""), "email", "password")
+	}), "malformed body")
+	assert.Equal(t, uint64(1), verifications(func() { e.login(*u.Email, staffPassword) }), "good password")
 }
 
 func TestStaffLogin_AccountsThatCannotUseAPassword(t *testing.T) {
@@ -270,7 +272,13 @@ func TestStaffLogin_TOTPWrongCode(t *testing.T) {
 	}
 	wantError(t, e.totpVerify(mfaToken, e.totpCode(secret)), http.StatusUnauthorized, domain.CodeMFATokenInvalid)
 
-	// Starting again at the password works.
+	// Starting again at the password does not buy more tries: the five wrong codes are counted
+	// against the user, so a fresh token and the right code are refused until the window ends.
+	rec := e.totpVerify(e.passwordStep(*u.Email), e.totpCode(secret))
+	wantError(t, rec, http.StatusTooManyRequests, domain.CodeRateLimited)
+	assert.NotEmpty(t, rec.Header().Get("Retry-After"))
+
+	e.clock.Advance(15*time.Minute + time.Second)
 	require.Equal(t, http.StatusOK, e.totpVerify(e.passwordStep(*u.Email), e.totpCode(secret)).Code)
 }
 

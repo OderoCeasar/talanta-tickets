@@ -112,7 +112,9 @@ One line each: what was chosen and why. Newest at the bottom.
   function that reads them.
 - **Per-IP limits are loose, per-phone and per-email limits are tight.** Kenyan mobile networks
   put thousands of phones behind one address; a tight per-IP limit would lock out a stadium
-  of fans. SMS cost is capped per phone (one code a minute, five an hour).
+  of fans. The per-phone limit (one code a minute, five an hour) protects one number; it does
+  not cap SMS cost, because an attacker uses a new number each time. Cost is bounded by the
+  country allow-list and the global hourly and daily caps (see below).
 - **Access tokens carry `sid` (the refresh-token family) beside `sub`, `role`, `iat`, `exp`,
   `jti`.** "Change password signs out my other sessions" needs to know which session is
   calling. The MFA token is signed with a key derived from `JWT_SECRET`, so it can never
@@ -127,3 +129,64 @@ One line each: what was chosen and why. Newest at the bottom.
 - **`/v1/admin` and `/v1/gate` are sub-routers with a catch-all route.** Their auth and role
   middleware then runs for every path under the prefix, existing or not, so a fan gets 403
   rather than a 404 that maps the admin API.
+- **Mobile server data is `@tanstack/react-query` 5.104.1.** The fixed choice in `CLAUDE.md`, and the
+  same version the admin uses so the hoisted workspace holds one copy.
+- **Mobile local state is `zustand` 5.0.15.** The fixed choice in `CLAUDE.md`; it holds only the
+  tapped seat IDs and the hold expiry.
+- **`react-native-svg` 15.15.4 and `@shopify/react-native-skia` 2.6.2 draw the seat map.** The fixed
+  choices in `CLAUDE.md` (§5.2: SVG up to about 1,200 seats, Skia above); versions are the ones
+  `expo install` picks for SDK 57, and both ship in Expo Go.
+- **`expo-secure-store` 57.0.4 holds the mobile tokens.** Access and refresh tokens go in the
+  Android Keystore / iOS Keychain, never in plain storage.
+- **`@react-native-async-storage/async-storage` 2.2.0 holds the offline copy of the tickets.** Also
+  the signed-in user and the pointer used to resume a checkout. Nothing secret. An explicit
+  cache of one answer was simpler to reason about than persisting the whole query cache.
+- **`expo-brightness` 57.0.2 raises screen brightness on the ticket screen.** A dim screen is the
+  usual reason a QR will not scan; the system level is restored on leaving.
+- **`expo-crypto` 57.0.3 makes the checkout idempotency key.** `randomUUID()` from the platform's
+  secure random source; Hermes has no `crypto.randomUUID`.
+- **`qrcode-generator` 2.0.4 draws the ticket QR in the app.** Same library and version the admin
+  uses; it only computes the modules, which the app draws with react-native-svg.
+- **Mobile unit tests run on `vitest` 3.2.7.** The tested code is pure TypeScript (no React Native
+  imports), so the runner the shared package already uses is enough and `jest-expo` is not needed.
+- **Mobile shows Nairobi time with a fixed UTC+3 offset, not `Intl`.** Kenya has no daylight
+  saving, and `Intl` time-zone support differs between Hermes builds; the fixed offset gives
+  the same text on every phone and is unit-tested.
+- **The mobile app creates the booking when checkout opens, not when Pay is tapped.** `Hold` has
+  no fee, so only a booking can tell the fan the total before they are asked to pay it. The
+  idempotency key is made once per hold and "Pay" resends it, so nothing is created twice.
+- **Mobile `EXPO_PUBLIC_API_URL` is the origin without `/v1`.** That is what `eas.json` already sets
+  for preview and production; the app appends the prefix.
+- **TOTP codes at sign-in are counted per user, five per 15 minutes, in the rate limiter.**
+  The per-token count was no limit: every good password minted a new token. Every code tried
+  is counted before it is checked (so parallel guesses share the five) and a finished sign-in
+  clears the count; once it is reached even the right code answers 429 until the window ends.
+- **A good password does not clear the per-email login count when TOTP is on.** Only the TOTP
+  step does, otherwise a known password is an unlimited supply of password steps.
+- **`CLIENT_IP_HEADER` is empty by default.** Caddy passes `CF-Connecting-IP` through from
+  whoever reaches the origin, so believing it let a caller choose their rate-limit bucket.
+  The right-to-left `X-Forwarded-For` walk is the default; the header is opt-in for origins
+  only the CDN can reach.
+- **Production refuses an empty `TRUSTED_PROXY_CIDRS`; `none` means "exposed directly".**
+  Empty behind a proxy puts every caller in one bucket without any sign of it, so the operator
+  has to say which of the two set-ups this is.
+- **At most `ARGON2_MAX_CONCURRENT` (4) argon2 runs at once, behind one semaphore in
+  `auth.passwordHasher`.** Login needs no account, so uncapped it is 19 MiB and a core per
+  request for anyone. Waiters queue on the request context and get 429 when it ends; there is
+  no 503 code in the contract.
+- **Sign-in SMS go only to `OTP_ALLOWED_COUNTRY_CODES` (default 254), with global caps of
+  2,000 an hour and 10,000 a day.** International SMS is what pumping fraud bills; the caps
+  bound the worst day, and reaching one is logged at error as the alert. The caps are counted
+  last so a request refused for its own phone's limit does not use them up.
+- **SMTP requires TLS (STARTTLS, or implicit on 465) except to loopback or with
+  `SMTP_ALLOW_PLAINTEXT=true`.** "STARTTLS when offered" is downgraded by anyone in the path;
+  a failed send does not fail the invitation.
+- **The mock SMS and mailer never log a body in production, at any level.** Debug logging is
+  switched on exactly when someone is investigating, which is when codes must not leak.
+- **`ADMIN_BASE_URL` has no default in production and must be https.** The invite link is a
+  one-time credential; a localhost or http link is a silent failure or a leak.
+- **`auth.Cleanup` runs hourly in the worker as `auth-cleanup`.** It deletes sign-in codes
+  older than 24 hours and refresh tokens expired more than 7 days; it is a plain function, not
+  a `Service` method, because the worker has no JWT secret.
+- **TOTP enrolment still does not ask for the password.** Asking would change the contract
+  and the admin UI; it is listed in `docs/STATUS.md` as a known limit instead.
