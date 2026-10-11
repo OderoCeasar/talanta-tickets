@@ -103,6 +103,7 @@ func run() error {
 	publishTimeout := max(cfg.WriteTimeout-5*time.Second, cfg.RequestTimeout)
 	eventPolicy := events.DefaultPolicy()
 	eventPolicy.PublishTimeout = publishTimeout
+	eventPolicy.CancelTimeout = publishTimeout
 	eventService, err := events.NewService(events.Config{DB: pool, Logger: logger, Policy: eventPolicy})
 	if err != nil {
 		return err

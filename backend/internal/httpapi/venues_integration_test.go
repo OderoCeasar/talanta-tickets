@@ -266,6 +266,16 @@ func TestGenerateSeats(t *testing.T) {
 
 	wantFields(t, e.do("POST", gen, obj{"rows": 3, "seats_per_row": 4, "row_offsets": []float64{1, 2}}, token), "row_offsets")
 	wantFields(t, e.do("POST", gen, obj{"rows": 201, "seats_per_row": 0}, token), "rows", "seats_per_row")
+	// Each number is within its own limit, but together they ask for 100,000 seats (and
+	// 3,050): refused on both fields, for a preview too, and nothing is written.
+	for _, b := range []obj{
+		{"rows": 200, "seats_per_row": 500}, {"rows": 200, "seats_per_row": 500, "dry_run": true}, {"rows": 61, "seats_per_row": 50, "dry_run": true},
+	} {
+		rules = wantFields(t, e.do("POST", gen, b, token), "rows", "seats_per_row")
+		assert.Equal(t, "max_seats", rules["rows"])
+		assert.Equal(t, "max_seats", rules["seats_per_row"])
+	}
+	assert.Equal(t, 12, queryInt(t, `SELECT count(*) FROM seats WHERE block_id = $1`, blockID))
 	wantFields(t, e.do("POST", gen, obj{"rows": 1, "seats_per_row": 1, "row_label_scheme": "ROMAN", "numbering_direction": "UP"}, token), "row_label_scheme", "numbering_direction")
 	wantError(t, e.do("POST", "/admin/blocks/999999999/generate-seats", obj{"rows": 1, "seats_per_row": 1}, token), http.StatusNotFound, domain.CodeNotFound)
 	wantError(t, e.do("GET", "/admin/blocks/999999999/seats", nil, token), http.StatusNotFound, domain.CodeNotFound)

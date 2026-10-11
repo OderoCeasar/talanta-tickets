@@ -41,6 +41,7 @@ const (
 	CodeEventNotReady              Code = "EVENT_NOT_READY"
 	CodeInvalidStateTransition     Code = "INVALID_STATE_TRANSITION"
 	CodeEventNotEditable           Code = "EVENT_NOT_EDITABLE"
+	CodeEventBusy                  Code = "EVENT_BUSY"
 	CodeBlockHasInventory          Code = "BLOCK_HAS_INVENTORY"
 	CodeCategoryInUse              Code = "CATEGORY_IN_USE"
 	CodeConfirmationRequired       Code = "CONFIRMATION_REQUIRED"

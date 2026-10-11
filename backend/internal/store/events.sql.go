@@ -86,6 +86,9 @@ DELETE FROM events WHERE id = $1 AND status = 'DRAFT'
 `
 
 // Only a draft can be deleted: once published an event has inventory and may have sales.
+// The caller holds the event's lock (LockEvent) and has read the status under it; the
+// status condition here is a second guard, not the check. Categories and painting go with
+// the event through ON DELETE CASCADE.
 func (q *Queries) DeleteDraftEvent(ctx context.Context, id int64) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteDraftEvent, id)
 	if err != nil {
@@ -442,8 +445,9 @@ SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kic
 // applying a template, editing the event, cancel) take this lock first and then check the
 // status they just read. So a paint either commits before publish reads the painting, or
 // waits, sees the event is no longer DRAFT and is refused; event_seats.category_id can never
-// differ from the painting. Two publishes of one event also queue here, and the second finds
-// the event already published.
+// differ from the painting. Two publishes of one event also take turns here, and the second
+// finds the event already published (or, if the first is still copying seats when its wait
+// runs out, is told the event is busy).
 //
 // Before the row lock it takes the event's GATE: a transaction-level advisory lock on the
 // event, exclusive. Holds take the same gate shared (store/holds.go, lockEventForHold). The
@@ -452,6 +456,11 @@ SELECT e.id, e.venue_id, e.title, e.competition, e.home_team, e.away_team, e.kic
 // price change waited until the rush was over (measured: the whole of a 1,000-request storm).
 // Advisory locks queue in order, so with the gate a writer waits only for the holds already
 // in flight, and the holds that arrive after it wait for it. Order: gate, then row.
+//
+// Services call it through LockEventWithin (store/locks.go), which bounds the wait with
+// lock_timeout: a publish or a cancel of a full stadium keeps both locks for many seconds,
+// and a request queued behind one gives up with EVENT_BUSY instead of running into the
+// statement timeout. A second publish no longer queues here until the first is done.
 func (q *Queries) LockEvent(ctx context.Context, id int64) (Event, error) {
 	row := q.db.QueryRow(ctx, lockEvent, id)
 	var i Event

@@ -1,6 +1,7 @@
 package events
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -79,9 +80,10 @@ type Sales struct {
 
 // SalesQuery is the time series part of a sales request.
 type SalesQuery struct {
-	// Bucket is BucketHour or BucketDay; empty means hour.
+	// Bucket is BucketHour or BucketDay; empty lets the range decide (seriesRange).
 	Bucket string
-	// From defaults to the first paid booking, To to now.
+	// From defaults to the first paid booking (or later, to keep the series within
+	// MaxSeriesPoints), To to now.
 	From, To *time.Time
 }
 
@@ -94,10 +96,7 @@ func (s *Service) Sales(ctx context.Context, eventID int64, query SalesQuery) (S
 	}
 	ev := row.Event
 	now := s.now()
-	if query.Bucket == "" {
-		query.Bucket = BucketHour
-	}
-	out := Sales{EventID: eventID, GeneratedAt: now, Bucket: query.Bucket, Categories: []SalesCategory{}, Blocks: []SalesBlock{}, Points: []SalesPoint{}}
+	out := Sales{EventID: eventID, GeneratedAt: now, Categories: []SalesCategory{}, Blocks: []SalesBlock{}, Points: []SalesPoint{}}
 
 	totals, err := s.q.GetEventSalesTotals(ctx, eventID)
 	if err != nil {
@@ -144,51 +143,84 @@ func (s *Service) Sales(ctx context.Context, eventID int64, query SalesQuery) (S
 	}
 	sort.Slice(out.Blocks, func(i, j int) bool { return out.Blocks[i].BlockID < out.Blocks[j].BlockID })
 
-	out.Points, err = s.series(ctx, eventID, query, now)
+	out.Bucket, out.Points, err = s.series(ctx, eventID, query, now)
 	return out, err
 }
 
-// series builds the time series with a point for every bucket in range, sales or not.
-func (s *Service) series(ctx context.Context, eventID int64, query SalesQuery, now time.Time) ([]SalesPoint, error) {
+// hourBucketSpan is the longest range that gets hour buckets when the caller did not choose a
+// bucket: two days of hours is a readable chart, two months of them is not.
+const hourBucketSpan = 48 * time.Hour
+
+// seriesRange settles the bucket and the start of a time series.
+//
+// A caller who sends neither bucket nor from must always get an answer, however long the
+// event has been on sale (the default call used to fail with a 400 on `from`, a field the
+// caller never sent, 83 days after the first sale). So what the caller left out is chosen
+// to fit: no bucket means hours up to hourBucketSpan and days beyond it; no from means the
+// first sale, moved forward to the most recent maxPoints buckets when there would be more.
+// Only a from the caller sent can be too far back, and that is still refused.
+//
+// givenFrom is nil when the caller sent none; first is then where the data starts.
+func seriesRange(bucket string, givenFrom *time.Time, first, to time.Time, maxPoints int) (string, time.Time, error) {
+	from := first
+	if givenFrom != nil {
+		from = *givenFrom
+	}
+	if bucket == "" {
+		bucket = BucketHour
+		if to.Sub(from) > hourBucketSpan {
+			bucket = BucketDay
+		}
+	}
+	width := nextBucket(bucket, time.Time{}).Sub(time.Time{})
+	// `to` is exclusive: the last bucket is the one holding the instant before it.
+	last := bucketStart(bucket, to.Add(-time.Nanosecond))
+	if points := int(last.Sub(bucketStart(bucket, from))/width) + 1; points > maxPoints {
+		if givenFrom != nil {
+			return bucket, from, domain.InvalidField("from", "range", fmt.Sprintf(
+				"That range has more than %d %s buckets. Use a shorter range or bucket=day.", maxPoints, bucket))
+		}
+		from = last.Add(-time.Duration(maxPoints-1) * width)
+	}
+	return bucket, from, nil
+}
+
+// series builds the time series with a point for every bucket in range, sales or not, and
+// says which bucket it used.
+func (s *Service) series(ctx context.Context, eventID int64, query SalesQuery, now time.Time) (string, []SalesPoint, error) {
 	points := []SalesPoint{}
 	to := now
 	if query.To != nil {
 		to = *query.To
 	}
-	var from time.Time
-	if query.From != nil {
-		from = *query.From
-	} else {
-		first, err := s.q.GetFirstPaidAt(ctx, eventID)
-		if errors.Is(err, store.ErrNoRows) {
-			return points, nil
+	first := to
+	if query.From == nil {
+		var err error
+		first, err = s.q.GetFirstPaidAt(ctx, eventID)
+		if errors.Is(err, store.ErrNoRows) || (err == nil && !to.After(first)) {
+			// No sale yet, or the first one is later than the requested end: nothing to show.
+			return cmp.Or(query.Bucket, BucketHour), points, nil
 		}
 		if err != nil {
-			return nil, fmt.Errorf("first paid booking of event %d: %w", eventID, err)
+			return "", nil, fmt.Errorf("first paid booking of event %d: %w", eventID, err)
 		}
-		from = first
-	}
-	if !to.After(from) {
-		if query.From == nil {
-			// The first sale is later than the requested end: nothing to show.
-			return points, nil
-		}
-		return nil, domain.InvalidField("to", "after_from", "Must be later than from.")
+	} else if !to.After(*query.From) {
+		return "", nil, domain.InvalidField("to", "after_from", "Must be later than from.")
 	}
 
-	for start := bucketStart(query.Bucket, from); start.Before(to); start = nextBucket(query.Bucket, start) {
-		if len(points) == s.policy.MaxSeriesPoints {
-			return nil, domain.InvalidField("from", "range", fmt.Sprintf(
-				"That range has more than %d %s buckets. Use a shorter range or bucket=day.", s.policy.MaxSeriesPoints, query.Bucket))
-		}
+	bucket, from, err := seriesRange(query.Bucket, query.From, first, to, s.policy.MaxSeriesPoints)
+	if err != nil {
+		return "", nil, err
+	}
+	for start := bucketStart(bucket, from); start.Before(to); start = nextBucket(bucket, start) {
 		points = append(points, SalesPoint{Start: start})
 	}
 
 	rows, err := s.q.ListPaidBookingBuckets(ctx, store.ListPaidBookingBucketsParams{
-		Bucket: query.Bucket, EventID: eventID, FromAt: from, ToAt: to,
+		Bucket: bucket, EventID: eventID, FromAt: from, ToAt: to,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("sales series of event %d: %w", eventID, err)
+		return "", nil, fmt.Errorf("sales series of event %d: %w", eventID, err)
 	}
 	index := make(map[int64]int, len(points))
 	for i, p := range points {
@@ -197,11 +229,11 @@ func (s *Service) series(ctx context.Context, eventID int64, query SalesQuery, n
 	for _, r := range rows {
 		i, ok := index[r.BucketStart.Unix()]
 		if !ok {
-			return nil, fmt.Errorf("sales series of event %d: bucket %s from the database is not on a %s boundary", eventID, r.BucketStart, query.Bucket)
+			return "", nil, fmt.Errorf("sales series of event %d: bucket %s from the database is not on a %s boundary", eventID, r.BucketStart, bucket)
 		}
 		points[i].Bookings, points[i].Tickets, points[i].RevenueCents = int(r.Bookings), int(r.Tickets), r.RevenueCents
 	}
-	return points, nil
+	return bucket, points, nil
 }
 
 // AdminBooking is one booking on the organiser's list.

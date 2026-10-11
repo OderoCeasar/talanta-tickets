@@ -243,6 +243,8 @@ type envConfig struct {
 	// holdDB is the pool the hold service runs on; nil means the shared one.
 	holdDB       booking.DB
 	otpCountries []string
+	// venueLockWait is how long a layout change waits for a publish; zero means the default.
+	venueLockWait time.Duration
 }
 
 type envOption func(*envConfig)
@@ -324,6 +326,9 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	e.events, err = events.NewService(events.Config{DB: db.Pool, Logger: logger, Policy: cfg.eventPolicy, Now: e.clock.Now})
 	require.NoError(t, err)
 	e.venues = venue.NewService(db.Pool)
+	if cfg.venueLockWait > 0 {
+		e.venues = e.venues.WithLockWait(cfg.venueLockWait)
+	}
 	e.holds, err = booking.NewService(booking.Config{DB: cfg.holdDB, Logger: logger, Policy: cfg.holdPolicy})
 	require.NoError(t, err)
 	e.router = httpapi.NewRouter(httpapi.Deps{

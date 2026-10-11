@@ -48,6 +48,7 @@ var statusByCode = map[domain.Code]int{
 	domain.CodeEventNotReady:            http.StatusConflict,
 	domain.CodeInvalidStateTransition:   http.StatusConflict,
 	domain.CodeEventNotEditable:         http.StatusConflict,
+	domain.CodeEventBusy:                http.StatusConflict,
 	domain.CodeBlockHasInventory:        http.StatusConflict,
 	domain.CodeCategoryInUse:            http.StatusConflict,
 	domain.CodeConfirmationRequired:     http.StatusConflict,

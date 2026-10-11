@@ -31,6 +31,13 @@ import (
 //
 // Each function below must be called inside a transaction; the locks last until it ends.
 //
+// WAITS FOR THE EVENT ARE BOUNDED. A publish or a cancel of a full stadium keeps the event
+// (steps 0 and 1) for many seconds. Callers take those two steps through the *Within
+// functions in locks.go, which set lock_timeout for that one statement and lift it again:
+// a request that cannot get the event in time is answered EVENT_BUSY rather than left to
+// the statement timeout. The limit is lifted before step 2 so that waits for hold and seat
+// rows, which last milliseconds and are what makes holds correct, are never cut short.
+//
 // SEAT WRITES COME LAST. event_seats.updated_at is stamped when the row is written, and the
 // seat map's change poll looks back only 20 seconds from its marker. A transaction that
 // wrote a seat and then waited for some other lock could commit a stamp older than that and

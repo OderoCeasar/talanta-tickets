@@ -25,10 +25,23 @@ type Policy struct {
 	// PublishTimeout is the statement timeout of the publish transaction, which copies one
 	// row per seat and outlasts the pool's ordinary limit.
 	PublishTimeout time.Duration
+	// CancelTimeout is the statement timeout of the cancel transaction, which on a well-sold
+	// event rewrites every ticket, booking and sold seat's refund in one go.
+	CancelTimeout time.Duration
+	// LockWait is how long an edit, a publish or a cancel waits for the event's lock before
+	// it answers EVENT_BUSY. A publish of the full venue holds that lock for most of a
+	// minute; waiting it out would run into the statement timeout and look like a fault.
+	// It has to cover the holds already in flight when a writer arrives at the gate (about
+	// a second in the worst storm measured), with room to spare.
+	LockWait time.Duration
 	// CountsTTL is how long the per-event availability counts are reused. Level 1 and
 	// level 2 of the seat map, the event list and the sales dashboard all read them, and
 	// each fresh read scans about 60,000 index entries.
 	CountsTTL time.Duration
+	// ListCountsTTL is how long the event LIST reuses the counts. A list shows one line per
+	// event and every line costs one full aggregate when its counts are stale, so the list
+	// accepts older figures than a page about a single event does.
+	ListCountsTTL time.Duration
 	// PollInterval is how often a client should poll an open block.
 	PollInterval time.Duration
 	// MarkerOverlap is how far before a marker the change poll looks. It must be longer than
@@ -46,7 +59,10 @@ type Policy struct {
 func DefaultPolicy() Policy {
 	return Policy{
 		PublishTimeout:  55 * time.Second,
+		CancelTimeout:   55 * time.Second,
+		LockWait:        5 * time.Second,
 		CountsTTL:       3 * time.Second,
+		ListCountsTTL:   20 * time.Second,
 		PollInterval:    5 * time.Second,
 		MarkerOverlap:   20 * time.Second,
 		MarkerMaxAge:    5 * time.Minute,
@@ -90,9 +106,20 @@ func NewService(cfg Config) (*Service, error) {
 	if p.PublishTimeout <= 0 {
 		p.PublishTimeout = def.PublishTimeout
 	}
+	if p.CancelTimeout <= 0 {
+		p.CancelTimeout = def.CancelTimeout
+	}
+	if p.LockWait <= 0 {
+		p.LockWait = def.LockWait
+	}
 	if p.CountsTTL <= 0 {
 		p.CountsTTL = def.CountsTTL
 	}
+	if p.ListCountsTTL <= 0 {
+		p.ListCountsTTL = def.ListCountsTTL
+	}
+	// The list may show older counts than a single event's page, never fresher ones.
+	p.ListCountsTTL = max(p.ListCountsTTL, p.CountsTTL)
 	if p.PollInterval <= 0 {
 		p.PollInterval = def.PollInterval
 	}
@@ -124,11 +151,18 @@ type Event struct {
 	SeatsTotal     int
 }
 
-// lockEvent takes the event's row lock (see the LockEvent query for why) and returns the row.
-func lockEvent(ctx context.Context, q *store.Queries, eventID int64) (store.Event, error) {
-	ev, err := q.LockEvent(ctx, eventID)
+// lockEvent takes the event's gate and row lock (see the LockEvent query for why) and returns
+// the row. It waits at most Policy.LockWait: when a publish, a cancel or another edit keeps
+// the lock longer, the answer is EVENT_BUSY and nothing has changed.
+func (s *Service) lockEvent(ctx context.Context, q *store.Queries, eventID int64) (store.Event, error) {
+	ev, err := q.LockEventWithin(ctx, eventID, s.policy.LockWait)
 	if errors.Is(err, store.ErrNoRows) {
 		return ev, domain.ErrNotFound
+	}
+	if store.IsLockTimeout(err) {
+		busy := domain.EventBusy("")
+		busy.Err = err
+		return ev, busy
 	}
 	if err != nil {
 		return ev, fmt.Errorf("lock event %d: %w", eventID, err)
@@ -137,8 +171,8 @@ func lockEvent(ctx context.Context, q *store.Queries, eventID int64) (store.Even
 }
 
 // view turns an event row into what readers see, reading the availability counts (from the
-// short-lived cache) for anything that has inventory.
-func (s *Service) view(ctx context.Context, row store.Event, venueName string) (Event, error) {
+// short-lived cache, at most countsAge old) for anything that has inventory.
+func (s *Service) view(ctx context.Context, row store.Event, venueName string, countsAge time.Duration) (Event, error) {
 	out := Event{
 		Row: row, VenueName: venueName,
 		Status: domain.EffectiveEventStatus(domain.EventStatus(row.Status), row.SalesOpenAt, row.SalesCloseAt, s.now()),
@@ -146,7 +180,7 @@ func (s *Service) view(ctx context.Context, row store.Event, venueName string) (
 	if !domain.EventStatus(row.Status).HasInventory() {
 		return out, nil
 	}
-	inv, err := s.inventory(ctx, row.ID)
+	inv, err := s.inventoryWithin(ctx, row.ID, countsAge)
 	if err != nil {
 		return out, err
 	}

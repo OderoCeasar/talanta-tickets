@@ -50,7 +50,16 @@ const (
 const (
 	MaxRows        = 200
 	MaxSeatsPerRow = 500
+	// MaxSeatsPerBlock caps rows × seats per row. The two limits above multiply to 100,000
+	// seats, which is more than the stadium; a block is what one fan's screen shows at
+	// level 3 (33 bytes a seat) and what one request writes, and the largest real block
+	// has 1,312 seats.
+	MaxSeatsPerBlock = 3000
 )
+
+// FieldBlockSize is ParamError.Field when rows and seats per row are each within their own
+// limit but together make a block of more than MaxSeatsPerBlock seats.
+const FieldBlockSize = "block_size"
 
 // maxArcStepDeg is how far apart outline points are placed on a curved edge. Five degrees
 // keeps a quarter-circle corner visibly round with about twenty points per arc.
@@ -166,8 +175,8 @@ var ErrInvalidParams = errors.New("invalid block parameters")
 // ParamError is a validation failure that knows which setting is at fault, so a form can
 // show the message beside the right input. It wraps ErrInvalidParams.
 type ParamError struct {
-	// Field is one of: rows, seats_per_row, seat_pitch, arc_radius, numbering_direction,
-	// row_label_scheme, row_offsets, placement.
+	// Field is one of: rows, seats_per_row, block_size (FieldBlockSize: the two together),
+	// seat_pitch, arc_radius, numbering_direction, row_label_scheme, row_offsets, placement.
 	Field string
 	// Reason is the message without the "invalid block parameters" prefix.
 	Reason string
@@ -187,6 +196,9 @@ func (p BlockParams) Validate() error {
 		return invalid("rows", "rows must be between 1 and %d, got %d", MaxRows, p.Rows)
 	case p.SeatsPerRow < 1 || p.SeatsPerRow > MaxSeatsPerRow:
 		return invalid("seats_per_row", "seats per row must be between 1 and %d, got %d", MaxSeatsPerRow, p.SeatsPerRow)
+	case p.Rows*p.SeatsPerRow > MaxSeatsPerBlock:
+		return invalid(FieldBlockSize, "a block can have at most %d seats, and %d rows of %d seats is %d; make several blocks",
+			MaxSeatsPerBlock, p.Rows, p.SeatsPerRow, p.Rows*p.SeatsPerRow)
 	case !(p.PitchX > 0) || !(p.PitchY > 0):
 		return invalid("seat_pitch", "seat pitch must be positive, got %g × %g", p.PitchX, p.PitchY)
 	case p.ArcRadius < 0:

@@ -56,13 +56,23 @@ func (s *Service) AdminCategories(ctx context.Context, eventID int64) ([]Categor
 	return s.categories(ctx, row.Event)
 }
 
-// CategoryInput is a new category. PriceCents is integer cents; zero is accepted and
-// blocks publishing.
+// CategoryInput is a new category. PriceCents is integer cents; zero is accepted on a draft
+// and blocks publishing.
 type CategoryInput struct {
 	Name        string
 	PriceCents  int64
 	ColorHex    string
 	Description *string
+}
+
+// priceProblem is the rule readiness enforces at publish, kept true afterwards: once an event
+// has left DRAFT none of its categories may be free. A draft may hold a zero price while the
+// organiser is still setting things up.
+func priceProblem(status domain.EventStatus, priceCents int64) error {
+	if status == domain.EventDraft || priceCents > 0 {
+		return nil
+	}
+	return domain.InvalidField("price_cents", "gt", "A published event's category needs a price above zero.")
 }
 
 func nameTaken(name string) *domain.Error {
@@ -73,12 +83,16 @@ func nameTaken(name string) *domain.Error {
 func (s *Service) CreateCategory(ctx context.Context, eventID int64, in CategoryInput) (Category, error) {
 	var row store.EventCategory
 	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
-		ev, err := lockEvent(ctx, q, eventID)
+		ev, err := s.lockEvent(ctx, q, eventID)
 		if err != nil {
 			return err
 		}
-		if status := domain.EventStatus(ev.Status); !status.Editable() {
+		status := domain.EventStatus(ev.Status)
+		if !status.Editable() {
 			return domain.EventNotEditable(status, fmt.Sprintf("An event that is %s can no longer be edited.", status))
+		}
+		if err := priceProblem(status, in.PriceCents); err != nil {
+			return err
 		}
 		row, err = q.CreateEventCategory(ctx, store.CreateEventCategoryParams{
 			EventID: eventID, Name: in.Name, PriceCents: in.PriceCents, ColorHex: in.ColorHex, Description: in.Description,
@@ -124,7 +138,7 @@ func (s *Service) UpdateCategory(ctx context.Context, categoryID int64, in Categ
 		ev  store.Event
 	)
 	err = store.InTx(ctx, s.db, func(q *store.Queries) error {
-		ev, err = lockEvent(ctx, q, found.EventID)
+		ev, err = s.lockEvent(ctx, q, found.EventID)
 		if err != nil {
 			return err
 		}
@@ -139,6 +153,16 @@ func (s *Service) UpdateCategory(ctx context.Context, categoryID int64, in Categ
 		status := domain.EventStatus(ev.Status)
 		if !status.Editable() {
 			return domain.EventNotEditable(status, fmt.Sprintf("An event that is %s can no longer be edited.", status))
+		}
+
+		// Checked on the merged row and before the confirmation question: confirm cannot
+		// make a free category acceptable.
+		merged := cat.PriceCents
+		if in.PriceCents != nil {
+			merged = *in.PriceCents
+		}
+		if err := priceProblem(status, merged); err != nil {
+			return err
 		}
 
 		if in.PriceCents != nil && *in.PriceCents != cat.PriceCents && status != domain.EventDraft && !in.Confirm {
@@ -209,7 +233,7 @@ func (s *Service) DeleteCategory(ctx context.Context, categoryID int64) error {
 	return store.InTx(ctx, s.db, func(q *store.Queries) error {
 		// The lock keeps a publish from copying this category into inventory while it is
 		// being deleted.
-		ev, err := lockEvent(ctx, q, found.EventID)
+		ev, err := s.lockEvent(ctx, q, found.EventID)
 		if err != nil {
 			return err
 		}
@@ -221,7 +245,7 @@ func (s *Service) DeleteCategory(ctx context.Context, categoryID int64) error {
 			return &domain.Error{
 				Code:    domain.CodeCategoryInUse,
 				Message: fmt.Sprintf("%s is used by this event's seats and cannot be deleted.", found.Name),
-				Details: domain.SalesStartedDetails{Sold: int(use.Sold), Held: int(use.Held)},
+				Details: domain.CategoryInUseDetails{Seats: int(use.Seats), Sold: int(use.Sold), Held: int(use.Held)},
 			}
 		}
 		n, err := q.DeleteEventCategory(ctx, store.DeleteEventCategoryParams{ID: categoryID, EventID: ev.ID})

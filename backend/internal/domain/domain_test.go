@@ -232,3 +232,31 @@ func TestPaymentFailureReason(t *testing.T) {
 	assert.Equal(t, "other", *PaymentFailureReason("FAILED", code(17)))
 	assert.Equal(t, "other", *PaymentFailureReason("FAILED", nil))
 }
+
+func TestPublishedEventProblems(t *testing.T) {
+	now := time.Date(2026, 10, 11, 12, 0, 0, 0, time.UTC)
+	at := func(h int) *time.Time { v := now.Add(time.Duration(h) * time.Hour); return &v }
+	fields := func(kickoff time.Time, open, closeAt *time.Time, changed bool) []string {
+		var out []string
+		for _, p := range PublishedEventProblems(kickoff, open, closeAt, changed, now) {
+			out = append(out, p.Field+":"+p.Rule)
+		}
+		return out
+	}
+
+	assert.Empty(t, fields(*at(48), at(-1), at(47), true), "a sound window and a future kickoff")
+	assert.Equal(t, []string{"sales_close_at:required"}, fields(*at(48), at(-1), nil, false), "sales would never close")
+	assert.Equal(t, []string{"sales_open_at:required"}, fields(*at(48), nil, at(47), false))
+	assert.Equal(t, []string{"sales_open_at:required", "sales_close_at:required"}, fields(*at(48), nil, nil, false))
+	assert.Equal(t, []string{"sales_close_at:after_open"}, fields(*at(48), at(10), at(10), false))
+	assert.Equal(t, []string{"sales_close_at:before_kickoff"}, fields(*at(48), at(-1), at(49), false))
+	assert.Equal(t, []string{"kickoff_at:future"}, fields(*at(-1), at(-48), at(-2), true), "this edit moves the kickoff into the past")
+	assert.Equal(t, []string{"kickoff_at:future"}, fields(now, at(-48), at(-2), true), "exactly now is not the future")
+	assert.Empty(t, fields(*at(-1), at(-48), at(-2), false), "a kickoff that has simply passed does not block other edits")
+
+	// The same inputs publish judges: whatever SalesWindowProblems refuses, this refuses.
+	for _, c := range []struct{ open, closeAt *time.Time }{{nil, at(1)}, {at(1), nil}, {at(5), at(4)}, {at(1), at(72)}} {
+		assert.NotEmpty(t, SalesWindowProblems(*at(48), c.open, c.closeAt, now))
+		assert.NotEmpty(t, PublishedEventProblems(*at(48), c.open, c.closeAt, false, now))
+	}
+}

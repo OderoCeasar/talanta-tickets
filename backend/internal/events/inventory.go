@@ -127,7 +127,16 @@ func (s *Service) loadInventory(ctx context.Context, eventID int64) (*Inventory,
 
 // inventory returns the event's counts, at most CountsTTL old.
 func (s *Service) inventory(ctx context.Context, eventID int64) (*Inventory, error) {
-	return s.counts.get(eventID, func() (*Inventory, error) { return s.loadInventory(ctx, eventID) })
+	return s.inventoryWithin(ctx, eventID, s.policy.CountsTTL)
+}
+
+// inventoryWithin returns the event's counts, at most maxAge old. The event list passes
+// ListCountsTTL: it reads the counts of every event on the page, and with CountsTTL each of
+// those was a fresh aggregate over the event's whole inventory (about 80 ms for the full
+// venue) every three seconds, for a number shown as one line of a list. A reader with the
+// shorter limit still refreshes the shared entry, which the list then gets for free.
+func (s *Service) inventoryWithin(ctx context.Context, eventID int64, maxAge time.Duration) (*Inventory, error) {
+	return s.counts.getWithin(eventID, maxAge, func() (*Inventory, error) { return s.loadInventory(ctx, eventID) })
 }
 
 // countsCache keeps each event's counts for a few seconds. It is per process: two API
@@ -152,7 +161,15 @@ func newCountsCache(ttl time.Duration, now func() time.Time) *countsCache {
 	return &countsCache{ttl: ttl, now: now, entries: map[int64]*countsEntry{}}
 }
 
+// get returns the event's counts, at most the cache's own ttl old.
 func (c *countsCache) get(eventID int64, load func() (*Inventory, error)) (*Inventory, error) {
+	return c.getWithin(eventID, c.ttl, load)
+}
+
+// getWithin returns the event's counts if the cached ones are younger than maxAge, and loads
+// them otherwise. Callers with different limits share one entry: a patient caller never
+// forces a load that an impatient one would not, and an impatient one's load serves both.
+func (c *countsCache) getWithin(eventID int64, maxAge time.Duration, load func() (*Inventory, error)) (*Inventory, error) {
 	c.mu.Lock()
 	e, ok := c.entries[eventID]
 	if !ok {
@@ -163,7 +180,7 @@ func (c *countsCache) get(eventID int64, load func() (*Inventory, error)) (*Inve
 
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.inv != nil && c.now().Sub(e.at) < c.ttl {
+	if e.inv != nil && c.now().Sub(e.at) < maxAge {
 		return e.inv, nil
 	}
 	inv, err := load()

@@ -11,6 +11,7 @@ One line each. Updated at the end of every milestone.
 - M3 Auth: phone OTP, email + password with optional two-step, rotating refresh tokens with reuse detection, role checks, staff invitations, first admin from env. Integration suite passes; the invite journey was run in a browser against the real API.
 - M4 Events and inventory: event, category, layout, template and painting endpoints; publish creates exactly one inventory row per active seat (59,568) and a second publish changes nothing.
 - M5 Seat map API: three levels plus the changed-since poll. Level 1 is 4,800 B, level 2 at most 6,557 B, level 3 for the largest block (1,312 seats) 43,617 B raw / 14,541 B gzipped; a poll with one change is 110 B.
+- M5 follow-up, review fixes: requests behind a publish answer 409 `EVENT_BUSY` after 3 to 5 s instead of 500; edits after publish keep the sales window, a future kickoff and prices above zero; cancel of a sold-out venue (57,568 tickets) takes 10.7 to 16.0 s under its own timeouts; the default sales call always succeeds; a block is capped at 3,000 seats; drafts and templates can be deleted. Contract is 74 operations.
 - M6 Holds and locking: hold, release, best available, sweeper, per-user limit, one payment extension, sell-by-hold. 1,000 parallel requests at 10 seats: 10 winners, 990 `SEATS_UNAVAILABLE`, 0 other errors, 0 seats held twice; 10 runs in a row passed. With the seat row lock removed the same test goes red (seats with 2 and 4 winners).
 - M8 Mobile fan flow (on `main`): ran end to end on an Android 16 emulator against a stand-in server; not yet re-run against the real API.
 - M9 Admin web (on `main`): events, pricing, seat painting, publish, venue layout, templates, sales dashboard. A real full-venue publish through the browser showed the wait state and "Published" after 37.9 s.
@@ -18,7 +19,6 @@ One line each. Updated at the end of every milestone.
 
 ## Partly done
 
-- M5 follow-up: review fixes for events and seat map (500 for edits sent during a publish; edits after publish can clear the sales close time or set a price to 0; cancel untested at full-venue size; default hourly sales range fails after 83 days; no cap on generated block size).
 - M8: smooth zoom and pan on the largest block is not proven (the emulator was too loaded to judge); pinch was not exercised; no installable build was made.
 - M9: cancel event, and acting on refund-required bookings, are built but were not exercised against the real API.
 
@@ -31,12 +31,11 @@ One line each. Updated at the end of every milestone.
 ## Known bugs and limits
 
 - Publishing 59,568 seats takes 30–44 s on the dev laptop (four foreign-key checks per row on `postgres:16-alpine`) against a 55 s limit for that route. Past the limit it rolls back and answers 500; a retry is safe. An async publish would remove the limit.
-- Level 3 for the largest block is 43.6 KB raw, over the ~40 KB in §5.1. Shrinking it means changing the seat tuple in the contract.
+- Level 3 for the largest blocks is up to 46,245 B raw (14,930 B gzipped at most), over the ~40 KB in §5.1; 8 of 96 blocks are over. Shrinking it means changing the seat tuple in the contract.
 - Nothing sets an event to SOLD_OUT or COMPLETED yet.
-- Level 3 for the largest blocks is up to 46,243 B raw (14,249 B gzipped), not the 43,617 B first reported.
 - An ended hold (expired or released) lists no seats, because there is no hold-seats table.
-- A hold request on a draft event that is mid-publish waits and can hit the 15 s statement timeout (500).
-- No way to delete an event or a venue template through the API, so drafts pile up.
+- `booking.ExtendForPayment` (used by M7) still waits without limit for an event that is being cancelled or published; M7 should bound it like hold and release.
+- The admin and mobile apps do not yet handle `EVENT_BUSY` (retry, or "this event is being published").
 - No real SMS provider: in production the OTP is not delivered, so fans cannot sign in there until one is added (M7 adds the interface; a provider account is the owner's).
 - Rate limits (including the per-user TOTP cap and the global SMS caps), TOTP replay protection and MFA-token single use are held in memory per process: a restart resets them, and a second API instance would not share them.
 - TOTP setup and enable do not re-ask for the password: a borrowed signed-in session can turn two-step sign-in on with its own authenticator (turning it off does ask).

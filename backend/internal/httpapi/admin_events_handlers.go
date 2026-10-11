@@ -150,6 +150,19 @@ func (s *Server) updateEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, newEventDTO(ev))
 }
 
+func (s *Server) deleteEvent(w http.ResponseWriter, r *http.Request) {
+	id, err := PathID(r, "eventId")
+	if err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	if err := s.events.Delete(r.Context(), id); err != nil {
+		WriteError(w, r, err)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func (s *Server) getEventReadiness(w http.ResponseWriter, r *http.Request) {
 	id, err := PathID(r, "eventId")
 	if err != nil {

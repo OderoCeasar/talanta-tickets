@@ -26,6 +26,7 @@ func (s *Server) staffEventRoutes(r chi.Router) {
 	r.Post("/venues/{venueId}/blocks", s.createBlock)
 	r.Get("/venues/{venueId}/templates", s.listVenueTemplates)
 	r.Post("/venues/{venueId}/templates", s.createVenueTemplate)
+	r.Delete("/venues/{venueId}/templates/{templateId}", s.deleteVenueTemplate)
 
 	r.Patch("/blocks/{blockId}", s.updateBlock)
 	r.Delete("/blocks/{blockId}", s.deleteBlock)
@@ -36,11 +37,14 @@ func (s *Server) staffEventRoutes(r chi.Router) {
 	r.Post("/events", s.createEvent)
 	r.Get("/events/{eventId}", s.getAdminEvent)
 	r.Patch("/events/{eventId}", s.updateEvent)
+	r.Delete("/events/{eventId}", s.deleteEvent)
 	r.Get("/events/{eventId}/readiness", s.getEventReadiness)
 	// Publish copies one inventory row per seat (about 60,000) and takes longer than the
 	// router-wide request timeout allows, so it runs under its own.
 	r.With(routeTimeout(s.publishTimeout)).Post("/events/{eventId}/publish", s.publishEvent)
-	r.Post("/events/{eventId}/cancel", s.cancelEvent)
+	// Cancel rewrites every ticket and booking of the event in one transaction; on a sold-out
+	// stadium that outlasts the router-wide timeout too (measured, see docs/DECISIONS.md).
+	r.With(routeTimeout(s.publishTimeout)).Post("/events/{eventId}/cancel", s.cancelEvent)
 	r.Get("/events/{eventId}/categories", s.listAdminEventCategories)
 	r.Post("/events/{eventId}/categories", s.createCategory)
 	r.Get("/events/{eventId}/assignments", s.getEventAssignments)

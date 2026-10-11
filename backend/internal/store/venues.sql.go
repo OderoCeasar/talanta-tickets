@@ -743,6 +743,42 @@ func (q *Queries) LockBlock(ctx context.Context, id int64) (Block, error) {
 	return i, err
 }
 
+const lockBlockForEdit = `-- name: LockBlockForEdit :one
+SELECT id, stand_id, code, label, origin_x, origin_y, rotation_deg, arc_radius, seat_pitch_x, seat_pitch_y, outline, row_count, seats_per_row, numbering_direction FROM blocks WHERE id = $1 FOR NO KEY UPDATE
+`
+
+// Locks: the one blocks row, FOR NO KEY UPDATE, until the transaction ends.
+// Why: a rename or a move reads the block and then rewrites it and its seats' positions; two
+// edits of one block at once would interleave. NO KEY UPDATE still shuts out the other
+// edits, regenerate and delete (they take NO KEY UPDATE or FOR UPDATE on the same row), but
+// unlike FOR UPDATE it does not conflict with the FOR KEY SHARE locks a publish takes on
+// every block it copies seats of (the event_seats.block_id foreign key) and keeps until it
+// commits, most of a minute later. A move changes no key column, so it has no reason to
+// queue behind a publish. Changing the block's code is the exception: (stand_id, code) is a
+// unique key, so that UPDATE itself needs the stronger lock and waits; UpdateBlock runs
+// under a short lock_timeout for that case.
+func (q *Queries) LockBlockForEdit(ctx context.Context, id int64) (Block, error) {
+	row := q.db.QueryRow(ctx, lockBlockForEdit, id)
+	var i Block
+	err := row.Scan(
+		&i.ID,
+		&i.StandID,
+		&i.Code,
+		&i.Label,
+		&i.OriginX,
+		&i.OriginY,
+		&i.RotationDeg,
+		&i.ArcRadius,
+		&i.SeatPitchX,
+		&i.SeatPitchY,
+		&i.Outline,
+		&i.RowCount,
+		&i.SeatsPerRow,
+		&i.NumberingDirection,
+	)
+	return i, err
+}
+
 const lockVenueForLayoutChange = `-- name: LockVenueForLayoutChange :one
 SELECT id FROM venues WHERE id = $1 FOR NO KEY UPDATE
 `

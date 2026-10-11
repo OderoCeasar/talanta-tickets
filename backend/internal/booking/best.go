@@ -49,7 +49,7 @@ func (s *Service) HoldBestAvailable(ctx context.Context, userID, eventID, catego
 	// The same checks a hold makes, before any seat is read, so "not on sale" and "over
 	// your limit" are reported as such and not as "no seats found". Each try repeats them
 	// under its own locks.
-	if err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error { return admit(ctx, tx, userID, eventID, quantity) }); err != nil {
+	if err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error { return s.admit(ctx, tx, userID, eventID, quantity) }); err != nil {
 		return Hold{}, err
 	}
 	category, err := s.q.GetEventCategory(ctx, store.GetEventCategoryParams{ID: categoryID, EventID: eventID})

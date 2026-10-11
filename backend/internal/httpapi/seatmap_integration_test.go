@@ -368,11 +368,23 @@ func TestSeatMap_LapsedHoldIsAvailable(t *testing.T) {
 	// A hold that lapses while a block is open reaches the poll although no row is
 	// written when it lapses. The row's own stamp is put in the past so that only the
 	// expiry can be what the poll finds.
-	holdSeats(t, ev.ID, holderID, time.Now().Add(1500*time.Millisecond), ids[2])
+	lapsing := holdSeats(t, ev.ID, holderID, time.Now().Add(10*time.Minute), ids[2])
 	age(t, ev.ID, time.Hour)
 	live := want(t, e.seats(ev.ID, block, "", ""), http.StatusOK)
 	require.Equal(t, "H", seatCodes(t, live)[ids[2]])
-	time.Sleep(1700 * time.Millisecond)
+	// The hold runs out now. No sleeping against a short expiry (that raced the clock): the
+	// expiry itself is moved to a moment after the marker and already past, and the row's
+	// stamps are left an hour old, so the write is not what the poll finds.
+	untriggered(t, func(tx pgx.Tx) {
+		ctx := context.Background()
+		_, err := tx.Exec(ctx, `UPDATE holds SET expires_at = clock_timestamp() WHERE id = $1`, lapsing)
+		require.NoError(t, err)
+		tag, err := tx.Exec(ctx, `UPDATE event_seats SET hold_expires_at = clock_timestamp() WHERE id = $1 AND hold_id = $2`, ids[2], lapsing)
+		require.NoError(t, err)
+		require.EqualValues(t, 1, tag.RowsAffected())
+	})
+	require.Equal(t, 1, queryInt(t, `SELECT count(*) FROM event_seats WHERE id = $1 AND status = 'HELD' AND hold_expires_at <= now() AND updated_at < now() - interval '30 minutes'`, ids[2]),
+		"still stored as HELD, lapsed, and not stamped as changed")
 	changes := changeCodes(t, want(t, e.seats(ev.ID, block, live["marker"].(string), ""), http.StatusOK))
 	assert.Equal(t, map[int64]string{ids[2]: "A"}, changes)
 }

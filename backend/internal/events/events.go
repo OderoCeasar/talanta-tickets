@@ -94,7 +94,7 @@ func (s *Service) page(ctx context.Context, limit, fetched int, at func(int) (st
 	out := make([]Event, 0, n)
 	for i := 0; i < n; i++ {
 		row, venue := at(i)
-		ev, err := s.view(ctx, row, venue)
+		ev, err := s.view(ctx, row, venue, s.policy.ListCountsTTL)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -113,7 +113,7 @@ func (s *Service) GetPublic(ctx context.Context, eventID int64) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	return s.view(ctx, row.Event, row.VenueName)
+	return s.view(ctx, row.Event, row.VenueName, s.policy.CountsTTL)
 }
 
 // GetAdmin returns one event in any status.
@@ -122,7 +122,7 @@ func (s *Service) GetAdmin(ctx context.Context, eventID int64) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	return s.view(ctx, row.Event, row.VenueName)
+	return s.view(ctx, row.Event, row.VenueName, s.policy.CountsTTL)
 }
 
 // CreateInput is a new draft event.
@@ -157,6 +157,24 @@ func timeProblems(kickoff time.Time, gates, open, closeAt *time.Time) []domain.F
 		out = append(out, domain.FieldError{Field: "sales_close_at", Rule: "before_kickoff", Message: "Sales must close at or before kickoff."})
 	}
 	return out
+}
+
+// mergeFieldErrors appends the errors of more that name a field and rule not already in base,
+// so two checks that overlap (the order of the times) report a problem once.
+func mergeFieldErrors(base, more []domain.FieldError) []domain.FieldError {
+	for _, m := range more {
+		dup := false
+		for _, b := range base {
+			if b.Field == m.Field && b.Rule == m.Rule {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			base = append(base, m)
+		}
+	}
+	return base
 }
 
 // Create makes a draft event, optionally from a venue template.
@@ -211,7 +229,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (Event, error) {
 	if err != nil {
 		return Event{}, err
 	}
-	return s.view(ctx, row, venue.Name)
+	return s.view(ctx, row, venue.Name, s.policy.CountsTTL)
 }
 
 // UpdateInput changes an event's details. Nil and unset fields are left alone.
@@ -233,14 +251,16 @@ type UpdateInput struct {
 func (s *Service) Update(ctx context.Context, eventID int64, in UpdateInput) (Event, error) {
 	var row store.Event
 	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
-		ev, err := lockEvent(ctx, q, eventID)
+		ev, err := s.lockEvent(ctx, q, eventID)
 		if err != nil {
 			return err
 		}
-		if status := domain.EventStatus(ev.Status); !status.Editable() {
+		status := domain.EventStatus(ev.Status)
+		if !status.Editable() {
 			return domain.EventNotEditable(status, fmt.Sprintf("An event that is %s can no longer be edited.", status))
 		}
 
+		before := ev.KickoffAt
 		if in.Title != nil {
 			ev.Title = *in.Title
 		}
@@ -259,7 +279,14 @@ func (s *Service) Update(ctx context.Context, eventID int64, in UpdateInput) (Ev
 		in.SalesCloseAt.apply(&ev.SalesCloseAt)
 
 		// The merged result is what must make sense, not just the fields that were sent.
-		if problems := timeProblems(ev.KickoffAt, ev.GatesOpenAt, ev.SalesOpenAt, ev.SalesCloseAt); len(problems) > 0 {
+		problems := timeProblems(ev.KickoffAt, ev.GatesOpenAt, ev.SalesOpenAt, ev.SalesCloseAt)
+		if status != domain.EventDraft {
+			// Publish refused an event with no sales window or a kickoff in the past; an
+			// edit afterwards must not be a way round that.
+			problems = mergeFieldErrors(problems, domain.PublishedEventProblems(
+				ev.KickoffAt, ev.SalesOpenAt, ev.SalesCloseAt, !ev.KickoffAt.Equal(before), s.now()))
+		}
+		if len(problems) > 0 {
 			return domain.Invalid(problems...)
 		}
 		row, err = q.UpdateEvent(ctx, store.UpdateEventParams{
@@ -279,5 +306,36 @@ func (s *Service) Update(ctx context.Context, eventID int64, in UpdateInput) (Ev
 	if err != nil {
 		return Event{}, fmt.Errorf("get venue %d: %w", row.VenueID, err)
 	}
-	return s.view(ctx, row, venue.Name)
+	return s.view(ctx, row, venue.Name, s.policy.CountsTTL)
+}
+
+// Delete removes a draft event with its categories and painting (the database cascades
+// them). Only a draft: a published event has inventory and may have bookings, and is
+// cancelled instead. It takes the event lock like every other edit, so it cannot slip in
+// between a publish reading the draft and copying it.
+func (s *Service) Delete(ctx context.Context, eventID int64) error {
+	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
+		ev, err := s.lockEvent(ctx, q, eventID)
+		if err != nil {
+			return err
+		}
+		if status := domain.EventStatus(ev.Status); status != domain.EventDraft {
+			return domain.EventNotEditable(status, fmt.Sprintf("Only a draft can be deleted. This event is %s; cancel it instead.", status))
+		}
+		n, err := q.DeleteDraftEvent(ctx, eventID)
+		if err != nil {
+			return fmt.Errorf("delete event %d: %w", eventID, err)
+		}
+		if n != 1 {
+			// Cannot happen while the row lock is held.
+			return fmt.Errorf("delete event %d: status changed under the row lock", eventID)
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	s.counts.invalidate(eventID)
+	s.log.InfoContext(ctx, "draft event deleted", "event_id", eventID)
+	return nil
 }

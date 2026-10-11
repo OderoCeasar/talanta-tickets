@@ -61,12 +61,19 @@ func (s *Service) Hold(ctx context.Context, userID, eventID int64, seatIDs []int
 
 // admit runs the checks that come before any seat is looked at, taking the first two locks
 // of the lock order: the event (FOR SHARE) and the (user, event) advisory lock.
-func admit(ctx context.Context, tx store.DBTX, userID, eventID int64, quantity int) error {
+func (s *Service) admit(ctx context.Context, tx store.DBTX, userID, eventID int64, quantity int) error {
 	// 1. The event row. A concurrent cancel waits for this transaction, or we wait for it
-	// and then read CANCELLED.
-	ev, err := store.LockEventForHold(ctx, tx, eventID)
+	// and then read CANCELLED. The wait is bounded: an edit takes milliseconds, but a
+	// publish or a cancel of a full stadium keeps the event for many seconds, and a fan is
+	// better served by "busy, try again" now than by a timeout later.
+	ev, err := store.LockEventForHoldWithin(ctx, tx, eventID, s.policy.EventLockWait)
 	if errors.Is(err, store.ErrNoRows) {
 		return domain.ErrNotFound
+	}
+	if store.IsLockTimeout(err) {
+		busy := domain.EventBusy("This event is being updated. Try again in a moment.")
+		busy.Err = err
+		return busy
 	}
 	if err != nil {
 		return fmt.Errorf("lock event %d: %w", eventID, err)
@@ -93,7 +100,7 @@ func admit(ctx context.Context, tx store.DBTX, userID, eventID int64, quantity i
 // holdTx is the hold transaction. seatIDs are sorted and distinct. Returning an error rolls
 // everything back, which is how "never a partial hold" is kept.
 func (s *Service) holdTx(ctx context.Context, tx pgx.Tx, userID, eventID int64, seatIDs []int64) (int64, error) {
-	if err := admit(ctx, tx, userID, eventID, len(seatIDs)); err != nil {
+	if err := s.admit(ctx, tx, userID, eventID, len(seatIDs)); err != nil {
 		return 0, err
 	}
 

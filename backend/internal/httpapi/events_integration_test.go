@@ -625,7 +625,7 @@ func TestCategories(t *testing.T) {
 
 	// Inventory points at the category now.
 	ee = wantError(t, e.do("DELETE", catPath(vip), nil, token), http.StatusConflict, domain.CodeCategoryInUse)
-	assert.Equal(t, obj{"sold": 1.0, "held": 1.0}, details(t, ee))
+	assert.Equal(t, obj{"seats": 3.0, "sold": 1.0, "held": 1.0}, details(t, ee))
 	wantFields(t, e.do("DELETE", "/admin/categories/zero", nil, token), "categoryId")
 	// A category added after publish has no seats and can still go.
 	late := e.addCategory(&ev, "Late", 1_000, "#222222")

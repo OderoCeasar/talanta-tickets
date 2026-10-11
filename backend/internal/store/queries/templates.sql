@@ -14,7 +14,8 @@ SELECT * FROM venue_templates WHERE venue_id = $1 AND name = $2;
 SELECT * FROM venue_templates WHERE venue_id = $1 ORDER BY name;
 
 -- name: DeleteVenueTemplate :execrows
-DELETE FROM venue_templates WHERE id = $1;
+-- Scoped to the venue in the path, so a template id from another venue deletes nothing.
+DELETE FROM venue_templates WHERE id = sqlc.arg(id) AND venue_id = sqlc.arg(venue_id);
 
 -- name: CreateCategoriesFromTemplate :execrows
 INSERT INTO event_categories (event_id, name, price_cents, color_hex, description)

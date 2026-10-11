@@ -4,7 +4,7 @@ Companion to `backend/docs/openapi.yaml`, which is the contract. This file holds
 easier to read as a table: error codes, the compact array layouts, the one-letter codes, and
 where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 
-72 operations on 63 paths. Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
+74 operations on 64 paths. Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
 
 ## Basics
 
@@ -66,8 +66,9 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 | `EVENT_NOT_READY` | 409 | Publish refused | `problems[]` (same as readiness) |
 | `INVALID_STATE_TRANSITION` | 409 | Publish or cancel not allowed from the current status | `current_status` |
 | `EVENT_NOT_EDITABLE` | 409 | Event is past the status where this edit is allowed | `current_status` |
+| `EVENT_BUSY` | 409 | The event is locked by a publish, a cancel or another edit that did not finish within the lock wait; nothing changed, send the request again | null |
 | `BLOCK_HAS_INVENTORY` | 409 | Block is used by a published event, or an event at the venue is being published right now; cannot delete or regenerate | `event_ids[]` (empty in the second case) |
-| `CATEGORY_IN_USE` | 409 | Category has inventory or bookings | `sold, held` |
+| `CATEGORY_IN_USE` | 409 | Category has inventory or bookings | `seats, sold, held` |
 | `CONFIRMATION_REQUIRED` | 409 | Price change after the event has left `DRAFT` needs `confirm: true` | `sold, held` |
 | `ALREADY_EXISTS` | 409 | Unique name or code is taken | `fields[]` |
 | `EMAIL_ALREADY_REGISTERED` | 409 | A user with this email exists | null |
@@ -103,17 +104,19 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `rule` | Meaning |
 |---|---|
 | `required` | Missing or empty |
-| `email`, `e164`, `number`, `len`, `min`, `max`, `oneof`, `gte`, `lte` | The value breaks that rule |
+| `email`, `e164`, `number`, `len`, `min`, `max`, `oneof`, `gt`, `gte`, `lte` | The value breaks that rule (`gt` on `price_cents`: a category of an event that has left `DRAFT` must cost more than zero) |
 | `type` | Wrong JSON type (a number where a string is expected) |
 | `unknown` | The body has a field the endpoint does not accept |
 | `json` | The body is not valid JSON |
 | `content_type` | The body was not sent as `application/json` |
-| `id`, `range`, `cursor` | Path ID, `limit`, or `cursor` is malformed |
+| `id`, `range`, `cursor` | Path ID, `limit`, or `cursor` is malformed; `range` on `from` of the sales call: a `from` the caller sent is more than 2,000 buckets back |
 | `datetime` | Not an RFC 3339 time (body field or `from`/`to` query) |
 | `url` | `poster_url` is not an `http(s)` address |
 | `unique` | A list repeats a value (`block_ids`, `row_ids`); also the rule on `ALREADY_EXISTS` |
 | `hexcolor`, `blockcode` | Not `#RRGGBB`; not capitals, digits and dashes |
 | `before_kickoff`, `after_open`, `after_from` | Times in the wrong order (`gates_open_at`, `sales_close_at`, `to`) |
+| `future` | `kickoff_at` of an event that has left `DRAFT` would be moved into the past |
+| `max_seats` | `rows` x `seats_per_row` is more than 3,000 seats in one block (on both fields) |
 | `plan_bounds` | The block's outline would leave `[0, plan_width] × [0, plan_height]` |
 | `layout` | The seat geometry cannot be made (for example a row too long for the arc) |
 | `venue` | On `VENUE_MISMATCH`: the block, row, template or event is at another venue |
@@ -234,12 +237,17 @@ Measured through the real router with `Accept-Encoding: gzip` (chi compress, lev
 |---|---|---|---|
 | Level 1, 8 stands | 4,800 B (4.7 KB) | 1,584 B | ~4 KB |
 | Level 2, largest stand (14 blocks) | 6,557 B (6.4 KB) | 1,993 B | ~10 KB |
-| Level 3, largest block (1,312 seats, curved) | 43,617 B (42.6 KB) | 14,541 B | ~40 KB |
+| Level 3, largest answer of all 96 blocks (block of 1,312 seats) | 46,245 B (45.2 KB) | 14,274 B | ~40 KB |
+| Level 3, largest gzipped answer (another block of 1,312 seats) | 44,930 B | 14,930 B | |
 | Level 3 poll, nothing changed | 100 B | not compressed | |
 | Level 3 poll, 6 seats changed | 165 B | not compressed | |
 
-Level 3 costs 33 bytes a seat raw, so only blocks above about 1,230 seats pass 40 KB; the
-largest block is 6% over. A curved block's coordinates are irregular and compress to a
+Every block is measured and the largest answer reported. Level 3 costs 33 to 35 bytes a
+seat raw (ids, labels and coordinates of later blocks have more digits), so the answer for
+blocks of the same seat count differs by thousands of bytes: 8 of the 96 blocks pass 40 KB
+and the largest is 13% over. (The figure first reported, 43,617 B, was the lowest-id block
+among the equally large ones, not the maximum. Exact bytes move by a few with the ids a
+database happens to hand out.) A curved block's coordinates are irregular and compress to a
 third, not the eighth estimated before measuring. What would shrink it, each a contract
 change: send `x`/`y` only for curved blocks and let the client lay a straight block out
 from origin, rotation and pitch; send the first `event_seat_id` of a row and let the rest
@@ -306,27 +314,67 @@ the 16 random bytes in each UUID.
   filters use the same rule in SQL. Legal moves of the stored status are one table in
   `domain.TransitionEvent`.
 - **Publish** takes the event row lock, then checks status, then readiness, then inserts
-  one inventory row per active seat. Painting, category changes, event edits and cancel
-  take the same lock, so the inventory can never disagree with the painting. A repeat on a
+  one inventory row per active seat. Painting, category changes, event edits, delete and
+  cancel take the same lock, so the inventory can never disagree with the painting. A repeat on a
   published event answers 200 with `already_published: true`. It runs under its own request
   timeout (the server's write timeout less five seconds, 55 s by default) and raises the
   statement timeout for its own transaction.
+- **Busy events (`EVENT_BUSY`).** Nothing queues behind a publish or a cancel for long.
+  Every call that needs the event's lock waits a bounded time and then answers 409
+  `EVENT_BUSY` with nothing changed: 5 seconds for staff calls (paint, category create,
+  edit and delete, event edit and delete, cancel, a second publish), 3 seconds for a fan's
+  `POST /holds`, best available and `DELETE /holds/{id}`. The client retries the same request; the admin should
+  say "this event is being published" rather than show an error. Before this the request
+  waited 15 seconds and answered 500. In the layout editor, a move, a new label or a new
+  curve of a block is not held up by a publish at all; a new block `code` is, and answers
+  `EVENT_BUSY` after 3 seconds, as does a second editor of the same block. Deleting or
+  regenerating a block during a publish still answers `BLOCK_HAS_INVENTORY` with an empty
+  `event_ids`. A hold request for a `DRAFT` event that is being published gets `EVENT_BUSY`
+  too, where a moment earlier or later it gets 404 or 201.
+- **Edits after publish.** Once an event has left `DRAFT`, `PATCH /admin/events/{id}` is
+  checked on the merged event against what publish required: `sales_open_at` and
+  `sales_close_at` must both stay set (rule `required`), in order and not after kickoff,
+  and `kickoff_at` may not be moved into the past (rule `future`). A kickoff that has
+  simply passed does not stop other edits. A category of such an event must cost more than
+  zero, on create and on edit, with or without `confirm` (rule `gt` on `price_cents`).
+- **Delete.** `DELETE /admin/events/{id}` removes a `DRAFT` with its categories and
+  painting; any other status is 409 `EVENT_NOT_EDITABLE`. `DELETE
+  /admin/venues/{venueId}/templates/{templateId}` removes a template; events made from it
+  keep what was copied.
 - **Readiness** needs: at least one active seat, at least one category, every active seat
   painted (row override, else block), every category priced above zero, both ends of the
   sales window set, close after open and not after kickoff, kickoff in the future.
 - **Cancel** is allowed from every status but `COMPLETED`; see the operation for what it does.
+  It is one transaction and, like publish, has the longer request and statement timeouts:
+  on the full venue sold out (57,568 tickets, 14,392 paid bookings, 1,000 live holds) it
+  took 10.7 s and 16.0 s in two runs on the dev laptop. A repeat answers in milliseconds
+  with zero counts.
 - **Categories.** A price change once the event has left `DRAFT` needs `confirm: true`. A
   category can be deleted while nothing points at it (no inventory row, no booking item).
+  `CATEGORY_IN_USE` carries `seats` (inventory rows of the category, any status), `sold`
+  and `held`: `seats > 0` with the other two at zero means only "the event is published".
   `price_cents` is whole cents: `10.5` is refused.
 - **Painting** is allowed only while `DRAFT`. Painting a block does not clear the row
   overrides inside it.
 - **Lists.** `GET /events` shows `PUBLISHED`, `ON_SALE` and `SOLD_OUT` with kickoff from
   now (or `from`) on, soonest first. `GET /admin/events` shows everything, latest first.
-  `from` is inclusive and `to` exclusive in both.
+  `from` is inclusive and `to` exclusive in both. `seats_available` and `price_from_cents`
+  in either LIST may be up to 20 seconds old; one event read on its own, and the seat map,
+  keep the 3 seconds.
+- **Public reads and `Authorization`.** The public event and seat map reads need no token,
+  but look at one if it is sent. A header that is malformed, not a valid token or expired
+  answers 401 on all six of them, as the contract now says; send no header to be anonymous.
+- **Block size.** A block is at most 200 rows, 500 seats per row and 3,000 seats in all
+  (`seatmap.MaxSeatsPerBlock`); the largest block of the real stadium has 1,312.
 - **Seat generation** replaces a block's rows and seats; the row overrides of draft events
   on the old rows go with them (the block's own painting stays). `venues.capacity` is
   recounted on every generate and delete. Seat labels are row label + number (`C14`), with
   a dash when rows are numbered (`12-14`).
+- **Sales defaults.** `GET /admin/events/{id}/sales` with no parameters always succeeds.
+  No `bucket`: `hour` for a range of 48 hours or less, `day` beyond (`series.bucket` says
+  which). No `from`: the first paid booking, or the most recent 2,000 buckets when that
+  would be more. A `from` the caller sends is never moved and is 400 (rule `range`) past
+  2,000 buckets.
 - **Sales.** Day buckets are Nairobi days (21:00 UTC to 21:00 UTC). `refund_required_cents`
   is the queued refunds of `REFUND_REQUIRED` bookings, or a booking's total while none is
   queued. `Payment.failure_reason` is derived from Daraja's result code (1 insufficient
@@ -336,7 +384,9 @@ the 16 random bytes in each UUID.
 
 - **Counts** (level 1, level 2, event `seats_available`/`price_from_cents`, category
   counts, the sales dashboard) come from one per-event aggregate kept in memory for 3
-  seconds per API process and dropped on publish and cancel. Level 3 is never cached.
+  seconds per API process and dropped on publish and cancel. The two event lists accept a
+  copy up to 20 seconds old (`Policy.ListCountsTTL`), because a list reads the aggregate of
+  every event on its page. Level 3 is never cached.
 - **`seats_total`** on events, stands, blocks and categories counts every inventory row,
   blocked ones included. The sales heatmap's block `total` leaves blocked seats out.
 - **Markers.** The server reads the database clock before it selects seats and puts that
@@ -358,9 +408,10 @@ the 16 random bytes in each UUID.
   sold, blocked, not part of the event, or does not exist is listed in
   `details.unavailable_seat_ids`, in ascending order. A loser of a race may be told about one
   seat or several of its seats, never about a seat it did not ask for.
-- **Order of checks:** body (400), event exists and is not a draft (404), event on sale and
-  inside the sales window (409), ticket limit (422), then the seats (409). Best available
-  checks the category (404) after the limit.
+- **Order of checks:** body (400), the event's lock (409 `EVENT_BUSY` when an organiser's
+  publish, cancel or edit keeps it for more than 3 seconds), event exists and is not a
+  draft (404), event on sale and inside the sales window (409), ticket limit (422), then
+  the seats (409). Best available checks the category (404) after the limit.
 - **Clock.** `expires_at`, `remaining_seconds`, the sales window and "has this hold run out"
   are all judged by the database clock. `remaining_seconds` is rounded down.
 - **Status.** `status` is the effective one: an `ACTIVE` hold past `expires_at` is reported

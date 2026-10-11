@@ -121,8 +121,10 @@ func TestSalesSummaryAndBookings(t *testing.T) {
 		obj{"bucket_start": rfc(day0.Add(24 * time.Hour)), "bookings": 0.0, "tickets": 0.0, "revenue_cents": 0.0},
 	}, cut["points"])
 
-	// Defaults: from the first paid booking to now.
-	def := list(want(t, e.do("GET", salesPath, nil, token), http.StatusOK)["series"].(obj), "points")
+	// Default range: from the first paid booking to now. (The bucket is named here: left
+	// out, it would be hours or days depending on how long ago that first sale is; see
+	// TestSales_DefaultCallAlwaysSucceeds.)
+	def := list(want(t, e.do("GET", salesPath+"?bucket=hour", nil, token), http.StatusOK)["series"].(obj), "points")
 	require.GreaterOrEqual(t, len(def), 24)
 	assert.Equal(t, rfc(day0.Add(23*time.Hour)), def[0].(obj)["bucket_start"])
 	total := 0.0
@@ -208,4 +210,80 @@ func TestSalesSummaryAndBookings(t *testing.T) {
 	wantFields(t, e.do("GET", bookingsPath+"?cursor=xx", nil, token), "cursor")
 	wantFields(t, e.do("GET", bookingsPath+"?limit=1000", nil, token), "limit")
 	wantError(t, e.do("GET", "/admin/events/999999999/bookings", nil, token), http.StatusNotFound, domain.CodeNotFound)
+}
+
+// Fix 4. The call the dashboard makes first, with no parameters, used to pick hour buckets
+// from the first paid booking and so answered 400 on `from` (which the caller never sent)
+// once the event had been selling for more than 2,000 hours, 83 days. What the caller leaves
+// out is now chosen so that the call always succeeds.
+func TestSales_DefaultCallAlwaysSucceeds(t *testing.T) {
+	e := newEnv(t)
+	v := e.newVenue(1, 1, 4)
+	ev := e.publishedEvent(v)
+	token := ev.Token
+	seats := eventSeatIDs(t, ev.ID, v.BlockIDs[0])
+	fanID, _ := e.newFan()
+	path := fmt.Sprintf("/admin/events/%d/sales", ev.ID)
+	series := func(query string) obj {
+		return want(t, e.do("GET", path+query, nil, token), http.StatusOK)["series"].(obj)
+	}
+	sum := func(points []any, key string) (total float64) {
+		for _, p := range points {
+			total += p.(obj)[key].(float64)
+		}
+		return total
+	}
+	rfc := func(tm time.Time) string { return tm.UTC().Format(time.RFC3339) }
+	now := time.Now()
+
+	// A first sale one hour ago: a short range, so hour buckets.
+	recent := now.Add(-time.Hour)
+	insertBooking(t, ev.ID, fanID, "PAID", recent, &recent, bookingItem{seats[1], ev.Cats["Regular"], 100_000})
+	young := series("")
+	assert.Equal(t, "hour", young["bucket"])
+	assert.Len(t, list(young, "points"), 2)
+
+	// A first sale 200 days ago: 4,800 hours.
+	old := now.Add(-200 * 24 * time.Hour)
+	insertBooking(t, ev.ID, fanID, "PAID", old, &old, bookingItem{seats[2], ev.Cats["Regular"], 100_000}, bookingItem{seats[3], ev.Cats["Regular"], 100_000})
+
+	// No parameters at all: day buckets, from the first sale, both sales counted.
+	def := series("")
+	assert.Equal(t, "day", def["bucket"], "a range this long is shown in days")
+	points := list(def, "points")
+	assert.InDelta(t, 201, len(points), 1, "one point per Nairobi day from the first sale to today")
+	assert.EqualValues(t, 2, sum(points, "bookings"))
+	assert.EqualValues(t, 3, sum(points, "tickets"))
+	assert.EqualValues(t, 300_000, sum(points, "revenue_cents"))
+	assert.EqualValues(t, 2, points[0].(obj)["tickets"], "the series starts at the first sale")
+
+	// Hour buckets asked for, no `from`: the most recent 2,000 hours, not a 400.
+	hours := series("?bucket=hour")
+	assert.Equal(t, "hour", hours["bucket"])
+	points = list(hours, "points")
+	require.Len(t, points, 2000)
+	assert.EqualValues(t, 1, sum(points, "bookings"), "the sale of 200 days ago is outside the last 2,000 hours")
+	last, err := time.Parse(time.RFC3339, points[1999].(obj)["bucket_start"].(string))
+	require.NoError(t, err)
+	assert.WithinDuration(t, now, last, time.Hour+time.Minute, "the series ends at the current hour")
+
+	// No bucket but a `from` the caller chose: the bucket follows the range.
+	assert.Equal(t, "hour", series("?from=" + rfc(now.Add(-47*time.Hour)))["bucket"])
+	long := series("?from=" + rfc(now.Add(-49*time.Hour)))
+	assert.Equal(t, "day", long["bucket"])
+	assert.InDelta(t, 3, len(list(long, "points")), 1)
+
+	// A range the caller asked for that is too long is still refused, on the field they sent.
+	rules := wantFields(t, e.do("GET", path+"?bucket=hour&from="+rfc(old), nil, token), "from")
+	assert.Equal(t, "range", rules["from"])
+	wantFields(t, e.do("GET", path+"?from=2000-01-01T00:00:00Z", nil, token), "from")
+
+	// Even day buckets are capped by default: a first sale ten years back gives the most
+	// recent 2,000 days.
+	ancient := now.AddDate(-10, 0, 0)
+	insertBooking(t, ev.ID, fanID, "PAID", ancient, &ancient, bookingItem{seats[0], ev.Cats["VIP"], 500_000})
+	capped := series("")
+	assert.Equal(t, "day", capped["bucket"])
+	assert.Len(t, list(capped, "points"), 2000)
+	assert.EqualValues(t, 2, sum(list(capped, "points"), "bookings"))
 }

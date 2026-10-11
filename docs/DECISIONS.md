@@ -321,3 +321,72 @@ One line each: what was chosen and why. Newest at the bottom.
 - **The admin switches off editing while its own publish request is in flight.** A write that
   waits on the publish lock can answer 500 after about 15 seconds; the site tracks the publish
   with a TanStack mutation key and disables event edits and block edits until it answers.
+- **Nothing waits long for an event's lock: 409 `EVENT_BUSY` (review fix 1).** Publish holds
+  the event's gate and row for 30 to 44 s on the full venue, and cancel for 10 to 16 s on a
+  sold-out one. Everything else that takes that lock (paint, category create/edit/delete,
+  event edit and delete, cancel, a second publish) waited under the 15 s statement timeout
+  and answered 500. Each now sets `lock_timeout` for the one locking statement and answers
+  `EVENT_BUSY` with nothing changed: 5 s for staff calls (`events.Policy.LockWait`), 3 s for
+  a fan's hold (`booking.Policy.EventLockWait`) and for the layout editor
+  (`venue.DefaultLockWait`). 5 s because a writer legitimately waits for the holds in flight
+  when it reaches the gate (0.7 to 1.2 s in the worst storm measured). This replaces "the
+  admin switches off editing while its own publish is in flight" as the safety net; that UI
+  rule can stay as a courtesy.
+- **The lock wait is set for one statement and lifted again; the SQL is in `internal/store`.**
+  `store.SetLocalLockTimeout` and the `…Within` functions in `store/locks.go` (which also
+  took over the two raw `set_config` calls that were in `internal/venue`). The limit is put
+  back to the session's own before the rest of the transaction runs, so waits for hold and
+  seat rows behave exactly as before; `store.IsLockTimeout` recognises SQLSTATE 55P03.
+- **A hold on a busy event answers `EVENT_BUSY`, not a not-on-sale error.** `EVENT_NOT_ON_SALE`
+  tells the app to stop offering seats; busy tells it to try again in a moment, which is the
+  truth (an organiser's price change or a publish is in progress). A hold aimed at a draft
+  that is mid-publish gets the same answer instead of 404: reading the event before the gate
+  to tell the two apart would add a query to every hold for a case no real client reaches.
+  The changes in `internal/booking` are `admit` (now a method, for the policy) calling
+  `store.LockEventForHoldWithin`, and `Release` doing the same through
+  `LockEventOfHoldWithin` (a release queued behind a 16 s cancel would otherwise meet the
+  15 s statement timeout). `ExtendForPayment` still waits unbounded: it runs inside the
+  payment transaction of M7, which should decide its own answer for a busy event.
+- **A block edit locks the block `FOR NO KEY UPDATE`.** A publish holds `FOR KEY SHARE` on
+  every block it copies seats of (the `event_seats.block_id` foreign key), which `FOR UPDATE`
+  conflicts with and `FOR NO KEY UPDATE` does not; a move changes no key. Changing the code
+  does (`UNIQUE (stand_id, code)`), so that `UPDATE` waits and `UpdateBlock` runs under the
+  3 s lock wait. Delete and regenerate keep `FOR UPDATE` behind the venue lock.
+- **An edit after publish is checked against what publish required (review fix 2).**
+  `domain.PublishedEventProblems` on the merged row: both ends of the sales window set, in
+  order, not after kickoff; and the kickoff not moved into the past. "Kickoff in the past"
+  is only refused when the edit moves the kickoff: an event that has been played must stay
+  editable. A category of a non-draft event must cost more than zero on edit AND on create
+  (create was not in the review; without it an edit of such a category would be refused for
+  a price the caller did not send).
+- **Cancel has publish's timeouts (review fix 3).** Measured on the seeded venue sold out
+  (57,568 tickets, 14,392 paid bookings with one payment each, 1,000 live holds): 16.0 s and
+  10.7 s through the API on the dev laptop; the largest statements were queueing refunds
+  (4.5 s) and voiding tickets (4.0 s). That is inside the ordinary limits on an idle
+  machine (15 s a statement, 30 s a request) but with less than twice the room on the
+  request limit, on hardware where publish varied by half between runs. A cancel that
+  rolls back at 30 s on match-day load is the wrong failure, so it runs under
+  `routeTimeout` and `SetLocalStatementTimeout` (`Policy.CancelTimeout`, the same 55 s).
+  Still one transaction; a repeat is a no-op in about 60 ms.
+- **The default sales call always succeeds (review fix 4).** No `bucket`: hours for a range
+  up to 48 h, days beyond. No `from`: the first paid booking, moved forward to the most
+  recent 2,000 buckets when needed. Only a `from` the caller sent can be refused. The
+  `default: hour` on `SalesBucket` is gone from the contract because it is no longer true.
+- **A block has at most 3,000 seats (review fix 5).** `seatmap.MaxSeatsPerBlock`, checked in
+  `Validate` so previews and moves are covered too; the real maximum is 1,312. The error is
+  on both `rows` and `seats_per_row` with rule `max_seats`.
+- **The event lists accept counts up to 20 s old (review fix 9).** `Policy.ListCountsTTL`.
+  One cache entry per event serves both limits: a list never forces a load that a seat map
+  would not, and a seat map's 3-second refresh also freshens the list. Publish and cancel
+  still drop the entry.
+- **`CATEGORY_IN_USE.details.seats` counts every inventory row of the category.** Named
+  `seats`, not `seats_on_sale`: a blocked seat still points at its category and still stops
+  the delete. `CONFIRMATION_REQUIRED` keeps `{ sold, held }`.
+- **Request bodies in the contract declare no `default`.** openapi-typescript turns a
+  defaulted property into a required field; the default is stated in the description
+  instead. A test keeps it so for every request body (`CreateEvent.max_tickets_per_user`
+  and `CreateBlock.rotation_deg` had the same fault and were fixed with the reported ones).
+- **`DELETE /admin/events/{id}` (drafts only, under the event lock) and `DELETE
+  /admin/venues/{venueId}/templates/{templateId}`.** A cancelled draft is not deletable:
+  the rule is "DRAFT", not "never published", so there is one status to check.
+- **No new Go dependency and no migration 000008 for the M5 review fixes.**

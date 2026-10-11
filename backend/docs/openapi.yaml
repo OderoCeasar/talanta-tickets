@@ -605,6 +605,9 @@ paths:
         the moment of the request: a published event is `ON_SALE` exactly while now is
         inside `[sales_open_at, sales_close_at)` and `PUBLISHED` outside it. The `status`
         filter matches on that same value.
+
+        `seats_available` and `price_from_cents` in this list may be up to 20 seconds old.
+        `GET /events/{eventId}` and the seat map lag by a few seconds at most.
       security: []
       parameters:
         - name: from
@@ -627,6 +630,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/EventPage' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous.'
+          content: *err
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -648,6 +654,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Event' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous.'
+          content: *err
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
@@ -668,6 +677,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/CategoryList' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous.'
+          content: *err
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
@@ -694,6 +706,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StadiumMap' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous.'
+          content: *err
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
@@ -718,6 +733,9 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/StandBlocks' }
         '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401':
+          description: '`UNAUTHENTICATED` or `TOKEN_EXPIRED` - only when the request carries an `Authorization` header that is malformed, not a valid access token, or expired. No header is needed: leave it out and the call is anonymous.'
+          content: *err
         '404': { $ref: '#/components/responses/NotFound' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
@@ -862,6 +880,7 @@ paths:
             - `EVENT_NOT_ON_SALE` - the event is not in status `ON_SALE`.
             - `SALES_NOT_OPEN` - before `sales_open_at`.
             - `SALES_CLOSED` - after `sales_close_at`.
+            - `EVENT_BUSY` - the organiser is changing the event right now (publishing, cancelling or editing it) and it stayed locked for more than about 3 seconds. Nothing was held; ask again in a moment.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -932,7 +951,7 @@ paths:
           description: '`NOT_FOUND` - no such event, or the category is not part of it.'
           content: *err
         '409':
-          description: '`NO_ADJACENT_SEATS`, `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN` or `SALES_CLOSED`.'
+          description: '`NO_ADJACENT_SEATS`, `EVENT_NOT_ON_SALE`, `SALES_NOT_OPEN`, `SALES_CLOSED`, or `EVENT_BUSY` (the organiser is changing the event right now; nothing was held, ask again in a moment).'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -991,6 +1010,7 @@ paths:
           description: |
             - `PAYMENT_IN_PROGRESS` - an M-Pesa prompt is live for this hold's booking; wait for it to finish.
             - `HOLD_NOT_ACTIVE` - the hold is `CONVERTED` (the seats were bought).
+            - `EVENT_BUSY` - the organiser is changing the event right now and it stayed locked for more than about 3 seconds. Nothing changed; ask again in a moment. (If the event is being cancelled, the cancel releases the hold itself.)
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -1415,6 +1435,11 @@ paths:
         so existing inventory and tickets are not affected. A move that would take the
         block's outline outside the venue plan is 400 with rule `plan_bounds` on the
         placement fields that were sent.
+
+        A move, a new label or a new curve goes through while an event at the venue is
+        being published. A new `code` has to wait for the publish; if the wait passes
+        about 3 seconds, or someone else is editing the same block, the answer is 409
+        `EVENT_BUSY` and nothing changed.
       parameters:
         - $ref: '#/components/parameters/BlockId'
       requestBody:
@@ -1433,7 +1458,9 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: '`ALREADY_EXISTS` - another block in the stand has this code.'
+          description: |
+            - `ALREADY_EXISTS` - another block in the stand has this code.
+            - `EVENT_BUSY` - an event at the venue is being published, or the block is being changed by someone else. Nothing changed; try again in a moment.
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
     delete:
@@ -1472,7 +1499,9 @@ paths:
         **replaced** and the answer carries the new IDs. Replacing is refused once any
         event has inventory for the block.
 
-        Limits: 200 rows, 500 seats per row. The generated outline must stay inside the
+        Limits: 200 rows, 500 seats per row, and 3,000 seats in the block
+        (`rows` x `seats_per_row`; more is 400 with rule `max_seats` on both fields, for a
+        preview too). The generated outline must stay inside the
         venue plan (`0..plan_width` by `0..plan_height`); if it does not, the answer is 400
         with rule `plan_bounds` on `rows` and `seats_per_row` and nothing is saved. A
         layout the geometry cannot make (for example a row too long for the block's
@@ -1584,6 +1613,28 @@ paths:
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
+  /admin/venues/{venueId}/templates/{templateId}:
+    delete:
+      operationId: deleteVenueTemplate
+      tags: [AdminVenues]
+      summary: Delete a saved template
+      description: |
+        **Role:** ORGANISER, ADMIN. Removes the template. Events that were created from it
+        keep their categories and painting: those were copied when the event was made.
+      parameters:
+        - $ref: '#/components/parameters/VenueId'
+        - $ref: '#/components/parameters/TemplateId'
+      responses:
+        '204':
+          description: Deleted.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404':
+          description: '`NOT_FOUND` - no such template at this venue (or no such venue).'
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+
   # ---------------------------------------------------------------------------
   # Admin: events
   # ---------------------------------------------------------------------------
@@ -1592,7 +1643,7 @@ paths:
       operationId: listAdminEvents
       tags: [AdminEvents]
       summary: Events in every status
-      description: '**Role:** ORGANISER, ADMIN. Ordered by kickoff, latest first.'
+      description: '**Role:** ORGANISER, ADMIN. Ordered by kickoff, latest first. `seats_available` and `price_from_cents` in this list may be up to 20 seconds old; one event read on its own lags by a few seconds at most.'
       parameters:
         - name: status
           in: query
@@ -1687,6 +1738,12 @@ paths:
         `CANCELLED` and `COMPLETED` events cannot be edited. The times must still make
         sense together after the change (gates before kickoff, sales closing after they
         open and not after kickoff), otherwise 400.
+
+        Once the event has left `DRAFT` the change must also keep what publishing
+        checked: `sales_open_at` and `sales_close_at` cannot be cleared (400, rule
+        `required`) and `kickoff_at` cannot be moved to a time that has already passed
+        (400, rule `future`). An event whose kickoff has simply gone by can still have
+        its other fields edited.
       parameters:
         - $ref: '#/components/parameters/EventId'
       requestBody:
@@ -1705,7 +1762,35 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: '`EVENT_NOT_EDITABLE` - the event is `CANCELLED` or `COMPLETED`.'
+          description: |
+            - `EVENT_NOT_EDITABLE` - the event is `CANCELLED` or `COMPLETED`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
+          content: *err
+        '500': { $ref: '#/components/responses/Internal' }
+    delete:
+      operationId: deleteEvent
+      tags: [AdminEvents]
+      summary: Delete a draft event
+      description: |
+        **Role:** ORGANISER, ADMIN. Removes a `DRAFT` event with its categories and its
+        painting. Only a draft can be deleted: once published an event has inventory and
+        may have sales, so it is cancelled instead (409 `EVENT_NOT_EDITABLE`,
+        `details.current_status` says where it is; a draft that was cancelled is
+        `CANCELLED` and stays). Venue templates saved from the event are copies and are
+        not touched. Deleting an event that is already gone answers 404.
+      parameters:
+        - $ref: '#/components/parameters/EventId'
+      responses:
+        '204':
+          description: Deleted.
+        '400': { $ref: '#/components/responses/ValidationFailed' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            - `EVENT_NOT_EDITABLE` - the event is not `DRAFT`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -1764,8 +1849,12 @@ paths:
         otherwise to `PUBLISHED`. No request body.
 
         This is the one slow call in the API: for the full stadium it can take most of a
-        minute, so give it a client timeout of 60 seconds. Painting and category changes
-        sent while it runs wait for it and are then answered against the published event.
+        minute, so give it a client timeout of 60 seconds. While it runs the event is
+        locked: painting, category changes, edits of the event, cancel, a second publish
+        and a fan's hold request wait a few seconds (5 for staff calls, 3 for holds) and
+        are then answered 409 `EVENT_BUSY`, with nothing changed. Send them again once
+        the publish has answered. Changing a block's `code` at the same venue is refused
+        the same way; deleting or regenerating a block answers 409 `BLOCK_HAS_INVENTORY`.
 
         Safe to repeat: publishing an event that is already `PUBLISHED`, `ON_SALE` or
         `SOLD_OUT` changes nothing and answers 200 with `already_published: true`.
@@ -1788,6 +1877,7 @@ paths:
           description: |
             - `EVENT_NOT_READY` - see `details.problems`.
             - `INVALID_STATE_TRANSITION` - the event is `CANCELLED` or `COMPLETED`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment. A second publish sent while the first is still running gets this.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1818,6 +1908,11 @@ paths:
         per successful payment and moves `PAID` bookings to `REFUND_REQUIRED`, all in one
         transaction. A draft can be cancelled too. No request body. Safe to repeat:
         cancelling a `CANCELLED` event answers 200 with zero counts.
+
+        On a sold-out stadium this rewrites about 60,000 seats, tickets and bookings and
+        can take longer than an ordinary call, so it runs under the same longer time limit
+        as publish: give it a client timeout of 60 seconds. While it runs the event is
+        locked as it is during a publish (other calls answer 409 `EVENT_BUSY`).
       parameters:
         - $ref: '#/components/parameters/EventId'
       responses:
@@ -1831,7 +1926,9 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: '`INVALID_STATE_TRANSITION` - a `COMPLETED` event cannot be cancelled.'
+          description: |
+            - `INVALID_STATE_TRANSITION` - a `COMPLETED` event cannot be cancelled.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -1858,7 +1955,10 @@ paths:
       operationId: createCategory
       tags: [AdminEvents]
       summary: Add a category to an event
-      description: '**Role:** ORGANISER, ADMIN. The name is unique within the event.'
+      description: |
+        **Role:** ORGANISER, ADMIN. The name is unique within the event. While the event is
+        `DRAFT` a price of zero is accepted (it blocks publishing); once the event has left
+        `DRAFT` the price must be above zero (400 on `price_cents`, rule `gt`).
       parameters:
         - $ref: '#/components/parameters/EventId'
       requestBody:
@@ -1878,7 +1978,10 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: '`ALREADY_EXISTS` (name taken) or `EVENT_NOT_EDITABLE` (event is `CANCELLED` or `COMPLETED`).'
+          description: |
+            - `ALREADY_EXISTS` - name taken.
+            - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -1895,6 +1998,9 @@ paths:
         already be looking at the old price; `details` says how many seats of the category
         are sold or held, which may be none.) Sending the price the category already has is
         not a change. Past bookings always keep the price they were made at.
+
+        Once the event has left `DRAFT` the price must stay above zero: `price_cents: 0`
+        is 400 on `price_cents` (rule `gt`), with or without `confirm`.
       parameters:
         - $ref: '#/components/parameters/CategoryId'
       requestBody:
@@ -1918,6 +2024,7 @@ paths:
             - `CONFIRMATION_REQUIRED` - the event is published; resend with `confirm: true`. `details` has the sold and held counts.
             - `ALREADY_EXISTS` - name taken.
             - `EVENT_NOT_EDITABLE` - event is `CANCELLED` or `COMPLETED`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1945,7 +2052,9 @@ paths:
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
-          description: '`CATEGORY_IN_USE` - the event has inventory or bookings in this category.'
+          description: |
+            - `CATEGORY_IN_USE` - the event has inventory or bookings in this category. `details.seats` is how many seats were published in it; `details.sold` and `details.held` how many of those are sold or held now. `seats` above zero with both others at zero means the only obstacle is that the event is published.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
@@ -2003,7 +2112,9 @@ paths:
           description: '`NOT_FOUND` - no such event, or the category is not part of it.'
           content: *err
         '409':
-          description: '`EVENT_NOT_EDITABLE` - the event is no longer `DRAFT`.'
+          description: |
+            - `EVENT_NOT_EDITABLE` - the event is no longer `DRAFT`.
+            - `EVENT_BUSY` - the event is locked by a publish, a cancel or another edit that did not finish within a few seconds. Nothing changed; send the same request again in a moment.
           content: *err
         '422':
           description: '`VENUE_MISMATCH` - a block or row is not at the event''s venue; `details.fields` names them.'
@@ -2028,17 +2139,23 @@ paths:
 
         Time-series buckets start on Africa/Nairobi clock boundaries: a `day` bucket runs
         from Nairobi midnight (21:00 UTC) to the next. `from` is inclusive, `to` exclusive;
-        the first and last buckets only count what is inside the range. A range of more
-        than 2,000 buckets is refused with 400 on `from`.
+        the first and last buckets only count what is inside the range.
+
+        A call with no `bucket` and no `from` always succeeds, however long the event has
+        been selling. When `bucket` is left out the server picks it: `hour` for a range of
+        up to 48 hours, `day` beyond that; `series.bucket` says which. When `from` is left
+        out the series starts at the first paid booking, or later if that would be more
+        than 2,000 buckets: then it is the most recent 2,000. Only a `from` the caller
+        sent can be too far back: more than 2,000 buckets is then 400 on `from`.
       parameters:
         - $ref: '#/components/parameters/EventId'
         - name: bucket
           in: query
-          description: Width of each time-series bucket.
+          description: 'Width of each time-series bucket. Left out: `hour` when the range is 48 hours or less, otherwise `day`.'
           schema: { $ref: '#/components/schemas/SalesBucket' }
         - name: from
           in: query
-          description: Start of the time series. Defaults to the first paid booking.
+          description: Start of the time series. Left out, it is the first paid booking, moved forward if needed so that the series has at most 2,000 buckets.
           schema: { type: string, format: date-time }
         - name: to
           in: query
@@ -2510,6 +2627,11 @@ components:
       in: path
       required: true
       schema: { $ref: '#/components/schemas/Id' }
+    TemplateId:
+      name: templateId
+      in: path
+      required: true
+      schema: { $ref: '#/components/schemas/Id' }
     HoldId:
       name: holdId
       in: path
@@ -2760,7 +2882,6 @@ components:
     SalesBucket:
       type: string
       enum: [hour, day]
-      default: hour
 
     # -------------------------------------------------------------------------
     # Errors
@@ -2798,6 +2919,7 @@ components:
         - EVENT_NOT_READY
         - INVALID_STATE_TRANSITION
         - EVENT_NOT_EDITABLE
+        - EVENT_BUSY
         - BLOCK_HAS_INVENTORY
         - CATEGORY_IN_USE
         - CONFIRMATION_REQUIRED
@@ -2847,6 +2969,7 @@ components:
                 - { $ref: '#/components/schemas/NotReadyDetails' }
                 - { $ref: '#/components/schemas/EventStateDetails' }
                 - { $ref: '#/components/schemas/SalesStartedDetails' }
+                - { $ref: '#/components/schemas/CategoryInUseDetails' }
                 - { $ref: '#/components/schemas/InventoryDetails' }
                 - { $ref: '#/components/schemas/RateLimitDetails' }
     ValidationDetails:
@@ -2952,12 +3075,23 @@ components:
         current_status: { $ref: '#/components/schemas/EventStatus' }
     SalesStartedDetails:
       type: object
-      description: For `CONFIRMATION_REQUIRED`, `CATEGORY_IN_USE`.
+      description: For `CONFIRMATION_REQUIRED`.
       additionalProperties: false
       required: [sold, held]
       properties:
         sold: { type: integer }
         held: { type: integer }
+    CategoryInUseDetails:
+      type: object
+      description: For `CATEGORY_IN_USE`.
+      additionalProperties: false
+      required: [seats, sold, held]
+      properties:
+        seats:
+          type: integer
+          description: Seats published in this category (the event's inventory rows that point at it), whatever their status. Above zero as soon as the event is published with the category painted on any seat.
+        sold: { type: integer, description: How many of those seats are sold. }
+        held: { type: integer, description: How many of those seats are in a live hold. }
     InventoryDetails:
       type: object
       description: For `BLOCK_HAS_INVENTORY`.
@@ -3323,7 +3457,7 @@ components:
         poster_url: { type: [string, 'null'], format: uri, maxLength: 2048, description: An `http` or `https` address. }
         sales_open_at: { type: [string, 'null'], format: date-time }
         sales_close_at: { type: [string, 'null'], format: date-time, description: After `sales_open_at` and not after `kickoff_at`. }
-        max_tickets_per_user: { type: integer, minimum: 1, maximum: 50, default: 6 }
+        max_tickets_per_user: { type: integer, minimum: 1, maximum: 50, description: Optional. 6 when left out. }
         template_id:
           description: Copy this venue template's categories and assignments onto the new event.
           anyOf:
@@ -3372,7 +3506,7 @@ components:
       required: [name, price_cents, color_hex]
       properties:
         name: { type: string, minLength: 1, maxLength: 60 }
-        price_cents: { type: integer, format: int64, minimum: 0, description: 'Zero is accepted here but blocks publishing.' }
+        price_cents: { type: integer, format: int64, minimum: 0, description: 'Zero is accepted while the event is `DRAFT` (it blocks publishing) and refused afterwards.' }
         color_hex: { $ref: '#/components/schemas/ColorHex' }
         description: { type: [string, 'null'], maxLength: 500 }
     UpdateCategory:
@@ -3386,8 +3520,7 @@ components:
         description: { type: [string, 'null'], maxLength: 500 }
         confirm:
           type: boolean
-          default: false
-          description: Must be true to change the price once the event has left `DRAFT`.
+          description: Optional; false when left out. Must be true to change the price once the event has left `DRAFT`.
 
     # -------------------------------------------------------------------------
     # Seat map
@@ -4107,7 +4240,7 @@ components:
         label: { type: string, minLength: 1, maxLength: 60 }
         origin_x: { type: number }
         origin_y: { type: number }
-        rotation_deg: { type: number, minimum: -360, maximum: 360, default: 0 }
+        rotation_deg: { type: number, minimum: -360, maximum: 360, description: Optional. 0 when left out. }
         arc_radius: { type: [number, 'null'], exclusiveMinimum: 0, description: Null or omitted for a straight block. }
         seat_pitch_x: { type: number, exclusiveMinimum: 0 }
         seat_pitch_y: { type: number, exclusiveMinimum: 0 }
@@ -4130,13 +4263,15 @@ components:
       required: [rows, seats_per_row]
       properties:
         rows: { type: integer, minimum: 1, maximum: 200 }
-        seats_per_row: { type: integer, minimum: 1, maximum: 500 }
+        seats_per_row: { type: integer, minimum: 1, maximum: 500, description: '`rows` x `seats_per_row` may be at most 3,000.' }
         row_label_scheme:
-          $ref: '#/components/schemas/RowLabelScheme'
-          default: ALPHA
+          description: Optional. `ALPHA` when left out.
+          allOf:
+            - { $ref: '#/components/schemas/RowLabelScheme' }
         numbering_direction:
-          $ref: '#/components/schemas/NumberingDirection'
-          default: LTR
+          description: Optional. `LTR` when left out.
+          allOf:
+            - { $ref: '#/components/schemas/NumberingDirection' }
         row_offsets:
           type: array
           description: |
@@ -4146,8 +4281,7 @@ components:
           items: { type: number }
         dry_run:
           type: boolean
-          default: false
-          description: True returns the preview and saves nothing.
+          description: Optional; false when left out. True returns the preview and saves nothing.
     BlockLayout:
       type: object
       description: A block's rows and physical seats, generated or saved.

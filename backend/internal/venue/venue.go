@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/seatmap"
@@ -29,14 +28,26 @@ type DB interface {
 type Service struct {
 	db DB
 	q  *store.Queries
-	// lockWait is how long a block delete or regenerate waits for a publish at the same venue
-	// before giving up with BLOCK_HAS_INVENTORY.
+	// lockWait is how long a layout change waits for a lock a publish at the same venue is
+	// holding before it gives up: a block delete or regenerate with BLOCK_HAS_INVENTORY, a
+	// block edit with EVENT_BUSY.
 	lockWait time.Duration
 }
 
+// DefaultLockWait is how long a layout change waits for a publish before answering "busy".
+const DefaultLockWait = 3 * time.Second
+
 // NewService builds the service.
 func NewService(db DB) *Service {
-	return &Service{db: db, q: store.New(db), lockWait: 3 * time.Second}
+	return &Service{db: db, q: store.New(db), lockWait: DefaultLockWait}
+}
+
+// WithLockWait returns a copy of the service that waits d for locks held by a publish. Tests
+// use it to keep the wait short.
+func (s *Service) WithLockWait(d time.Duration) *Service {
+	c := *s
+	c.lockWait = d
+	return &c
 }
 
 // Block is a block with the two facts the editor needs beside its columns.
@@ -230,9 +241,16 @@ func (in UpdateBlockInput) placementFields() []string {
 
 // UpdateBlock renames or moves a block. Moving recomputes the outline and every seat's
 // position; seat ids, rows and numbering stay, so inventory and tickets are untouched.
+//
+// It never waits long for a lock. The block is locked FOR NO KEY UPDATE, which a publish
+// (holding FOR KEY SHARE on the block through event_seats.block_id) does not block, so a
+// move or a new label goes through while an event is being published. A new code is a key
+// change and does have to wait for the publish; that wait, and a wait for another edit of
+// the same block, ends after lockWait with EVENT_BUSY instead of a statement timeout.
 func (s *Service) UpdateBlock(ctx context.Context, blockID int64, in UpdateBlockInput) (Block, error) {
 	var out Block
-	err := store.InTx(ctx, s.db, func(q *store.Queries) error {
+	err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
+		q := store.New(tx)
 		info, err := q.GetBlockWithVenue(ctx, blockID)
 		if errors.Is(err, store.ErrNoRows) {
 			return domain.ErrNotFound
@@ -240,7 +258,12 @@ func (s *Service) UpdateBlock(ctx context.Context, blockID int64, in UpdateBlock
 		if err != nil {
 			return fmt.Errorf("get block %d: %w", blockID, err)
 		}
-		b, err := q.LockBlock(ctx, blockID)
+		// For the whole transaction: the lock below and the UPDATE of the block row are the
+		// two statements that can queue behind someone else.
+		if err := store.SetLocalLockTimeout(ctx, tx, s.lockWait); err != nil {
+			return err
+		}
+		b, err := q.LockBlockForEdit(ctx, blockID)
 		if errors.Is(err, store.ErrNoRows) {
 			return domain.ErrNotFound
 		}
@@ -296,6 +319,11 @@ func (s *Service) UpdateBlock(ctx context.Context, blockID int64, in UpdateBlock
 		out, err = decorate(ctx, q, updated, info.VenueID)
 		return err
 	})
+	if store.IsLockTimeout(err) {
+		busy := domain.EventBusy("An event at this venue is being published, or this block is being changed by someone else. Try again in a moment.")
+		busy.Err = err
+		return Block{}, busy
+	}
 	return out, err
 }
 
@@ -382,6 +410,12 @@ func paramError(err error, fallback []string) error {
 		return fmt.Errorf("generate seats: %w", err)
 	}
 	message := strings.ToUpper(pe.Reason[:1]) + pe.Reason[1:] + "."
+	if pe.Field == seatmap.FieldBlockSize {
+		// Neither number is wrong alone, so both inputs are marked.
+		return domain.Invalid(
+			domain.FieldError{Field: "rows", Rule: "max_seats", Message: message},
+			domain.FieldError{Field: "seats_per_row", Rule: "max_seats", Message: message})
+	}
 	fields := fallback
 	for _, f := range fallback {
 		if f == pe.Field || (pe.Field == "seat_pitch" && strings.HasPrefix(f, "seat_pitch")) {
@@ -443,19 +477,11 @@ func (s *Service) lockForLayoutChange(ctx context.Context, tx pgx.Tx, blockID in
 	// A publish at this venue holds the venue row for as long as it copies seats, which can
 	// be most of a minute. Waiting that long would run into the statement timeout and look
 	// like a server fault, so the wait is short and ends in an answer the editor can show.
-	wait := strconv.FormatInt(s.lockWait.Milliseconds(), 10)
-	if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', $1, true)", wait); err != nil {
-		return info, fmt.Errorf("set lock_timeout: %w", err)
-	}
-	if _, err := q.LockVenueForLayoutChange(ctx, info.VenueID); err != nil {
-		var pgErr *pgconn.PgError
-		if errors.As(err, &pgErr) && pgErr.Code == "55P03" { // lock_not_available
+	if err := q.LockVenueForLayoutChangeWithin(ctx, info.VenueID, s.lockWait); err != nil {
+		if store.IsLockTimeout(err) {
 			return info, domain.BlockHasInventory(nil, "An event at this venue is being published right now. Try again in a minute.")
 		}
 		return info, fmt.Errorf("lock venue %d: %w", info.VenueID, err)
-	}
-	if _, err := tx.Exec(ctx, "SELECT set_config('lock_timeout', '0', true)"); err != nil {
-		return info, fmt.Errorf("reset lock_timeout: %w", err)
 	}
 
 	info.Block, err = q.LockBlock(ctx, blockID)
