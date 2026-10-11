@@ -17,3 +17,16 @@ export async function getHealth(baseUrl: string): Promise<Health> {
 }
 
 export { colors } from "./theme";
+
+export { createApiClient } from "./api/client";
+export type { Api, ApiClient, ApiClientOptions, AuthSession, TokenStore } from "./api/client";
+export { ApiError, fieldErrors, isApiErrorBody, unwrap } from "./api/errors";
+export type {
+  ApiErrorBody,
+  ApiErrorCode,
+  ApiErrorDetails,
+  ApiFieldError,
+  ClientErrorCode,
+  FieldErrors,
+} from "./api/errors";
+export type { components, operations, paths } from "./api/schema";
