@@ -16,7 +16,7 @@ const goodSecret = "a-private-secret-that-is-long-enough-123"
 func clearAPIEnv(t *testing.T) {
 	t.Helper()
 	for _, k := range []string{
-		"APP_ENV", "LOG_LEVEL", "ADDR", "CORS_ORIGINS", "JWT_SECRET", "ADMIN_BASE_URL",
+		"APP_ENV", "LOG_LEVEL", "ADDR", "CORS_ORIGINS", "JWT_SECRET", "ADMIN_BASE_URL", "PUBLIC_BASE_URL",
 		"BOOTSTRAP_ADMIN_EMAIL", "BOOTSTRAP_ADMIN_PASSWORD",
 		"SMTP_HOST", "SMTP_PORT", "SMTP_USERNAME", "SMTP_PASSWORD", "SMTP_FROM",
 		"TRUSTED_PROXY_CIDRS", "CLIENT_IP_HEADER",
@@ -39,6 +39,7 @@ func productionEnv(t *testing.T) {
 	t.Setenv("JWT_SECRET", goodSecret)
 	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
 	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+	t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com")
 }
 
 // Production mode fails closed: a server whose env file was lost must not come up with
@@ -408,4 +409,43 @@ func TestLoadAPI_BookingFee(t *testing.T) {
 		require.Error(t, err, bad)
 		assert.Contains(t, err.Error(), "BOOKING_FEE_BPS", bad)
 	}
+}
+
+// The SMS ticket link is a bearer secret for the tickets: production must name a real https
+// origin for it, exactly as for invitation links.
+func TestPublicBaseURLInProduction(t *testing.T) {
+	t.Run("required", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("PUBLIC_BASE_URL", "")
+		_, err := LoadAPI()
+		require.ErrorContains(t, err, "PUBLIC_BASE_URL is required when APP_ENV=production")
+	})
+	for _, v := range []string{"http://talanta.example.com", "http://localhost:8080"} {
+		t.Run("must be https: "+v, func(t *testing.T) {
+			productionEnv(t)
+			t.Setenv("PUBLIC_BASE_URL", v)
+			_, err := LoadAPI()
+			require.ErrorContains(t, err, "PUBLIC_BASE_URL must be https when APP_ENV=production")
+		})
+	}
+	t.Run("not a URL", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("PUBLIC_BASE_URL", "talanta.example.com")
+		_, err := LoadAPI()
+		require.ErrorContains(t, err, "PUBLIC_BASE_URL must be an http(s) URL")
+	})
+	t.Run("https is accepted and the trailing slash dropped", func(t *testing.T) {
+		productionEnv(t)
+		t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com/")
+		cfg, err := LoadAPI()
+		require.NoError(t, err)
+		assert.Equal(t, "https://talanta.example.com", cfg.PublicBaseURL)
+	})
+	t.Run("development defaults to the local API and may use http", func(t *testing.T) {
+		clearAPIEnv(t)
+		t.Setenv("APP_ENV", "development")
+		cfg, err := LoadAPI()
+		require.NoError(t, err)
+		assert.Equal(t, "http://localhost:8080", cfg.PublicBaseURL)
+	})
 }

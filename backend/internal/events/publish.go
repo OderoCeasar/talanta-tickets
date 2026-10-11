@@ -224,7 +224,10 @@ func (s *Service) Cancel(ctx context.Context, eventID int64) (CancelResult, erro
 		if _, err := q.FreeHeldSeatsOfEvent(ctx, eventID); err != nil {
 			return fmt.Errorf("free held seats of event %d: %w", eventID, err)
 		}
-		tickets, err := q.VoidTicketsOfEvent(ctx, eventID)
+		// Which tickets may be voided is the ticket status rule's to say, not this query's.
+		tickets, err := q.VoidTicketsOfEvent(ctx, store.VoidTicketsOfEventParams{
+			EventID: eventID, FromStatuses: domain.TicketStatusesThatCanBecome(domain.TicketVoid),
+		})
 		if err != nil {
 			return fmt.Errorf("void tickets of event %d: %w", eventID, err)
 		}

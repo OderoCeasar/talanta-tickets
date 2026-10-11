@@ -82,8 +82,8 @@ func sellOut(t *testing.T, eventID, userID int64, sold, holds int) soldOut {
 		SELECT id, total_cents, '+254700000009', 'SUCCESS', 'ws_CO_scale_' || id, 'RSC' || id, now()
 		FROM bookings WHERE event_id = $1 AND status = 'PAID'`, eventID)
 	exec(t, `
-		INSERT INTO tickets (booking_id, event_seat_id, token_nonce, event_id, gate_group, key_id)
-		SELECT bi.booking_id, bi.event_seat_id, '\x01', $1, 'N-LOWER', 'k1'
+		INSERT INTO tickets (booking_id, event_seat_id, token_nonce, event_id, gate_group, key_id, qr_token)
+		SELECT bi.booking_id, bi.event_seat_id, '\x01', $1, 'N-LOWER', 'k1', 'TLT1.dGVzdA.dGVzdA'
 		FROM booking_items bi JOIN bookings b ON b.id = bi.booking_id
 		WHERE b.event_id = $1`, eventID)
 

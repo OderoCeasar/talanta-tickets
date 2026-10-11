@@ -331,6 +331,7 @@ func TestOTPRequest_UnsetAppEnvIsProductionAndReturnsNoDevCode(t *testing.T) {
 	t.Setenv("JWT_SECRET", testSecret)
 	// What production must set, or the config does not load at all.
 	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
+	t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com")
 	t.Setenv("TRUSTED_PROXY_CIDRS", "none")
 	for _, k := range []string{"BOOTSTRAP_ADMIN_EMAIL", "BOOTSTRAP_ADMIN_PASSWORD", "SMTP_HOST", "HTTP_WRITE_TIMEOUT", "REQUEST_TIMEOUT",
 		"CLIENT_IP_HEADER", "ARGON2_MAX_CONCURRENT", "OTP_ALLOWED_COUNTRY_CODES", "OTP_GLOBAL_HOURLY_LIMIT", "OTP_GLOBAL_DAILY_LIMIT", "SMTP_ALLOW_PLAINTEXT"} {

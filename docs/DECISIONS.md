@@ -390,3 +390,100 @@ One line each: what was chosen and why. Newest at the bottom.
   /admin/venues/{venueId}/templates/{templateId}`.** A cancelled draft is not deletable:
   the rule is "DRAFT", not "never published", so there is one status to check.
 - **No new Go dependency and no migration 000008 for the M5 review fixes.**
+- **Ticket QR text is `TLT1.<payload>.<signature>` with a fixed 51-byte binary payload (M7).**
+  Version (1), key number (2), ticket UUID (16), event ID (8), gate group (16, ASCII, zero
+  padded), nonce (8); integers big-endian. Always 160 characters, QR version 9 at level M
+  (53 x 53 modules). The whole layout, the verification order and a worked example are in
+  `docs/TICKET_FORMAT.md`, whose table and example are regenerated from the code by a test
+  that fails when they differ. §9.1 put only the ticket ID, event and nonce in the payload;
+  the gate group is added because correction 8 has the device check it offline.
+- **The signature is Ed25519 over `"talanta.ticket.v1\0" || payload`, not over the bare
+  payload.** A label in front means a signature this key ever makes for another purpose
+  cannot be passed off as a ticket, and a ticket signature is useless elsewhere.
+- **Token decoding is strict and canonical.** Only the base64url alphabet, no padding, and
+  the unused bits of a last character must be zero. The 86th signature character carries two
+  bits of it: a lenient decoder accepts 16 spellings of one signature, and Go's decoder also
+  skips line breaks. Either way one ticket would have several valid texts.
+- **Key IDs are `k<number>`, 1 to 65535, carried as two bytes.** A free-text key ID would
+  need a variable or padded field; a number is enough to rotate with and keeps the payload
+  at 51 bytes (68 base64 characters with no bits left over). `k0` is reserved for the
+  ephemeral development key, which a configured server refuses to trust.
+- **A ticket's signed text is stored (`tickets.qr_token`, migration 000008), not signed again
+  on every read.** Recomputing needs the private key of whatever key signed the ticket, so
+  after a rotation the server would have to keep every retired private key for as long as
+  one of its tickets exists; then nothing is ever really retired, and a leak of the key file
+  is a leak of every key there ever was. Stored, a retired key leaves only its public half
+  (`TICKET_VERIFY_KEYS`), old tickets are still shown byte for byte as issued, and a read
+  costs no signature. The cost is about 160 bytes a ticket (10 MB for a full stadium) and
+  that the database holds the tokens, which it already does in effect: it holds every
+  `web_token`, and whoever can read the table can read who sits where.
+- **The signing key never sits in a struct field.** `ticketing.Signer` keeps it in a closure,
+  so `%v`, `%+v`, `%#v`, slog and JSON of a signer, or of anything holding one in any kind of
+  field, cannot print it (fmt prints an unexported nested field without calling its
+  `String`). It is read by `ticketing.LoadKeyring` straight from the environment and is not
+  part of `config.API`, which is printed and logged.
+- **Production refuses to start without `TICKET_SIGNING_KEY`, with a malformed one, or with
+  the test key published in `docs/TICKET_FORMAT.md`** (as signer or as a trusted verify
+  key). Development and test with no key get a random one per process, key ID `k0`, and a
+  loud warning.
+- **Tickets are issued after the seats are sold, inside the same transaction; the precondition
+  is "booking PAID, every item's seat SOLD through the booking's own hold, event not
+  cancelled".** `ticketing.IssueForBooking` checks it under the booking's row lock and
+  refuses otherwise, so it cannot hand out tickets for seats that were not bought. This puts
+  a few statements after the `event_seats` write, which M6 asked to be last (the seat map
+  poll goes by the time of that write). It is safe because issue waits for nothing: every
+  row it locks (the event, the booking) the payment transaction already holds, and
+  `TestIssue_DoesNotWaitBehindAQueuedCancel` proves the re-lock does not queue. Measured: 61
+  ms for a 50-seat booking, begin to commit. The other order (issue first, sell after) would
+  mean undoing an issue whenever the sale came up short (correction 5).
+- **Issue is idempotent by an explicit check under the booking's row lock, with the
+  `tickets_live_seat_idx` unique index behind it.** A booking that has any ticket, in any
+  status, gets those back and nothing is written; two calls at once take turns. Without the
+  check the second call would be a unique violation in the middle of a payment.
+- **Issue runs under a savepoint.** A refusal (including the unique violation, which would
+  otherwise abort the whole transaction) leaves the caller's transaction usable, so the
+  payment flow can mark the booking `REFUND_REQUIRED` and commit that.
+- **Issue re-takes the event row `FOR SHARE` and refuses a cancelled event.** A caller that
+  followed the lock order already has the row and the statement costs nothing. One that did
+  not could otherwise insert a ticket while a cancel was past its void statement, leaving a
+  valid ticket for an event that is off.
+- **One rule decides which tickets can be voided: `domain.TransitionTicket`.** VALID and USED
+  may become VOID; nothing leaves VOID. Event cancel's `VoidTicketsOfEvent` hard-coded the
+  two statuses; it and the new `VoidTicketsOfBooking` now take them from
+  `domain.TicketStatusesThatCanBecome(VOID)`.
+- **`GET /me/tickets` pages by (kickoff, event, inventory seat id, ticket id).** "Then seat"
+  in the contract is the inventory id, which follows block, row and seat number; the ticket
+  id breaks the tie between a void ticket and its replacement on one seat.
+- **The web ticket page has its own route group and reads no access token.** Under
+  `OptionalAuth` a stale `Authorization` header would turn the page into a JSON 401. Every
+  answer of the page is HTML, including 429 and 500, and it has its own per-IP limit
+  (`RateLimits.WebTicketPerIP`, 3,000 a minute: a stand of fans shares an address).
+- **The web ticket page loads nothing and runs nothing.** `default-src 'none'`, images only
+  as `data:` URLs (the QR codes are inline PNGs), one style block allowed by its SHA-256,
+  no script. `Referrer-Policy: no-referrer` because the page's address is the secret. A QR
+  is drawn only for a `VALID` ticket; unknown link, malformed link and a booking with no
+  tickets get the same 404 page byte for byte.
+- **`bookings.web_token` stays as migration 000005 made it: 32 bytes from `gen_random_bytes`
+  (pgcrypto's CSPRNG), hex, unique.** Checked for this milestone: it is generated by the
+  database on insert, never derived from the reference or the id, and never logged (the
+  request log records the route pattern, not the path).
+- **The ticket SMS goes to the phone of the fan who made the booking, names no event, and is
+  sent after commit.** The link alone is 100 characters with the production origin, so the
+  text is "Talanta: you're going! Booking TLT-XXXXXX, 2 tickets: <link>" (154 GSM
+  characters) and falls back to shorter wordings for a longer `PUBLIC_BASE_URL`. An event
+  title could be long or hold a character outside the GSM alphabet, which makes the whole
+  SMS UCS-2 with a 70-character limit. `SendTicketSMS` returns nothing: a failed send is
+  logged (with the link cut out of the provider's error) and can never fail a payment.
+- **`PUBLIC_BASE_URL` is required and https in production, like `ADMIN_BASE_URL`.** The SMS
+  link is a bearer secret for the tickets; a localhost or http link is a silent failure or
+  a leak.
+- **`github.com/skip2/go-qrcode` v0.0.0-20200617195104-da1b6568686e draws the QR PNGs.** The
+  library named in ARCHITECTURE §2; it has no tagged release, so the pseudo-version of its
+  newest commit is pinned. No dependencies of its own. Level M, four-module quiet zone,
+  512 px by default (1.4 KB).
+- **`github.com/makiuchi-d/gozxing` v0.1.1, in tests only.** A pure-Go port of ZXing that
+  shares no code with the library that draws: the tests decode the PNG the API serves (and
+  the images on the web page) and require exactly `qr_token` back. The API binary does not
+  import it.
+- **`contracttest` reads `text/html` and `image/png` bodies as strings.** kin-openapi has no
+  decoder for either, and the web ticket page and the QR image are in the contract.

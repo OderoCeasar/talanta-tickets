@@ -77,6 +77,9 @@ type API struct {
 
 	// AdminBaseURL is where the admin site is served; invitation links point into it.
 	AdminBaseURL string
+	// PublicBaseURL is the origin a fan's phone reaches the API at. The SMS ticket link is
+	// PublicBaseURL + "/v1/t/<web token>".
+	PublicBaseURL string
 	// BootstrapAdmin is the first admin to create at startup when the database has none.
 	// Empty Email means "do not bootstrap".
 	BootstrapAdmin BootstrapAdmin
@@ -164,6 +167,7 @@ func LoadAPI() (API, error) {
 	}
 	cfg.TrustedProxies = l.trustedProxies(cfg.Base)
 	cfg.AdminBaseURL = l.adminBaseURL(cfg.Base)
+	cfg.PublicBaseURL = l.publicBaseURL(cfg.Base)
 	cfg.JWTSecret, cfg.JWTSecretIsDevDefault = l.jwtSecret(cfg.Base)
 	cfg.BootstrapAdmin = l.bootstrapAdmin()
 	cfg.SMTP = l.smtp()
@@ -208,22 +212,35 @@ func (l *Loader) trustedProxies(b Base) []netip.Prefix {
 // (a link to localhost is useless and looks like it worked) and must be https: the link is a
 // one-time credential.
 func (l *Loader) adminBaseURL(b Base) string {
+	return l.baseURL(b, "ADMIN_BASE_URL", "http://localhost:5173")
+}
+
+// publicBaseURL reads PUBLIC_BASE_URL, the origin the SMS ticket link points at. The same
+// rules as ADMIN_BASE_URL for the same reason: the link is a bearer secret for the tickets,
+// so in production it has no default and must be https.
+func (l *Loader) publicBaseURL(b Base) string {
+	return l.baseURL(b, "PUBLIC_BASE_URL", "http://localhost:8080")
+}
+
+// baseURL reads an origin that links sent to people are built on. devFallback is used only
+// in development and test.
+func (l *Loader) baseURL(b Base, key, devFallback string) string {
 	fallback := ""
 	if b.AllowDevShortcuts() {
-		fallback = "http://localhost:5173"
+		fallback = devFallback
 	}
-	raw := strings.TrimRight(l.str("ADMIN_BASE_URL", fallback), "/")
+	raw := strings.TrimRight(l.str(key, fallback), "/")
 	if raw == "" {
-		l.fail("ADMIN_BASE_URL is required when APP_ENV=production, for example https://talanta.example.com")
+		l.fail("%s is required when APP_ENV=production, for example https://talanta.example.com", key)
 		return ""
 	}
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-		l.fail("ADMIN_BASE_URL must be an http(s) URL such as https://talanta.example.com, got %q", raw)
+		l.fail("%s must be an http(s) URL such as https://talanta.example.com, got %q", key, raw)
 		return raw
 	}
 	if b.IsProduction() && u.Scheme != "https" {
-		l.fail("ADMIN_BASE_URL must be https when APP_ENV=production, got %q", raw)
+		l.fail("%s must be https when APP_ENV=production, got %q", key, raw)
 	}
 	return raw
 }

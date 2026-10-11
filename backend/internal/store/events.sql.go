@@ -653,11 +653,19 @@ func (q *Queries) UpdateEvent(ctx context.Context, arg UpdateEventParams) (Event
 }
 
 const voidTicketsOfEvent = `-- name: VoidTicketsOfEvent :execrows
-UPDATE tickets SET status = 'VOID' WHERE event_id = $1 AND status IN ('VALID', 'USED')
+UPDATE tickets SET status = 'VOID'
+WHERE event_id = $1 AND status = ANY($2::text[])
 `
 
-func (q *Queries) VoidTicketsOfEvent(ctx context.Context, eventID int64) (int64, error) {
-	result, err := q.db.Exec(ctx, voidTicketsOfEvent, eventID)
+type VoidTicketsOfEventParams struct {
+	EventID      int64
+	FromStatuses []string
+}
+
+// Cancel: every ticket of the event that may become VOID does. from_statuses comes from
+// domain.TicketStatusesThatCanBecome(VOID), the same rule a refund's void uses.
+func (q *Queries) VoidTicketsOfEvent(ctx context.Context, arg VoidTicketsOfEventParams) (int64, error) {
+	result, err := q.db.Exec(ctx, voidTicketsOfEvent, arg.EventID, arg.FromStatuses)
 	if err != nil {
 		return 0, err
 	}

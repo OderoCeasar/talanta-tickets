@@ -58,10 +58,12 @@ One line each. Updated at the end of every milestone.
   - `CLIENT_IP_HEADER` — now empty by default; leave it unset. Set it to `CF-Connecting-IP` only once the origin accepts connections solely from Cloudflare (firewall or tunnel), because Caddy passes that header through from anyone who can reach the origin.
   - Optional, defaults are sensible: `ARGON2_MAX_CONCURRENT` (4), `OTP_ALLOWED_COUNTRY_CODES` (254), `OTP_GLOBAL_HOURLY_LIMIT` (2000), `OTP_GLOBAL_DAILY_LIMIT` (10000). Alert on the error-level log line "ALERT: global sign-in SMS cap reached".
   - Optional: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` to email invitations. Without them the admin copies the link. The server must offer STARTTLS (or use port 465); otherwise mail is not sent unless `SMTP_ALLOW_PLAINTEXT=true`.
+  - Before merging `backend/payments-tickets`: `TICKET_SIGNING_KEY` — required; base64 of a 32-byte Ed25519 seed (`openssl rand -base64 32`). Keep a safe copy: tickets signed with a lost key can still be checked with its public half, but no new ones can be issued under that key ID. `TICKET_SIGNING_KEY_ID` defaults to `k1`.
+  - Before merging `backend/payments-tickets`: `PUBLIC_BASE_URL=https://talanta.vendorsoko.com` — required, https; used for the ticket link sent by SMS.
   - Optional: `BOOKING_FEE_BPS` (default 0) — booking fee in basis points of the subtotal.
   - The full list with defaults is in `backend/.env.example`.
 - Before merging the schema commit, check production has no rows that migration 000002 rejects, or the migrate step fails and leaves the schema marked dirty: `SELECT count(*) FROM users WHERE phone_e164 !~ '^\+[1-9][0-9]{7,14}$';` and `SELECT lower(email), count(*) FROM users WHERE email IS NOT NULL GROUP BY 1 HAVING count(*) > 1;` must both return nothing.
 - The venue layout exists only after the seeder runs. Against production it creates the venue and the template only: no demo events and no demo users.
-- Migration 000005 adds NOT NULL columns to `tickets` and `scan_logs`; it fails if production already has rows in those tables.
+- Migrations 000005 and 000008 add NOT NULL columns to `tickets` (and 000005 to `scan_logs`); they fail if production already has rows in those tables.
 - The worker (`cmd/worker`: hold sweeper, payment reconciliation, hourly `auth-cleanup`) is not in the production image or compose file. Until it is, expired holds are still reclaimed at hold time, but unpaid bookings are not expired, payments are not reconciled, and `otp_codes` and `refresh_tokens` grow without being trimmed.
 - New env vars for `/opt/talanta/.env` will be listed here as each milestone adds them.

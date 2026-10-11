@@ -720,7 +720,7 @@ func TestCancelEvent(t *testing.T) {
 	insertPayment(t, paidID, "FAILED", 200_000, now.Add(-time.Minute))
 	insertPayment(t, paidID, "SUCCESS", 200_000, now)
 	for _, seat := range seats[6:8] {
-		exec(t, `INSERT INTO tickets (booking_id, event_seat_id, token_nonce, event_id, gate_group, key_id) VALUES ($1, $2, '\x01', $3, 'N-LOWER', 'k1')`, paidID, seat, ev.ID)
+		exec(t, `INSERT INTO tickets (booking_id, event_seat_id, token_nonce, event_id, gate_group, key_id, qr_token) VALUES ($1, $2, '\x01', $3, 'N-LOWER', 'k1', 'TLT1.dGVzdA.dGVzdA')`, paidID, seat, ev.ID)
 	}
 
 	o := want(t, e.do("POST", cancel, nil, token), http.StatusOK)
