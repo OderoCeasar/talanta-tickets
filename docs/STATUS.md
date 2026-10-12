@@ -1,47 +1,50 @@
 # Status
 
-One line each. Updated at the end of every milestone.
+One line each. Updated at the end of every milestone. Test counts are in `docs/TEST_REPORT.md`.
 
 ## Done
 
 - M1 Foundation: `make dev` brings up db, migrate, api, worker, adminer; `make test` and `make lint` pass. CI workflow left as it was (deployment files are off limits).
 - M2 Schema and seed: migrations 000002–000007 go up/down/up; seeder makes 59,580 seats (layout 2.8 s) and inserts 0 rows on a second run.
-- API contract: `backend/docs/openapi.yaml` (72 operations), lints clean, TypeScript types generate.
-
+- API contract: `backend/docs/openapi.yaml`, lints clean, TypeScript types generate.
 - M3 Auth: phone OTP, email + password with optional two-step, rotating refresh tokens with reuse detection, role checks, staff invitations, first admin from env. Integration suite passes; the invite journey was run in a browser against the real API.
 - M4 Events and inventory: event, category, layout, template and painting endpoints; publish creates exactly one inventory row per active seat (59,568) and a second publish changes nothing.
 - M5 Seat map API: three levels plus the changed-since poll. Level 1 is 4,800 B, level 2 at most 6,557 B, level 3 for the largest block (1,312 seats) 43,617 B raw / 14,541 B gzipped; a poll with one change is 110 B.
 - M5 follow-up, review fixes: requests behind a publish answer 409 `EVENT_BUSY` after 3 to 5 s instead of 500; edits after publish keep the sales window, a future kickoff and prices above zero; cancel of a sold-out venue (57,568 tickets) takes 10.7 to 16.0 s under its own timeouts; the default sales call always succeeds; a block is capped at 3,000 seats; drafts and templates can be deleted. Contract is 74 operations.
 - M6 Holds and locking: hold, release, best available, sweeper, per-user limit, one payment extension, sell-by-hold. 1,000 parallel requests at 10 seats: 10 winners, 990 `SEATS_UNAVAILABLE`, 0 other errors, 0 seats held twice; 10 runs in a row passed. With the seat row lock removed the same test goes red (seats with 2 and 4 winners).
 - M7 Bookings, payments, tickets: booking from a hold with an idempotency key; mock provider with nine outcomes; M-Pesa Daraja provider (tested against a fake server only); callback; reconciliation worker; refunds and organiser alerts; signed tickets issued in the payment transaction. A test passes for every row of the §8.2 table; a double-tapped Pay makes one booking; a late payment for resold seats ends REFUND_REQUIRED with no seat sold twice. Whole suite green; checked by hand on the local api + worker.
-- Money-path review fixes (branch `payments-review-fixes`, migration 000009): a success after a FAILED or TIMEOUT verdict is applied; an STK push whose answer was lost stays live and its callback is matched; callbacks are stored before the webhook answers and retried by a worker job; TIMEOUT payments are re-queried for 7 days; every "paid" callback is confirmed with an STK query before anything is sold or refunded; unsignable tickets end in a refund; fees are whole shillings; the ledger checker sees dropped money. Each has a test on real Postgres that was seen red first.
-- M8 Mobile fan flow (on `main`): ran end to end on an Android 16 emulator against a stand-in server; not yet re-run against the real API.
-- M9 Admin web (on `main`): events, pricing, seat painting, publish, venue layout, templates, sales dashboard. A real full-venue publish through the browser showed the wait state and "Published" after 37.9 s.
+- Money-path review fixes (on `backend/payments-tickets`, migration 000009): a success after a FAILED or TIMEOUT verdict is applied; an STK push whose answer was lost stays live and its callback is matched; callbacks are stored before the webhook answers and retried by a worker job; TIMEOUT payments are re-queried for 7 days; every "paid" callback is confirmed with an STK query before anything is sold or refunded; unsignable tickets end in a refund; fees are whole shillings; the ledger checker sees dropped money. Each has a test on real Postgres that was seen red first.
+- M8 Mobile fan flow: ran on an Android 16 emulator against the REAL API (sign in, 4 seats on the 1,312-seat block, checkout total from the hold, wrong PIN, retry, 4 tickets; the QR decoded from the ticket screen equals the ticket's token). No booking exists until the fan taps Pay. Inter and Plus Jakarta Sans fonts and an app icon are in (branch `mobile/real-api-fonts-icon`).
+- M9 Admin web (on `main`): events, pricing, seat painting, publish, venue layout, templates, sales dashboard. A real full-venue publish through the browser showed the wait state and "Published" after 37.9 s. Alerts and Refunds screens, the busy-event message, delete for drafts and templates, a wait state for cancel, and the Inter and Plus Jakarta Sans fonts are on `main` too.
 - Admin web, first slice (on `main`): login, Team (invite, resend, revoke), set-password page, account page.
+- M10 Gate mode, backend (branch `backend/gate`): gate events, manifest with a change marker, scan upload where the server decides each result. A ticket bought through the API scanned ADMITTED, then DUPLICATE; wrong gate and a tampered token were refused. Full manifest for 59,568 tickets is 1.29 MB gzipped.
+- M11: whole backend suite green on `backend/gate` (22 packages); load test written and run (`make loadtest`); README rewritten; results in `docs/TEST_REPORT.md`.
 
 ## Partly done
 
-- M8: smooth zoom and pan on the largest block is not proven (the emulator was too loaded to judge); pinch was not exercised; no installable build was made.
-- M9: cancel event, and acting on refund-required bookings, are built but were not exercised against the real API.
+- M8: smooth zoom and pan on the largest block is not proven and pinch was not exercised (emulator only, no real phone); no installable build was made, so the icon was not seen on a launcher. Not run on the emulator: hold expiry back to the map, paying with under 2 minutes left, payments unavailable, a timed-out payment settling late, tickets offline, large system font. The app stopped responding to taps once during the run and the cause was not established.
+- M9: the admin role was exercised only on Team, Alerts and Refunds; a long cancel (an event with sales) was not observed; the admin does not yet use `Alert.event_title`, `Alert.resolution`, `Refund.booking_status`, `already_completed` or the `booking_reference` filter the API now offers.
+- M10 Gate mode, app: scanning screens with offline verification and an upload queue are built with unit tests; see the end of this file for whether the emulator run was done.
+- M11: the load test passes on correctness (50 holds, 450 refusals, 0 errors, 0 double holds, six runs) and FAILS the speed target: p95 is 1.7 to 2.8 s against 300 ms on the dev laptop. The second, mixed load test was not run. See `docs/TEST_REPORT.md`.
 
 ## Not started
 
-- M10 Gate mode
-- M11 Hardening
+- Nothing. What is unfinished is listed under "Partly done" and "Known bugs and limits".
+
 
 ## Known bugs and limits
 
 - Publishing 59,568 seats takes 30–44 s on the dev laptop (four foreign-key checks per row on `postgres:16-alpine`) against a 55 s limit for that route. Past the limit it rolls back and answers 500; a retry is safe. An async publish would remove the limit.
 - Level 3 for the largest blocks is up to 46,245 B raw (14,930 B gzipped at most), over the ~40 KB in §5.1; 8 of 96 blocks are over. Shrinking it means changing the seat tuple in the contract.
 - Nothing sets an event to SOLD_OUT or COMPLETED yet.
+- After a payment that ends in a refund with nothing sold, the hold stays ACTIVE until it expires (at most 10 minutes), so those seats are not back on sale at once.
+- A hold request alone takes about 65 ms on the dev laptop (several statements across five lock steps); folding it into fewer round trips is the first thing to do for speed.
+- Gate: two offline phones at the same gate group both admit the same ticket; a phone told ADMITTED can later lose to an earlier scan and only learns it by uploading that scan again; scan order is only as good as the phones' clocks; a signed-in gate account can mark a ticket ID used without presenting its QR (the account and device are recorded).
 - An ended hold (expired or released) lists no seats, because there is no hold-seats table.
-- `booking.ExtendForPayment` (used by M7) still waits without limit for an event that is being cancelled or published; M7 should bound it like hold and release.
-- The admin and mobile apps do not yet handle `EVENT_BUSY` (retry, or "this event is being published").
 - M-Pesa is untested against Safaricom: no real OAuth, STK push, STK query or callback has been made, and the callback source ranges in `.env.example` are placeholders. In particular unverified: the list of STK result codes treated as final failures (`domain.IsFinalSTKFailure`, written from Daraja's documentation), that Daraja's callback carries the full paying number (an unknown-ID callback is matched by it; a masked number matches nothing and is left to a person), how long Daraja answers an STK query for an old CheckoutRequestID (TIMEOUT payments are re-queried for 7 days), and whether Daraja resends a callback answered 503.
 - Every "paid" callback now costs one STK query to Daraja before it is applied. If Daraja's query is down, paid callbacks wait in the inbox (retried for 7 days) and reconciliation times payments out with an alert; nothing is sold on the callback body alone.
 - An unknown-ID "paid" callback is matched to a payment only when exactly one ID-less payment has the same phone and amount in the 24 hours before it; otherwise it stays for a person, with an alert filed under a guessed event (alerts must belong to an event).
 - A stored callback is only retried while the worker runs (`payment-callback-drain`); the worker is not in the production image yet (see below).
-- The mobile and admin apps still have the old generated `Payment` type (with `checkout_request_id` and `merchant_request_id`) and do not show `result_desc` on a `PENDING` payment ("we are checking with M-Pesa"); the admin does not yet use `Alert.event_title`, `Alert.resolution`, `Refund.booking_status`, `already_completed` or the `booking_reference` filter. Regenerate the clients (`make openapi-clients`).
 - The ticket QR is static, so a screenshot copies it. The rotating QR of §9.3 is not built.
 - Booking status FAILED is never written: a failed payment leaves the booking payable while its hold lives.
 - Diagrams (the booking and payment state diagram, ERD, sequence diagrams) are deferred on the owner's instruction.
@@ -79,4 +82,3 @@ One line each. Updated at the end of every milestone.
 - Migration 000009 adds a CHECK on `stands.code` (`^[A-Z0-9]{1,10}$`); it fails if production has a stand code outside it: `SELECT code FROM stands WHERE code !~ '^[A-Z0-9]{1,10}$';` must return nothing.
 - Migrations 000005 and 000008 add NOT NULL columns to `tickets` (and 000005 to `scan_logs`); they fail if production already has rows in those tables.
 - The worker (`cmd/worker`: hold sweeper, payment reconciliation, the callback drain, hourly `auth-cleanup`) is not in the production image or compose file. Until it is, expired holds are still reclaimed at hold time, but unpaid bookings are not expired, payments are not reconciled, a callback that could not be applied at once is not retried, and `otp_codes` and `refresh_tokens` grow without being trimmed.
-- New env vars for `/opt/talanta/.env` will be listed here as each milestone adds them.
