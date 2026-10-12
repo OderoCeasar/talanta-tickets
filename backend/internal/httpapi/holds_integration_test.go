@@ -324,25 +324,26 @@ func TestHolds_FeeAndTotal(t *testing.T) {
 	e := newEnv(t, withHoldPolicy(func(p *booking.Policy) { p.BookingFeeBPS = 250 }))
 	v := e.newVenue(1, 2, 4)
 	ev := e.readyEvent(v)
-	// 999.99 KES: 2.5% of one seat is 24.99975 shillings, which must come out as 25.00.
-	want(t, e.do("PATCH", fmt.Sprintf("/admin/categories/%d", ev.Cats["Regular"]), obj{"price_cents": 99_999}, ev.Token), http.StatusOK)
+	// KES 1,500: 2.5% of one seat is 37.50 shillings, which must come out as 38.00.
+	want(t, e.do("PATCH", fmt.Sprintf("/admin/categories/%d", ev.Cats["Regular"]), obj{"price_cents": 150_000}, ev.Token), http.StatusOK)
 	want(t, e.publish(ev), http.StatusOK)
 	seats := eventSeatIDs(t, ev.ID, v.BlockIDs[0])
 	_, fan := e.newFan()
 
 	one := want(t, e.hold(fan, ev.ID, seats[4]), http.StatusCreated)
-	assert.EqualValues(t, 99_999, one["subtotal_cents"])
-	assert.EqualValues(t, 2_500, one["fee_cents"])
-	assert.EqualValues(t, 102_499, one["total_cents"])
+	assert.EqualValues(t, 150_000, one["subtotal_cents"])
+	assert.EqualValues(t, 3_800, one["fee_cents"])
+	assert.EqualValues(t, 153_800, one["total_cents"])
 
-	// Three seats: the fee is worked out once, on the subtotal (74.99925 shillings → 75.00).
+	// Three seats: the fee is worked out once, on the subtotal (112.50 shillings → 113.00),
+	// not three times 38.00.
 	three := want(t, e.best(fan, ev.ID, ev.Cats["Regular"], 3), http.StatusCreated)
-	assert.EqualValues(t, 299_997, three["subtotal_cents"])
-	assert.EqualValues(t, 7_500, three["fee_cents"])
-	assert.EqualValues(t, 307_497, three["total_cents"])
+	assert.EqualValues(t, 450_000, three["subtotal_cents"])
+	assert.EqualValues(t, 11_300, three["fee_cents"])
+	assert.EqualValues(t, 461_300, three["total_cents"])
 
 	got := want(t, e.do("GET", fmt.Sprintf("/holds/%d", id64(three["id"])), nil, fan), http.StatusOK)
-	assert.EqualValues(t, 7_500, got["fee_cents"])
+	assert.EqualValues(t, 11_300, got["fee_cents"])
 	mine := items(want(t, e.do("GET", "/me/holds", nil, fan), http.StatusOK))
 	require.Len(t, mine, 2)
 	for _, m := range mine {

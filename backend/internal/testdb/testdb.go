@@ -56,6 +56,9 @@ func New(t testing.TB) *DB {
 	return db
 }
 
+// startupDeadline is how long a fresh Postgres may take to accept connections.
+const startupDeadline = 150 * time.Second
+
 // Start starts a database with an empty schema. The caller must Close it.
 func Start(ctx context.Context) (*DB, error) {
 	ctx, cancel := context.WithTimeout(ctx, 3*time.Minute)
@@ -69,10 +72,12 @@ func Start(ctx context.Context) (*DB, error) {
 		// default is 60 s, and when every test package starts its own Postgres at once on a
 		// busy machine the first-run initdb can take longer than that: the whole suite then
 		// fails on container start-up without a single assertion having run.
-		testcontainers.WithWaitStrategy(wait.ForAll(
-			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
-			wait.ForListeningPort("5432/tcp"),
-		).WithDeadline(150*time.Second)),
+		// WithWaitStrategyAndDeadline, not WithWaitStrategy: the latter wraps whatever it
+		// is given in its own 60 s deadline.
+		testcontainers.WithWaitStrategyAndDeadline(startupDeadline,
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2).WithStartupTimeout(startupDeadline),
+			wait.ForListeningPort("5432/tcp").WithStartupTimeout(startupDeadline),
+		),
 	)
 	if err != nil {
 		if container != nil {

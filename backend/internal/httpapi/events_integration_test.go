@@ -560,14 +560,16 @@ func TestCategories(t *testing.T) {
 	cats := fmt.Sprintf("/admin/events/%d/categories", ev.ID)
 	catPath := func(id int64) string { return fmt.Sprintf("/admin/categories/%d", id) }
 
-	ee := wantError(t, e.do("POST", cats, obj{"name": "VIP", "price_cents": 1, "color_hex": "#000000"}, token), http.StatusConflict, domain.CodeAlreadyExists)
+	ee := wantError(t, e.do("POST", cats, obj{"name": "VIP", "price_cents": 100, "color_hex": "#000000"}, token), http.StatusConflict, domain.CodeAlreadyExists)
 	assert.Contains(t, string(ee.Error.Details), `"name"`)
-	wantFields(t, e.do("POST", cats, obj{"name": "X", "price_cents": 1, "color_hex": "red"}, token), "color_hex")
+	wantFields(t, e.do("POST", cats, obj{"name": "X", "price_cents": 100, "color_hex": "red"}, token), "color_hex")
 	wantFields(t, e.do("POST", cats, obj{"name": "X", "color_hex": "#000000"}, token), "price_cents")
 	wantFields(t, e.do("POST", cats, obj{"name": "X", "price_cents": -5, "color_hex": "#000000"}, token), "price_cents")
+	// M-Pesa takes no cents, so a price with cents in it is refused when it is set.
+	wantFields(t, e.do("POST", cats, obj{"name": "X", "price_cents": 150_050, "color_hex": "#000000"}, token), "price_cents")
 	// Money is whole cents: a fraction is not a price.
 	wantFields(t, e.do("POST", cats, obj{"name": "X", "price_cents": 10.5, "color_hex": "#000000"}, token), "price_cents")
-	wantError(t, e.do("POST", "/admin/events/999999999/categories", obj{"name": "X", "price_cents": 1, "color_hex": "#000000"}, token), http.StatusNotFound, domain.CodeNotFound)
+	wantError(t, e.do("POST", "/admin/events/999999999/categories", obj{"name": "X", "price_cents": 100, "color_hex": "#000000"}, token), http.StatusNotFound, domain.CodeNotFound)
 	wantError(t, e.do("GET", "/admin/events/999999999/categories", nil, token), http.StatusNotFound, domain.CodeNotFound)
 
 	// A draft's price changes freely.
@@ -632,7 +634,7 @@ func TestCategories(t *testing.T) {
 	want(t, e.do("DELETE", catPath(late), nil, token), http.StatusNoContent)
 
 	want(t, e.do("POST", fmt.Sprintf("/admin/events/%d/cancel", ev.ID), nil, token), http.StatusOK)
-	wantError(t, e.do("POST", cats, obj{"name": "Never", "price_cents": 1, "color_hex": "#000000"}, token), http.StatusConflict, domain.CodeEventNotEditable)
+	wantError(t, e.do("POST", cats, obj{"name": "Never", "price_cents": 100, "color_hex": "#000000"}, token), http.StatusConflict, domain.CodeEventNotEditable)
 	wantError(t, e.do("PATCH", catPath(vip), obj{"name": "Never"}, token), http.StatusConflict, domain.CodeEventNotEditable)
 }
 
