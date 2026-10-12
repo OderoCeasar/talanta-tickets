@@ -7,8 +7,14 @@
     "scheme": "talanta",
     "orientation": "portrait",
     "userInterfaceStyle": "automatic",
+    "icon": "./assets/icon.png",
     "android": {
-      "package": "co.ke.vendorsoko.talanta"
+      "package": "co.ke.vendorsoko.talanta",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "monochromeImage": "./assets/adaptive-icon-monochrome.png",
+        "backgroundColor": "#064E3B"
+      }
     },
     "ios": {
       "bundleIdentifier": "co.ke.vendorsoko.talanta"
@@ -16,7 +22,29 @@
     "plugins": [
       "expo-router",
       "expo-status-bar",
-      "expo-secure-store"
+      "expo-secure-store",
+      [
+        "expo-font",
+        {
+          "fonts": [
+            "../node_modules/@expo-google-fonts/inter/400Regular/Inter_400Regular.ttf",
+            "../node_modules/@expo-google-fonts/inter/500Medium/Inter_500Medium.ttf",
+            "../node_modules/@expo-google-fonts/inter/600SemiBold/Inter_600SemiBold.ttf",
+            "../node_modules/@expo-google-fonts/plus-jakarta-sans/600SemiBold/PlusJakartaSans_600SemiBold.ttf",
+            "../node_modules/@expo-google-fonts/plus-jakarta-sans/700Bold/PlusJakartaSans_700Bold.ttf",
+            "../node_modules/@expo-google-fonts/plus-jakarta-sans/800ExtraBold/PlusJakartaSans_800ExtraBold.ttf"
+          ]
+        }
+      ],
+      [
+        "expo-splash-screen",
+        {
+          "image": "./assets/splash-icon.png",
+          "imageWidth": 200,
+          "resizeMode": "contain",
+          "backgroundColor": "#064E3B"
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true
@@ -28,6 +56,9 @@
       "eas": {
         "projectId": "5e8ce0c6-6016-45c4-a423-87d476bfcf65"
       }
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
     }
   }
 }

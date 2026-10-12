@@ -657,8 +657,10 @@ export interface paths {
          *     for the same hold answers `HOLD_ALREADY_BOOKED`, however close together the two
          *     requests arrive.
          *
-         *     `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal, the same sum the hold
-         *     showed as an estimate. `reference` is `TLT-` and six characters from
+         *     `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal rounded to the nearest
+         *     whole shilling (a multiple of 100 cents; half a shilling rounds up), the same sum
+         *     the hold showed as an estimate. M-Pesa takes whole shillings only, so a fee with a
+         *     fraction of a shilling would make the booking unpayable. `reference` is `TLT-` and six characters from
          *     `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no 0, O, 1, I or L).
          */
         post: operations["createBooking"];
@@ -720,9 +722,22 @@ export interface paths {
          *     | Paid, seats sold, tickets issued | `SUCCESS` | null | `PAID` |
          *     | Insufficient funds, wrong PIN, cancelled, prompt timed out | `FAILED` | that reason | `PENDING_PAYMENT` while the hold lives, else `EXPIRED` |
          *     | No answer from M-Pesa within 5 minutes | `TIMEOUT` | `timeout` | as above |
-         *     | Paid the wrong amount | `FAILED` | `wrong_amount` | `REFUND_REQUIRED` |
+         *     | M-Pesa itself reports a different amount paid | `FAILED` | `wrong_amount` | `REFUND_REQUIRED` |
+         *     | Paid, but the tickets could not be issued | `SUCCESS` | null | `REFUND_REQUIRED` |
          *     | Paid, but the seats were gone (hold ended and seats resold, event cancelled) | `SUCCESS` | null | `REFUND_REQUIRED` |
          *     | Paid a second time for a booking another payment already paid | `SUCCESS` | null | `PAID` (tickets kept; this payment is refunded) |
+         *
+         *     `FAILED` and `TIMEOUT` are not always the last word: if M-Pesa later confirms that
+         *     the money did arrive, the payment becomes `SUCCESS` and ends as one of the three
+         *     "Paid" rows above. Keep showing what `GET /payments/{paymentId}` says.
+         *
+         *     **When we cannot tell whether the request reached M-Pesa** (it timed out after it
+         *     was sent, or the answer was lost) the answer is still **202** with the payment
+         *     `PENDING`, and its `result_desc` says "We are checking with M-Pesa whether the
+         *     request went through. Do not pay again yet." The fan may or may not get a prompt.
+         *     Until that payment resolves, a second one for the booking is refused with 409
+         *     `PAYMENT_IN_PROGRESS`, so the fan cannot pay twice. It resolves as any other payment
+         *     does, or is closed as `TIMEOUT` after 5 minutes.
          *
          *     **Dev only:** `X-Mock-Outcome` chooses what the mock provider does. Sending the
          *     header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`. A value
@@ -779,19 +794,33 @@ export interface paths {
          * @description **Role:** public; called by Safaricom, not by our clients. No bearer token: the
          *     source IP is checked against an allowlist from config.
          *
-         *     The body is never trusted alone. The server finds the payment by
-         *     `CheckoutRequestID`, checks it is still open and that the `Amount` equals the
-         *     booking total. An unknown ID, a repeat, a forged body or a disallowed IP all get
-         *     the same answer and change nothing. A "paid" with no readable `Amount` is not
-         *     applied: the server asks Daraja (STK query) and acts on that answer. A receipt
-         *     number already recorded on another payment is treated the same way. The body is
-         *     limited to 64 KiB and is kept with the payment.
+         *     The body is never trusted alone: it is a hint to ask Daraja. The server finds the
+         *     payment by `CheckoutRequestID` and, for a "paid", asks Daraja itself (the
+         *     authenticated STK query) before anything is sold or queued for refund. Only
+         *     Daraja's own answer moves money. The `Amount` in the body is never treated as
+         *     money: Daraja's query names no amount and an STK prompt cannot be paid in part or
+         *     in excess, so a confirmed payment is paid in full at the amount we requested, and
+         *     a body naming a different amount only raises an `AMOUNT_MISMATCH` alert (no refund
+         *     is queued for the body's figure). A failure is taken from the body when its
+         *     `ResultCode` is a documented final failure; any other code is checked with Daraja.
          *
-         *     The work is done after the answer is sent, so the answer is immediate.
+         *     The callback is **written down before the answer is sent** (the callback inbox), so
+         *     it survives a busy event, a failed query and a restart; the work itself runs after
+         *     the answer and is retried by the worker until it is done. A success that arrives
+         *     for a payment already `FAILED` or `TIMEOUT` is still applied.
          *
-         *     Always answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body
-         *     that cannot be parsed, so Daraja does not retry and nothing is revealed to a
-         *     prober.
+         *     A "paid" whose `CheckoutRequestID` no payment has (the STK request reached M-Pesa
+         *     but its answer never reached us) is stored too, raises a `PAYMENT_UNRESOLVED` alert
+         *     naming the receipt and amount, and is matched to a payment with no M-Pesa ID by
+         *     phone and amount once Daraja confirms it. An unknown ID with a failure, a repeat, a
+         *     body that is not Daraja's, a `ResultCode` that does not fit 32 bits and a
+         *     disallowed IP change nothing. When payments are switched off
+         *     (`PAYMENT_PROVIDER=none`) every callback is ignored. The body is limited to 64 KiB.
+         *
+         *     Answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body that
+         *     cannot be parsed or comes from a disallowed address, so nothing is revealed to a
+         *     prober. The one exception is **503**: a real callback that could not be written
+         *     down (the database is unreachable) is not acknowledged as accepted.
          */
         post: operations["mpesaCallback"];
         delete?: never;
@@ -831,7 +860,7 @@ export interface paths {
          * The ticket's QR code as a PNG
          * @description **Role:** FAN, owner only. The image encodes the same `TLT1.…` string as
          *     `qr_token`. The app normally draws the QR itself from `qr_token`; this endpoint is
-         *     for sharing and printing. Errors are JSON.
+         *     for sharing and printing. Errors are JSON. 60 requests a minute per user.
          */
         get: operations["getTicketQr"];
         put?: never;
@@ -1242,6 +1271,11 @@ export interface paths {
          * @description **Role:** ORGANISER, ADMIN. The name is unique within the event. While the event is
          *     `DRAFT` a price of zero is accepted (it blocks publishing); once the event has left
          *     `DRAFT` the price must be above zero (400 on `price_cents`, rule `gt`).
+         *
+         *     Set prices in whole shillings (`price_cents` a multiple of 100). M-Pesa takes whole
+         *     shillings only: a booking whose total is not a whole number of shillings is created
+         *     but every payment for it answers `BOOKING_NOT_PAYABLE`. The API does not refuse
+         *     such a price yet (see `docs/STATUS.md`).
          */
         post: operations["createCategory"];
         delete?: never;
@@ -1463,7 +1497,13 @@ export interface paths {
          *     `REFUND_REQUIRED` booking has no refund left pending it becomes `REFUNDED` and any
          *     ticket it still has is voided. A booking that is `PAID` (the refund was for a second,
          *     duplicate payment) stays `PAID` and keeps its tickets. Seats are not touched: see
-         *     `docs/API_NOTES.md`. This records the fact, it does not move money. Safe to repeat.
+         *     `docs/API_NOTES.md`. This records the fact, it does not move money.
+         *
+         *     Safe to repeat: a refund that is already `DONE` answers 200 again with the first
+         *     `completed_at`, and `already_completed: true` says this call changed nothing.
+         *
+         *     The open `REFUND_REQUIRED` and `AMOUNT_MISMATCH` alerts about the refunded payment
+         *     are closed in the same step, with a `resolution`.
          */
         post: operations["completeRefund"];
         delete?: never;
@@ -1571,8 +1611,11 @@ export interface paths {
         };
         /**
          * Events a gate device can scan for
-         * @description **Role:** GATE_STAFF, ADMIN. Published events whose kickoff is within the last day
-         *     or still ahead, soonest first, each with its gate groups. Not paged.
+         * @description **Role:** GATE_STAFF, ADMIN. Published events (`PUBLISHED`, `ON_SALE`, `SOLD_OUT`)
+         *     whose kickoff is within the last 24 hours or still ahead, soonest first, each with
+         *     its gate groups. Not paged; at most 50. A cancelled event is not listed, but its
+         *     manifest still answers, so a device that already holds it hears that every ticket
+         *     is void.
          */
         get: operations["listGateEvents"];
         put?: never;
@@ -1600,11 +1643,20 @@ export interface paths {
          *
          *     **With `since=<version>`** (`full: false`): only tickets that changed after that
          *     version, in any status, including ones that became `VOID`. The device applies them
-         *     on top of what it has. If the version is unreadable or too old the server answers
-         *     `full: true` instead; always check `full`.
+         *     on top of what it has: each tuple is that ticket's status now, so applying one
+         *     twice is harmless. The server looks back two minutes before the version it is
+         *     given, so a ticket that changed shortly before the last download is sent again;
+         *     that is deliberate. If the version is unreadable, belongs to another event or is
+         *     older than 7 days the server answers `full: true` instead; always check `full`.
          *
-         *     `version` is an opaque string. Send with `Accept-Encoding: gzip`; a full stadium
-         *     is about 60,000 tuples.
+         *     `version` is an opaque string. Store it together with the ticket set it came with
+         *     and send back only that one. Send with `Accept-Encoding: gzip`; a full stadium is
+         *     about 60,000 tuples (2.8 MB, 1.3 MB gzipped).
+         *
+         *     `gate_group_index` points into the `gate_groups` array of the same answer. Store
+         *     the gate group's text with each ticket, not the index.
+         *
+         *     A draft event answers 404. A cancelled or finished event still answers.
          *
          *     The private signing key is never in this or any other answer.
          */
@@ -1628,22 +1680,45 @@ export interface paths {
         put?: never;
         /**
          * Upload a batch of scans made at the gate
-         * @description **Role:** GATE_STAFF, ADMIN. Up to 500 scans per call, from one device. Each scan
-         *     carries a UUID made on the device (`client_scan_id`); a scan that was already
-         *     uploaded is not stored again and gets the same answer as the first time, so the
-         *     device can resend a batch whenever it is unsure.
+         * @description **Role:** GATE_STAFF, ADMIN. Up to 500 scans per call, from one device; more is
+         *     413. Each scan carries a UUID made on the device (`client_scan_id`). A scan that
+         *     was already uploaded is not stored again and is not judged again: the answer is
+         *     the result the server holds for it now, so the device can resend a batch whenever
+         *     it is unsure. Nothing about a stored scan is taken from the second upload.
          *
-         *     The server decides the final result of each scan, which may differ from what the
-         *     device showed offline:
+         *     The server decides the final result of each new scan, which may differ from what
+         *     the device showed offline. In this order, the first that applies:
          *
-         *     - The earliest `ADMITTED` scan of a ticket (by `scanned_at`) wins and marks the
-         *       ticket `USED`. Every other admit of that ticket becomes `DUPLICATE`.
-         *     - A ticket the server does not know, a void ticket, or a `token` that fails
-         *       signature checking is `INVALID`.
-         *     - A ticket for another event is `WRONG_EVENT`; for another gate group, `WRONG_GATE`.
+         *     1. A `token` that fails signature checking, or is not the text issued for
+         *        `ticket_id`: `INVALID`. A token for another event: `WRONG_EVENT`; for another
+         *        gate group: `WRONG_GATE`.
+         *     2. A ticket the server does not know: `INVALID` (the scan is still stored).
+         *     3. A ticket of another event than the scan's `event_id`: `WRONG_EVENT`; of another
+         *        gate group than the scan's `gate_group`: `WRONG_GATE`.
+         *     4. A `VOID` or `TRANSFERRED` ticket: `INVALID`, also when it was scanned before it
+         *        was voided.
+         *     5. Otherwise, a scan the device did **not** report as `ADMITTED` keeps the device's
+         *        result: the server never turns a refusal into an admission.
+         *     6. Otherwise the scan is an admission. The admission of a ticket with the earliest
+         *        `scanned_at` (ties: the smaller `client_scan_id`) is `ADMITTED` and the ticket
+         *        is `USED`; every other admission of that ticket is `DUPLICATE`, whichever was
+         *        uploaded first.
          *
          *     `overridden` is true where the final result differs from the device's verdict:
          *     those are the scans this device lost.
+         *
+         *     **A result can change after it was given.** If another device later uploads an
+         *     earlier scan of the same ticket, that scan becomes `ADMITTED` and the one answered
+         *     `ADMITTED` before becomes `DUPLICATE`. The first device is not told; it sees the
+         *     change only if it uploads that scan again.
+         *
+         *     `scanned_at` is the device's clock and is bounded: a time in the future, more than
+         *     7 days old, or before the ticket was issued is replaced by the time the server
+         *     received the batch.
+         *
+         *     An `event_id` that does not exist is 400 for the whole batch. While an organiser
+         *     is cancelling or editing the event the answer may be 409 `EVENT_BUSY`: nothing was
+         *     stored, send the batch again.
          *
          *     A QR that could not be read as a ticket ID at all is not uploaded.
          */
@@ -1766,9 +1841,17 @@ export interface components {
         /**
          * @description - `REFUND_REQUIRED` - a payment arrived and bought nothing (seats resold, hold gone,
          *       event cancelled, or the booking was already paid). A refund is in the queue.
-         *     - `AMOUNT_MISMATCH` - a payment of the wrong amount. A refund is in the queue.
-         *     - `PAYMENT_UNRESOLVED` - M-Pesa gave no final answer for a payment within 5 minutes
-         *       and it was closed as `TIMEOUT`. Check the M-Pesa portal; nothing is queued.
+         *     - `AMOUNT_MISMATCH` - M-Pesa itself reported a payment of the wrong amount: a refund
+         *       for what M-Pesa says was paid is in the queue. Or a callback named an amount other
+         *       than the one requested for a payment M-Pesa confirmed: the payment was treated as
+         *       paid in full, NO refund is queued, and the message says to check the statement.
+         *     - `PAYMENT_UNRESOLVED` - we do not know what became of some money. Either M-Pesa gave
+         *       no final answer for a payment within 5 minutes and it was closed as `TIMEOUT`; or a
+         *       payment request may have reached M-Pesa without us learning its ID; or M-Pesa
+         *       reported a payment we cannot match to any booking (the message names the receipt,
+         *       the amount and the phone); or a stored callback could not be confirmed in 7 days.
+         *       Check the M-Pesa portal; nothing is queued. It is closed automatically, with a
+         *       `resolution`, if the payment later ends in tickets or a queued refund.
          * @enum {string}
          */
         AlertKind: "REFUND_REQUIRED" | "AMOUNT_MISMATCH" | "PAYMENT_UNRESOLVED";
@@ -2558,9 +2641,10 @@ export interface components {
             subtotal_cents: number;
             /**
              * Format: int64
-             * @description The booking fee a booking made from this hold would charge on `subtotal_cents`,
-             *     in whole cents, rounded down. Zero when there is no fee. An estimate, like
-             *     `subtotal_cents`.
+             * @description The booking fee a booking made from this hold would charge on `subtotal_cents`:
+             *     always a whole number of shillings (a multiple of 100), rounded to the nearest
+             *     shilling with half a shilling rounding up. Zero when there is no fee. An
+             *     estimate, like `subtotal_cents`.
              */
             fee_cents: number;
             /**
@@ -2633,6 +2717,11 @@ export interface components {
             /** @description The M-Pesa number to prompt. May differ from the account's phone. */
             phone: components["schemas"]["Phone"];
         };
+        /**
+         * @description A payment as its owner (and staff) see it. Daraja's request IDs
+         *     (`CheckoutRequestID`, `MerchantRequestID`) are deliberately NOT part of it: the
+         *     `CheckoutRequestID` is the key a callback is matched by, and no client needs it.
+         */
         Payment: {
             id: components["schemas"]["Id"];
             booking_id: components["schemas"]["Id"];
@@ -2644,16 +2733,19 @@ export interface components {
             amount_cents: number;
             currency: components["schemas"]["Currency"];
             phone: components["schemas"]["Phone"];
-            merchant_request_id: string | null;
-            /** @description Daraja's ID for the prompt. */
-            checkout_request_id: string | null;
             /** @description M-Pesa receipt number, once paid. */
             mpesa_receipt: string | null;
-            /** @description Null while live and on success. Set for `FAILED` and `TIMEOUT`. `wrong_amount` is a `FAILED` payment whose `result_code` is 0: M-Pesa took the money, we refused it, `booking_status` is `REFUND_REQUIRED`. */
+            /** @description Null while live and on success. Set for `FAILED` and `TIMEOUT`. `wrong_amount` is a `FAILED` payment whose `result_code` is 0: M-Pesa took the money, we refused it, `booking_status` is `REFUND_REQUIRED`. A `FAILED` or `TIMEOUT` payment can still become `SUCCESS` later, when M-Pesa confirms the money did arrive. */
             failure_reason: components["schemas"]["PaymentFailureReason"] | null;
             /** @description The provider's raw result code. */
             result_code: number | null;
-            /** @description The provider's own wording. For display or support only. */
+            /**
+             * @description The provider's own wording, for display or support only. On a `PENDING` payment
+             *     it is normally null; when it is set there ("We are checking with M-Pesa whether
+             *     the request went through. Do not pay again yet.") the request may or may not
+             *     have reached M-Pesa, and the app should show that text instead of "check your
+             *     phone".
+             */
             result_desc: string | null;
             /** Format: date-time */
             created_at: string;
@@ -2680,6 +2772,11 @@ export interface components {
                     };
                 };
             };
+        };
+        MpesaCallbackNotStored: {
+            /** @enum {integer} */
+            ResultCode: 1;
+            ResultDesc: string;
         };
         MpesaCallbackAck: {
             /** @enum {integer} */
@@ -3128,14 +3225,27 @@ export interface components {
         Alert: {
             id: components["schemas"]["Id"];
             event_id: components["schemas"]["Id"];
+            /** @description The title of the event the alert is filed under. */
+            event_title: string;
             booking_id: components["schemas"]["Id"] | null;
             booking_reference: components["schemas"]["BookingReference"] | null;
             kind: components["schemas"]["AlertKind"];
             message: string;
             /** Format: date-time */
             created_at: string;
-            /** Format: date-time */
+            /**
+             * Format: date-time
+             * @description When the alert was closed, by a person (`ackAlert`) or by the system (then `resolution` is set).
+             */
             acknowledged_at: string | null;
+            /**
+             * @description Null for an open alert and for one a person acknowledged. Set when the SYSTEM
+             *     closed it because what it asked for is done, and says which:
+             *     a `PAYMENT_UNRESOLVED` alert whose payment later sold its seats or had a refund
+             *     queued; a `REFUND_REQUIRED` or `AMOUNT_MISMATCH` alert whose refund was marked
+             *     as paid back. For display.
+             */
+            resolution: string | null;
         };
         AlertPage: {
             items: components["schemas"]["Alert"][];
@@ -3145,11 +3255,19 @@ export interface components {
             id: components["schemas"]["Id"];
             booking_id: components["schemas"]["Id"];
             booking_reference: components["schemas"]["BookingReference"];
+            /**
+             * @description The booking's status now. `REFUND_REQUIRED`: completing its last pending refund
+             *     makes it `REFUNDED` and voids its tickets. `PAID`: the refund is for a second
+             *     payment; the booking keeps its tickets.
+             */
+            booking_status: components["schemas"]["BookingStatus"];
+            /** @description Only in the answer of `completeRefund`. True when the refund was already `DONE` and this call changed nothing. */
+            already_completed?: boolean;
             event_id: components["schemas"]["Id"];
             payment_id: components["schemas"]["Id"];
             /**
              * Format: int64
-             * @description What was actually received and must go back.
+             * @description What must go back: the amount M-Pesa itself confirmed, never a figure taken from a callback body alone.
              */
             amount_cents: number;
             currency: components["schemas"]["Currency"];
@@ -3185,7 +3303,13 @@ export interface components {
             gate_groups: components["schemas"]["GateGroup"][];
             /** @description Tickets that are `VALID` or `USED`. */
             ticket_count: number;
-            /** @description The current manifest `version`. If it equals the one on the device, there is nothing to download. */
+            /**
+             * @description An opaque change marker. It differs from the value in an earlier listing
+             *     exactly when something a device stores about the event changed in between:
+             *     a ticket was issued, used, voided or transferred, or the event's details,
+             *     gate groups or keys changed. It is **not** a manifest `version`: never send
+             *     it as `since` (the answer would be a full manifest).
+             */
             manifest_version: string;
         };
         GateEventList: {
@@ -3228,7 +3352,8 @@ export interface components {
             /** Format: date-time */
             generated_at: string;
             /**
-             * @description Every public key that signed a ticket for this event; normally one. A token
+             * @description Every public key the server accepts ticket signatures from, so every key
+             *     that signed a ticket for this event; normally one. Public keys only. A token
              *     names its key by ID. A token whose key ID is not here is invalid.
              */
             keys: {
@@ -3239,9 +3364,9 @@ export interface components {
                 /** @description The 32-byte Ed25519 public key, base64url without padding. */
                 public_key: string;
             }[];
-            /** @description The table `gate_group_index` points into. Always the venue's full list in a stable order, also in a changes-only manifest. */
+            /** @description The table `gate_group_index` points into. Always the venue's full list, sorted, also in a changes-only manifest. An index is only good for the answer it came in. */
             gate_groups: components["schemas"]["GateGroup"][];
-            /** @description Tickets that are `VALID` or `USED` for the event as of `version`, whatever `tickets` holds. A device can check its stored set against it. */
+            /** @description Tickets that are `VALID` or `USED` for the event, read in the same snapshot as `tickets`, whatever `tickets` holds. After applying the answer a device holds exactly this many tickets. */
             ticket_count: number;
             tickets: components["schemas"]["ManifestTicketTuple"][];
         };
@@ -3262,7 +3387,7 @@ export interface components {
             gate_group: components["schemas"]["GateGroup"];
             /**
              * Format: date-time
-             * @description Device clock at the moment of the scan.
+             * @description Device clock at the moment of the scan. Bounded by the server, see the operation.
              */
             scanned_at: string;
             /** @description What the device decided offline and showed to the steward. */
@@ -3290,7 +3415,7 @@ export interface components {
                 ticket_status: components["schemas"]["TicketStatus"] | null;
                 /**
                  * Format: date-time
-                 * @description When the winning admit of this ticket was scanned. Null if it was never admitted.
+                 * @description When the winning admit of this ticket was scanned (the ticket's `used_at`). Null if it was never admitted.
                  */
                 first_admitted_at: string | null;
             }[];
@@ -4742,7 +4867,10 @@ export interface operations {
             };
         };
         responses: {
-            /** @description The prompt was sent; the payment is `PENDING`. */
+            /**
+             * @description The payment is `PENDING`. Normally the prompt was sent. When `result_desc` is not
+             *     null the request may not have reached M-Pesa and is being checked (see above).
+             */
             202: {
                 headers: {
                     [name: string]: unknown;
@@ -4799,7 +4927,7 @@ export interface operations {
             };
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
-            /** @description `PAYMENT_PROVIDER_UNAVAILABLE` - M-Pesa did not accept the request. The attempt is kept as a `FAILED` payment (the booking shows it as `latest_payment`); no payment is left live and the fan may retry at once. */
+            /** @description `PAYMENT_PROVIDER_UNAVAILABLE` - the request provably did not reach M-Pesa, or M-Pesa refused it. The attempt is kept as a `FAILED` payment (the booking shows it as `latest_payment`); no payment is left live and the fan may retry at once. (A request that MAY have reached M-Pesa is not this: it is a 202.) */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -4850,7 +4978,7 @@ export interface operations {
             };
         };
         responses: {
-            /** @description Always. */
+            /** @description Always, except as below. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -4863,6 +4991,23 @@ export interface operations {
                      *     }
                      */
                     "application/json": components["schemas"]["MpesaCallbackAck"];
+                };
+            };
+            /** @description The callback is a valid one from an allowed address and could not be stored. Nothing was accepted; send it again. */
+            503: {
+                headers: {
+                    /** @description Seconds to wait before sending it again. */
+                    "Retry-After"?: number;
+                    [name: string]: unknown;
+                };
+                content: {
+                    /**
+                     * @example {
+                     *       "ResultCode": 1,
+                     *       "ResultDesc": "Temporarily unavailable"
+                     *     }
+                     */
+                    "application/json": components["schemas"]["MpesaCallbackNotStored"];
                 };
             };
         };
@@ -4923,6 +5068,7 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
         };
     };
@@ -6134,6 +6280,8 @@ export interface operations {
             query?: {
                 status?: components["schemas"]["RefundStatus"];
                 event_id?: components["schemas"]["Id"];
+                /** @description Only the refunds of this booking. Lets an alert link to its refund. */
+                booking_reference?: components["schemas"]["BookingReference"];
                 /** @description Page size. */
                 limit?: components["parameters"]["Limit"];
                 /** @description The `next_cursor` from the previous page. Opaque. */
@@ -6171,7 +6319,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description The refund. */
+            /** @description The refund, with `already_completed`. */
             200: {
                 headers: {
                     [name: string]: unknown;
@@ -6558,7 +6706,16 @@ export interface operations {
             400: components["responses"]["ValidationFailed"];
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
-            /** @description `PAYLOAD_TOO_LARGE` - split the batch. */
+            /** @description `EVENT_BUSY` - an event of the batch is being cancelled or edited. Nothing was stored; send the batch again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
+            /** @description `PAYLOAD_TOO_LARGE` - more than 500 scans, or a body over 1 MiB. Split the batch. */
             413: {
                 headers: {
                     [name: string]: unknown;
@@ -6567,6 +6724,7 @@ export interface operations {
                     "application/json": components["schemas"]["Error"];
                 };
             };
+            429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
         };
     };

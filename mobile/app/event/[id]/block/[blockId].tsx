@@ -13,7 +13,7 @@ import { buildGeometry, SEAT_ACCESSIBLE, SEAT_COMPANION, SEAT_RESTRICTED, seatLa
 import { SeatCanvas, type SeatCanvasHandle } from "../../../../src/features/seatmap/SeatCanvas";
 import { useBlockPolling } from "../../../../src/features/seatmap/useBlockPolling";
 import { formatCountdown, remainingMs } from "../../../../src/lib/countdown";
-import { errorMessage, unavailableSeatIds } from "../../../../src/lib/errors";
+import { backToMapMessage, errorMessage, isEventBusy, unavailableSeatIds } from "../../../../src/lib/errors";
 import { formatKes, sumCents } from "../../../../src/lib/money";
 import { useAppActive } from "../../../../src/lib/useAppActive";
 import { useNow } from "../../../../src/lib/useNow";
@@ -25,6 +25,8 @@ import { Banner, Button, ErrorState, Icon, Loading, Sheet } from "../../../../sr
 interface Notice {
   tone: "info" | "warning" | "error";
   text: string;
+  /** Offer "Try again" for the Continue that was refused; the selection is untouched. */
+  retry?: boolean;
 }
 
 /** Level 3: the seats of one block. */
@@ -73,7 +75,7 @@ export default function BlockScreen() {
   useEffect(() => () => clearTimeout(noticeTimer.current), []);
   // Checkout sends the fan back here with `expired` set when the hold ran out.
   useEffect(() => {
-    if (expired) say({ tone: "warning", text: "Your time to pay ran out, so the seats were released. Choose your seats again." }, true);
+    if (expired) say({ tone: "warning", text: backToMapMessage(expired === "too_late" ? "too_late" : "ended") }, true);
   }, [expired, say]);
 
   // Geometry depends only on where seats are. A poll that changes statuses keeps the same
@@ -197,10 +199,17 @@ export default function BlockScreen() {
           syncHold(h.expires_at, h.remaining_seconds);
           clearSelection();
           // The idempotency key for this checkout is made here, once, and kept with the hold.
-          await writeStoredCheckout({ holdId: h.id, eventId, idempotencyKey: Crypto.randomUUID(), bookingReference: null });
+          // It is first sent when the fan taps Pay, not before: no booking exists until then.
+          await writeStoredCheckout({ holdId: h.id, eventId, blockId, idempotencyKey: Crypto.randomUUID(), bookingReference: null });
           router.push({ pathname: "/checkout/[holdId]", params: { holdId: String(h.id) } });
         },
         onError: (error) => {
+          // An organiser is publishing or changing the event. Nothing happened to the seats:
+          // keep the selection exactly as it is and offer the same Continue again.
+          if (isEventBusy(error)) {
+            say({ tone: "warning", text: errorMessage(error), retry: true }, true);
+            return;
+          }
           const lost = unavailableSeatIds(error);
           if (lost.length > 0) {
             // Grey out what was lost, keep the rest selected, and load the block's real state.
@@ -213,7 +222,7 @@ export default function BlockScreen() {
         },
       },
     );
-  }, [selectedIds, createHold, eventId, syncHold, clearSelection, markLost, refetchBlock, say]);
+  }, [selectedIds, createHold, eventId, blockId, syncHold, clearSelection, markLost, refetchBlock, say]);
 
   // Signing in is asked for only at Continue. When the fan comes back signed in, carry on.
   const continueAfterSignIn = useRef(false);
@@ -267,7 +276,15 @@ export default function BlockScreen() {
       <View style={[styles.bottom, { paddingBottom: Math.max(insets.bottom, space.md) }]}>
         {pollingPaused ? <Text style={[type.small, { color: palette.warning }]}>Live updates are paused. Seats shown may be out of date.</Text> : null}
         {notice ? (
-          <Banner tone={notice.tone} testID="seat-notice">
+          <Banner
+            tone={notice.tone}
+            testID="seat-notice"
+            action={notice.retry && count > 0 && !createHold.isPending ? "Try again" : undefined}
+            onAction={() => {
+              setNotice(null);
+              onContinue();
+            }}
+          >
             {notice.text}
           </Banner>
         ) : null}
@@ -363,6 +380,6 @@ const styles = StyleSheet.create({
     borderTopColor: palette.grey300,
   },
   summary: { flexDirection: "row", alignItems: "center", gap: space.md },
-  total: { fontSize: 18, fontWeight: "800", color: palette.emeraldInk },
-  timer: { fontSize: 22, fontWeight: "800", color: palette.warning, fontVariant: ["tabular-nums"] },
+  total: { ...type.price, fontSize: 18, lineHeight: 24 },
+  timer: { ...type.clock, fontSize: 22, lineHeight: 28, color: palette.warning },
 });

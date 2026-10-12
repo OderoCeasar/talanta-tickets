@@ -237,7 +237,15 @@ export function seatAt(g: SeatGeometry, px: number, py: number): number {
 
 /** `C14`: the row label followed by the seat number. */
 export function seatLabel(g: SeatGeometry, index: number): string {
-  return `${g.rowLabels[g.row[index]!] ?? ""}${g.number[index]}`;
+  return joinSeatLabel(g.rowLabels[g.row[index]!] ?? "", g.number[index]!);
+}
+
+/**
+ * Row label plus seat number, the way the server writes `seat_label`: `C14` for a lettered
+ * row, `12-14` for a numbered one (row 12, seat 14), which would otherwise read as "1214".
+ */
+export function joinSeatLabel(rowLabel: string, seatNumber: number): string {
+  return /^[0-9]+$/.test(rowLabel) ? `${rowLabel}-${seatNumber}` : `${rowLabel}${seatNumber}`;
 }
 
 /** Statuses in the same order as the geometry's arrays. */

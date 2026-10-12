@@ -6,7 +6,8 @@ import Svg, { Polygon, Rect, Text as SvgText } from "react-native-svg";
 import { useEvent, useStadiumMap } from "../../../src/api/queries";
 import { boundsOf, labelPoint, pointsAttr, priceTints, SOLD_OUT_STROKE, textOn } from "../../../src/features/seatmap/overview";
 import { formatCount, formatKes } from "../../../src/lib/money";
-import { palette, space, type } from "../../../src/theme";
+import { standTitle } from "../../../src/lib/labels";
+import { font, palette, space, type } from "../../../src/theme";
 import { Card, Chip, EmptyState, ErrorState, Icon, Loading, Screen } from "../../../src/ui";
 
 /** Level 1: the stadium. Eight or so stand polygons, tinted by cheapest available price. */
@@ -45,7 +46,7 @@ export default function StadiumScreen() {
           <Card style={styles.mapCard}>
             <Svg style={{ width: "100%", aspectRatio: venue.plan_width / venue.plan_height }} viewBox={`0 0 ${venue.plan_width} ${venue.plan_height}`} testID="stadium-map">
               <Rect x={pitch.x} y={pitch.y} width={pitch.w} height={pitch.h} rx={12} fill={palette.ink100} stroke={palette.ink200} strokeWidth={6} />
-              <SvgText x={pitch.x + pitch.w / 2} y={pitch.y + pitch.h / 2 + 22} fontSize={64} fontWeight="700" fill={palette.ink400} textAnchor="middle">
+              <SvgText x={pitch.x + pitch.w / 2} y={pitch.y + pitch.h / 2 + 22} fontSize={64} fontFamily={font.headingBold} fill={palette.ink400} textAnchor="middle">
                 PITCH
               </SvgText>
               {stands.map((s, i) => {
@@ -59,14 +60,14 @@ export default function StadiumScreen() {
                     strokeWidth={8}
                     strokeDasharray={soldOut ? "24 16" : undefined}
                     onPress={soldOut ? undefined : () => open(s.id)}
-                    accessibilityLabel={`${s.name}${soldOut ? ", sold out" : ""}`}
+                    accessibilityLabel={`${standTitle(s.name, s.tier)}${soldOut ? ", sold out" : ""}`}
                   />
                 );
               })}
               {stands.map((s, i) => {
                 const [cx, cy] = labelPoint(s.polygon);
                 return (
-                  <SvgText key={s.id} x={cx} y={cy + 24} fontSize={68} fontWeight="700" fill={s.seats_available === 0 ? palette.grey600 : textOn(tints[i]!)} textAnchor="middle" pointerEvents="none">
+                  <SvgText key={s.id} x={cx} y={cy + 24} fontSize={68} fontFamily={font.headingBold} fill={s.seats_available === 0 ? palette.grey600 : textOn(tints[i]!)} textAnchor="middle" pointerEvents="none">
                     {s.code}
                   </SvgText>
                 );
@@ -78,10 +79,10 @@ export default function StadiumScreen() {
             {stands.map((s, i) => {
               const soldOut = s.seats_available === 0;
               return (
-                <Card key={s.id} onPress={soldOut ? undefined : () => open(s.id)} style={[styles.row, soldOut && styles.rowOff]} accessibilityLabel={`${s.name}, ${soldOut ? "sold out" : `from ${formatKes(s.price_from_cents ?? 0)}`}`}>
+                <Card key={s.id} onPress={soldOut ? undefined : () => open(s.id)} style={[styles.row, soldOut && styles.rowOff]} accessibilityLabel={`${standTitle(s.name, s.tier)}, ${soldOut ? "sold out" : `from ${formatKes(s.price_from_cents ?? 0)}`}`}>
                   <View style={[styles.swatch, { backgroundColor: tints[i], borderColor: soldOut ? SOLD_OUT_STROKE : tints[i] }]} />
                   <View style={styles.fill}>
-                    <Text style={type.h3}>{s.name}</Text>
+                    <Text style={type.h3}>{standTitle(s.name, s.tier)}</Text>
                     <Text style={type.small}>
                       {soldOut ? "No seats left" : `${formatCount(s.seats_available)} of ${formatCount(s.seats_total)} seats left`} · Gate {s.gate_group}
                     </Text>
