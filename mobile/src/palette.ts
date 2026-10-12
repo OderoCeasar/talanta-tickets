@@ -49,6 +49,9 @@ export const palette = {
   warning: "#92500a",
   warningBg: "#fdf4e3",
   warningBorder: "#f0d49b",
+  /** Gate mode's full-screen results: "let them in" and "turn them away". White text passes AA on both. */
+  admit: "#15803d",
+  refuse: "#b91c1c",
   /** The "held by someone else" outline on the seat map (§5.3). */
   amber: "#d97706",
 } as const;

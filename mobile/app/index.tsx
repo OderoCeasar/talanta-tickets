@@ -1,5 +1,6 @@
 import { Redirect } from "expo-router";
 
+import { isGateRole } from "../src/features/gate/roles";
 import { useSession } from "../src/session";
 import { Loading, Screen } from "../src/ui";
 
@@ -13,6 +14,6 @@ export default function Index() {
     );
   }
   // Gate staff use the same app but never see the fan screens.
-  if (status === "signedIn" && user?.role === "GATE_STAFF") return <Redirect href="/gate" />;
+  if (status === "signedIn" && isGateRole(user?.role)) return <Redirect href="/gate" />;
   return <Redirect href="/events" />;
 }
