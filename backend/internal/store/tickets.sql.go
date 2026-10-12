@@ -543,7 +543,12 @@ func (q *Queries) ListTicketViewsOfUser(ctx context.Context, arg ListTicketViews
 
 const voidTicketsOfBooking = `-- name: VoidTicketsOfBooking :execrows
 UPDATE tickets SET status = 'VOID'
-WHERE booking_id = $1 AND status = ANY($2::text[])
+WHERE id IN (
+    SELECT t.id FROM tickets t
+    WHERE t.booking_id = $1 AND t.status = ANY($2::text[])
+    ORDER BY t.id
+    FOR UPDATE
+)
 `
 
 type VoidTicketsOfBookingParams struct {
@@ -553,6 +558,12 @@ type VoidTicketsOfBookingParams struct {
 
 // Refund: every ticket of the booking that may become VOID does. from_statuses comes from
 // domain.TicketStatusesThatCanBecome(VOID), so the rule lives in one place.
+//
+// Locks: the booking's tickets that will change, FOR UPDATE, in id order, before any is
+// written. Why: the gate's scan upload locks the tickets of a batch in id order too
+// (store/gate.go, lockTicketsForScan). A bare UPDATE takes its rows in whatever order the
+// scan finds them, so a refund of two tickets and an upload holding the same two could each
+// wait for the other.
 func (q *Queries) VoidTicketsOfBooking(ctx context.Context, arg VoidTicketsOfBookingParams) (int64, error) {
 	result, err := q.db.Exec(ctx, voidTicketsOfBooking, arg.BookingID, arg.FromStatuses)
 	if err != nil {

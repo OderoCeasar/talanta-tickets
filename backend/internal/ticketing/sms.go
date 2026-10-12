@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 )
 
@@ -61,6 +62,18 @@ func TicketSMSText(reference string, tickets int, link string) string {
 	return wordings[len(wordings)-1]
 }
 
+// mockSMS reports whether a sender is the log-only mock, and whether it runs in production
+// (where it does not even log the text).
+func mockSMS(sender notify.SMSSender) (mock, production bool) {
+	switch m := sender.(type) {
+	case notify.LogSMS:
+		return true, m.Production
+	case *notify.LogSMS:
+		return m != nil, m != nil && m.Production
+	}
+	return false, false
+}
+
 // SendTicketSMS sends the "you're going" message for a paid booking to the phone of the fan
 // who made it. Call it AFTER the payment transaction has committed, never inside it: it
 // reads the booking through the pool and calls the SMS provider.
@@ -101,6 +114,17 @@ func (s *Service) SendTicketSMS(ctx context.Context, bookingID int64) {
 		reason := strings.ReplaceAll(err.Error(), b.WebToken, "[web token redacted]")
 		s.log.ErrorContext(ctx, "ticket sms not sent: the SMS provider failed; the fan can still open the tickets in the app",
 			"booking_id", bookingID, "err", reason)
+		return
+	}
+	// The mock sender "succeeds" without delivering anything. Saying "sent" then would be a
+	// lie in the one log line an operator reads to find out why a fan got no message.
+	if mock, production := mockSMS(s.sms); mock {
+		if production {
+			s.log.WarnContext(ctx, "ticket sms NOT delivered: no SMS provider is configured; the fan can still open the tickets in the app",
+				"booking_id", bookingID, "tickets", b.LiveTickets)
+			return
+		}
+		s.log.InfoContext(ctx, "ticket sms written to the log by the mock SMS sender, not delivered", "booking_id", bookingID, "tickets", b.LiveTickets)
 		return
 	}
 	s.log.InfoContext(ctx, "ticket sms handed to the SMS sender", "booking_id", bookingID, "tickets", b.LiveTickets)

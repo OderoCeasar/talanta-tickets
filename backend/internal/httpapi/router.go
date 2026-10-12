@@ -15,6 +15,7 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/gate"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/ratelimit"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
@@ -54,12 +55,22 @@ type RateLimits struct {
 	HoldPerIP   ratelimit.Rule
 	// WebTicketPerIP covers the web ticket page (GET /t/{webToken}). Its token is 256
 	// random bits, so the limit is not what stops guessing; it stops one client using the
-	// page to make the server draw QR codes all day. Loose like the other per-IP limits: on
-	// a match day a stand of fans opens the page from one address. Zero switches it off.
+	// page to make the server work all day. A fan opens the page a few times; the page is
+	// only for fans without the app, so even a stand of them behind one address stays far
+	// below five a second. Zero switches it off.
 	WebTicketPerIP ratelimit.Rule
+	// TicketQRPerUser covers GET /tickets/{ticketId}/qr. The app draws its own QR codes; the
+	// image is for sharing and printing, a few times per ticket. Zero switches it off.
+	TicketQRPerUser ratelimit.Rule
 	// CheckoutPerUser covers the two writes of checkout together: creating a booking and
 	// starting a payment. A fan does each a handful of times; a zero limit switches it off.
 	CheckoutPerUser ratelimit.Rule
+	// ScanUploadPerDevice and ScanUploadPerUser cover POST /gate/scans. A device syncs every
+	// few seconds at most, 500 scans a call, so the per-device limit is far above honest
+	// use. The per-user one is loose because stewards at one gate often share a sign-in:
+	// it counts every device of that account together. A zero limit switches either off.
+	ScanUploadPerDevice ratelimit.Rule
+	ScanUploadPerUser   ratelimit.Rule
 }
 
 // DefaultRateLimits is what production runs.
@@ -75,8 +86,12 @@ func DefaultRateLimits() RateLimits {
 		PublicReadPerIP:  ratelimit.Rule{Limit: 12000, Window: time.Minute},
 		HoldPerUser:      ratelimit.Rule{Limit: 20, Window: time.Minute},
 		HoldPerIP:        ratelimit.Rule{Limit: 3000, Window: time.Minute},
-		WebTicketPerIP:   ratelimit.Rule{Limit: 3000, Window: time.Minute},
+		WebTicketPerIP:   ratelimit.Rule{Limit: 300, Window: time.Minute},
+		TicketQRPerUser:  ratelimit.Rule{Limit: 60, Window: time.Minute},
 		CheckoutPerUser:  ratelimit.Rule{Limit: 30, Window: time.Minute},
+
+		ScanUploadPerDevice: ratelimit.Rule{Limit: 120, Window: time.Minute},
+		ScanUploadPerUser:   ratelimit.Rule{Limit: 3000, Window: time.Minute},
 	}
 }
 
@@ -124,6 +139,9 @@ type Deps struct {
 	// Pool is the database pool the booking answers read their tickets through. Nil means
 	// DB, when DB is a pool.
 	Pool store.DBTX
+
+	// Gate is gate mode (M10): gate events, the manifest, scan upload.
+	Gate *gate.Service
 	// AllowMockOutcome is config.Base.AllowDevShortcuts(): whether the X-Mock-Outcome header
 	// is read. False (the zero value, and production) refuses the header with 403.
 	AllowMockOutcome bool
@@ -148,11 +166,15 @@ type Server struct {
 	holds *booking.Service
 
 	tickets *ticketing.Service
+	// qr keeps drawn QR images: the ticket image endpoint and the web ticket page share it.
+	qr *ticketing.QRCache
 
 	payments         *payments.Service
 	pool             store.DBTX
 	allowMockOutcome bool
 	callbackAllowed  []netip.Prefix
+
+	gate *gate.Service
 }
 
 // NewRouter builds the API. Every route sits under /v1 because the admin web app is served
@@ -185,11 +207,13 @@ func NewRouter(d Deps) http.Handler {
 	s.events, s.venues, s.publishTimeout = d.Events, d.Venues, d.PublishTimeout
 	s.holds = d.Holds
 	s.tickets = d.Tickets
+	s.qr = ticketing.NewQRCache(0)
 	if d.Pool == nil {
 		d.Pool, _ = d.DB.(store.DBTX)
 	}
 	s.payments, s.pool = d.Payments, d.Pool
 	s.allowMockOutcome, s.callbackAllowed = d.AllowMockOutcome, d.MpesaCallbackAllowed
+	s.gate = d.Gate
 
 	r := chi.NewRouter()
 	// Order matters: the ID and the caller's address first so every later line can log
@@ -291,7 +315,7 @@ func (s *Server) routes(v1 chi.Router) {
 
 // catchAll gives a sub-router a route for every path under its prefix. It is what makes the
 // promise above true: chi only runs a router's middleware once that router has a route, so
-// a sub-router with none yet (the gate, until M10) would answer 404 to everyone, signed in
+// a sub-router with none would answer 404 to everyone, signed in
 // or not. Real routes are more specific and always win over this one.
 func catchAll(r chi.Router) {
 	r.HandleFunc("/", notFound)
@@ -363,11 +387,6 @@ func (s *Server) adminRoutes(r chi.Router) {
 	r.Post("/invitations", s.createInvitation)
 	r.Post("/invitations/{invitationId}/resend", s.resendInvitation)
 	r.Delete("/invitations/{invitationId}", s.revokeInvitation)
-}
-
-// gateRoutes: GATE_STAFF and ADMIN. Paths are relative to /v1/gate.
-func (s *Server) gateRoutes(chi.Router) {
-	// M10: gate events, manifest, scan upload.
 }
 
 func notFound(w http.ResponseWriter, r *http.Request) {

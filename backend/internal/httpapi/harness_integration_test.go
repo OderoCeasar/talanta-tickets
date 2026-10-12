@@ -29,6 +29,7 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/gate"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi/contracttest"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
@@ -106,7 +107,7 @@ func uncoveredOperations() []string {
 	}
 	seen := contract.Seen()
 	var missing []string
-	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations, m7TicketOperations, m7PaymentOperations) {
+	for _, op := range slices.Concat(m3Operations, m4m5Operations, m6Operations, m7TicketOperations, m7PaymentOperations, m10GateOperations) {
 		var success, failure bool
 		for _, s := range seen {
 			name, status, _ := strings.Cut(s, " ")
@@ -258,6 +259,8 @@ type envConfig struct {
 	provider func(m *mock.Provider) payments.Provider
 	// callbackAllowed is MPESA_CALLBACK_ALLOWED_CIDRS; empty allows every address.
 	callbackAllowed []netip.Prefix
+	// gatePolicy is the gate service's policy; zero values mean the defaults.
+	gatePolicy gate.Policy
 	// ticketIssuer wraps the ticket service the payment flow issues through (one that fails).
 	ticketIssuer func(real payments.TicketIssuer) payments.TicketIssuer
 	// paymentDB wraps the pool the payment service runs on (one that can be switched off).
@@ -292,6 +295,7 @@ type env struct {
 	venues  *venue.Service
 	holds   *booking.Service
 	tickets *ticketing.Service
+	gate    *gate.Service
 	// payments is the payment service; mock is its provider, whose callbacks the test
 	// delivers by hand (timers) and whose clock the test moves (mockClock).
 	payments  *payments.Service
@@ -412,7 +416,11 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 		exec(t, `UPDATE payment_callbacks SET processed_at = now(), verdict = 'DEFERRED', last_error = 'closed at the end of its test' WHERE processed_at IS NULL`)
 		exec(t, `UPDATE unmatched_callbacks SET processed_at = now(), verdict = 'UNMATCHED', last_error = 'closed at the end of its test' WHERE processed_at IS NULL`)
 	})
+	// Like production, gate mode is given the verifier (public keys) and never the signer.
+	e.gate, err = gate.NewService(gate.Config{DB: db.Pool, Logger: logger, Verifier: cfg.ticketKeys.Verifier, Policy: cfg.gatePolicy})
+	require.NoError(t, err)
 	e.router = httpapi.NewRouter(httpapi.Deps{
+		Gate:                 e.gate,
 		Payments:             e.payments,
 		AllowMockOutcome:     cfg.devShortcuts,
 		MpesaCallbackAllowed: cfg.callbackAllowed,

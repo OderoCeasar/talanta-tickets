@@ -34,8 +34,19 @@ SELECT unnest(sqlc.arg(ids)::uuid[]), sqlc.arg(booking_id)::bigint, unnest(sqlc.
 -- name: VoidTicketsOfBooking :execrows
 -- Refund: every ticket of the booking that may become VOID does. from_statuses comes from
 -- domain.TicketStatusesThatCanBecome(VOID), so the rule lives in one place.
+--
+-- Locks: the booking's tickets that will change, FOR UPDATE, in id order, before any is
+-- written. Why: the gate's scan upload locks the tickets of a batch in id order too
+-- (store/gate.go, lockTicketsForScan). A bare UPDATE takes its rows in whatever order the
+-- scan finds them, so a refund of two tickets and an upload holding the same two could each
+-- wait for the other.
 UPDATE tickets SET status = 'VOID'
-WHERE booking_id = sqlc.arg(booking_id) AND status = ANY(sqlc.arg(from_statuses)::text[]);
+WHERE id IN (
+    SELECT t.id FROM tickets t
+    WHERE t.booking_id = sqlc.arg(booking_id) AND t.status = ANY(sqlc.arg(from_statuses)::text[])
+    ORDER BY t.id
+    FOR UPDATE
+);
 
 -- name: ListTicketViewsOfUser :many
 -- One page of a fan's tickets: soonest kickoff first, then seat (inventory id), then ticket

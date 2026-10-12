@@ -4,7 +4,7 @@ Companion to `backend/docs/openapi.yaml`, which is the contract. This file holds
 easier to read as a table: error codes, the compact array layouts, the one-letter codes, and
 where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 
-74 operations on 64 paths (all but the three gate operations are implemented). Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
+74 operations on 64 paths, all implemented. Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
 
 ## Basics
 
@@ -91,8 +91,9 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 Wrong password and wrong TOTP code on signed-in routes are 422, not 401, so a client that
 refreshes its token on any 401 does not mistake them for an expired session.
 
-429 is declared on the auth endpoints, the public reads, holds, bookings and payments. Admin
-and gate routes are not rate limited.
+429 is declared on the auth endpoints, the public reads, holds, bookings, payments, the
+ticket QR image and the gate's scan upload. Admin routes and the two gate reads are not
+rate limited.
 
 ## Validation details
 
@@ -121,6 +122,7 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `plan_bounds` | The block's outline would leave `[0, plan_width] × [0, plan_height]` |
 | `layout` | The seat geometry cannot be made (for example a row too long for the arc) |
 | `venue` | On `VENUE_MISMATCH`: the block, row, template or event is at another venue |
+| `uuid`, `gategroup`, `event` | In a scan batch (`scans[3].ticket_id`): not a UUID; not a gate group such as `N-LOWER`; no event with that id |
 
 ## Sign-in behaviour the contract does not spell out
 
@@ -223,7 +225,8 @@ is `0` or `1`. Row `id` is also null in a dry run.
 | 2 | `status_code` | letter | `V` VALID, `U` USED, `X` VOID, `T` TRANSFERRED |
 
 Full manifest (`full: true`): only `V` and `U`. With `since` (`full: false`): any ticket
-that changed, including `X` and `T`, which the device removes.
+that changed, including `X` and `T`, which the device removes. The index is into the
+`gate_groups` of the same answer. More in "Gate mode" below.
 
 ### Points and polygons
 
@@ -460,7 +463,9 @@ the 16 random bytes in each UUID.
   `location.gate_group` is the gate group signed into the token. Answers that carry
   `qr_token` are sent `Cache-Control: private, no-store`.
 - **`GET /tickets/{ticketId}/qr`.** A black-on-white PNG, `size` x `size` pixels (128 to
-  1024, default 512, about 1.4 KB), with a four-module quiet zone. Modules are a whole
+  1024, default 512, about 1.4 KB), with a four-module quiet zone. 60 requests a minute per
+  user (429); a drawn image is kept in a small in-process cache (1,024 images) by token
+  and size, since a ticket's token never changes. Modules are a whole
   number of pixels, so there is a little extra white when `size` is not a multiple of 61.
   It is drawn for any status: a void ticket's QR is harmless, the manifest refuses it.
 - **Web ticket page, `GET /v1/t/{webToken}`.** HTML for every status (200, 404, 429, 500).
@@ -470,11 +475,21 @@ the 16 random bytes in each UUID.
   no tickets get the same 404 page. Headers: `Cache-Control: private, no-store`,
   `X-Robots-Tag: noindex, nofollow, noarchive`, `Referrer-Policy: no-referrer`,
   `X-Frame-Options: DENY`, and a Content-Security-Policy of `default-src 'none'` with only
-  `data:` images and the page's one style block allowed. 3,000 requests a minute per IP.
+  `data:` images and the page's one style block allowed. 300 requests a minute per IP. Its
+  QR images come from the same cache as the image endpoint.
+- **Ticket keys at startup.** A public key that is not a canonical Ed25519 point, or is
+  one of the eight small-order points, is refused (in `TICKET_VERIFY_KEYS` and as the
+  signing key's public half): under such a key one fixed signature verifies any ticket.
+  A `TICKET_VERIFY_KEYS` entry that is the signing seed itself is refused too (the list is
+  sent to gate devices). The seed of a *retired* key pasted there cannot be told from a
+  public key: both are 32 bytes.
+  Startup errors about `TICKET_SIGNING_KEY_ID` and `TICKET_VERIFY_KEYS` name the variable
+  and the entry's position and never repeat the value.
 - **SMS.** After a payment commits the fan who made the booking gets "Talanta: you're
   going! Booking TLT-XXXXXX, 2 tickets: `<PUBLIC_BASE_URL>/v1/t/<web token>`" (154
   characters with the production origin). No provider is wired yet: the mock logs the text
-  in development and only "not sent" in production.
+  in development and only "not sent" in production, where the ticket service logs a warning
+  "ticket sms NOT delivered" (booking id only, no link) instead of reporting it as sent.
 - **Issue and void are not endpoints.** Tickets are made inside the payment transaction
   (`ticketing.IssueForBooking`) and voided by a refund (`VoidForBooking`) or an event
   cancel. Statuses move only as `domain.TransitionTicket` allows: `VALID` to `USED`, `VOID`
@@ -668,4 +683,162 @@ the 16 random bytes in each UUID.
   magic numbers; `Payment.status`, `Payment.failure_reason`, `PaymentStatus`,
   `PaymentFailureReason`, `BookingStatus`, `MockOutcome`, `AlertKind`, `HoldStateDetails`,
   `getPayment`, `mpesaCallback` and `completeRefund` say what the code does. No schema
-  gained, lost or renamed a field in that work.
+  gained, lost or renamed a field.
+
+## Gate mode (M10)
+
+Three operations, GATE_STAFF and ADMIN only (a fan or an organiser gets 403, also for a
+path under `/gate` that does not exist). Answers are sent `Cache-Control: no-store`.
+
+### Gate events, `GET /gate/events`
+
+Events stored as `PUBLISHED`, `ON_SALE` or `SOLD_OUT` whose kickoff is later than 24 hours
+ago, soonest first, at most 50. `event.status` is the effective status, as everywhere.
+`gate_groups` is one `<stand code>-<tier>` per stand of the venue, sorted. `ticket_count`
+counts `VALID` and `USED` tickets. A cancelled event drops off the list; its manifest still
+answers.
+
+`manifest_version` is **not** a manifest version. It is a change marker: a digest of the
+event's details, the key set, the gate groups and the number of tickets per gate group and
+status. It is the same from one listing to the next exactly when none of those changed,
+so a device may use it to skip a sync. Sent as `since` it gets a full manifest.
+
+### Manifest, `GET /gate/events/{eventId}/manifest[?since=<version>]`
+
+- **Keys.** `keys[]` is every public key the server accepts ticket signatures from
+  (`TICKET_SIGNING_KEY`'s public half and `TICKET_VERIFY_KEYS`), 32 bytes each as 43
+  characters of base64url. Public keys only: the gate service is built from the verifier
+  and is never handed the signer. (With no key configured in development the one key is
+  `k0`, which is outside the contract's `key_id` pattern.)
+- **Full** (no `since`, `full: true`): every `VALID` (`V`) and `USED` (`U`) ticket. The
+  device replaces its set.
+- **Changes only** (`since`, `full: false`): every ticket written after the version, in
+  any status. `X` (void) and `T` (transferred) mean "remove it". Each tuple is the ticket's
+  status now, so applying an answer twice, or two overlapping answers, is harmless.
+- **`gate_group_index`** points into the `gate_groups` of the same answer. Store the text.
+- **`ticket_count`** is read in the same database snapshot as `tickets`: after applying the
+  answer the device holds exactly that many tickets. If it does not, download in full.
+- **Draft** events and unknown ids are 404. A cancelled or completed event answers (full:
+  no tickets; changes: every ticket as `X`).
+
+**How a version works.** It is the database clock read before anything else, with the event
+id, in an opaque text. A ticket's change stamp (`tickets.updated_at`) is set when the row
+is written, not when its transaction commits, so a transaction can commit a stamp that is
+older than a version already handed out. A changes-only answer therefore starts **two
+minutes before** the version it is given: longer than any transaction that writes tickets
+can stay open (15 s statement and idle limits; an event cancel, the longest, is cut off at
+55 s). The price is that a ticket scanned or sold in the last two minutes is sent again on
+every sync, about 50 bytes each. The answer is the full manifest instead when `since` is
+unreadable, is for another event, is from the future, or is older than 7 days.
+
+**Measured** (seeded Talanta, every seat sold: 59,568 tickets, 8 gate groups; laptop, no
+race detector, through the whole router):
+
+| Answer | Raw | gzip | Server time |
+|---|---|---|---|
+| Full manifest | 2,800,203 B (2.80 MB) | 1,285,494 B (1.29 MB), 21.6 B a ticket | 570 to 810 ms, of which 250 to 270 ms the query and building the list |
+| Changes only, 100 tickets changed | 5,208 B | 2,510 B | 77 to 102 ms |
+
+The ticket ids are random, which is why gzip stops at 46%. The changes-only read is an
+index scan on `tickets_event_updated_idx` (9 buffers for 100 rows). The full read and the
+changes-only `ticket_count` pass over the event's tickets once (a sequential scan when the
+event is most of the table, as in the test; 4,255 buffers). No ETag: an unchanged event
+costs one changes-only request of a few hundred bytes.
+
+### Scan upload, `POST /gate/scans`
+
+One batch from one device: `device_id` and 1 to 500 scans. More than 500 scans, or a body
+over 1 MiB, is 413. One transaction per batch: a 400, 409 or 5xx means nothing of the batch
+was stored.
+
+**Idempotency.** A scan whose `client_scan_id` is already stored is not stored again and
+not judged again. Its answer is the result the server holds for it now, about the ticket
+it was stored with; nothing is taken from the second upload. The same id twice in one
+batch is one scan. So a device may resend any batch, any number of times.
+
+**The decision, for a scan that is new.** The first row that applies:
+
+| # | Condition | Result | Ticket |
+|---|---|---|---|
+| 1 | `token` sent and it does not verify (bad shape, unknown key id, bad signature), or it is for another ticket than `ticket_id` | `INVALID` | untouched |
+| 2 | `token` sent, signed for another event than the scan's `event_id` | `WRONG_EVENT` | untouched |
+| 3 | `token` sent, signed for another gate group than the scan's `gate_group` | `WRONG_GATE` | untouched |
+| 4 | No ticket with that id | `INVALID` (stored all the same; `ticket_status` is null) | none |
+| 5 | `token` sent and it is not the exact text the ticket was issued with | `INVALID` | untouched |
+| 6 | The ticket belongs to another event than `event_id` | `WRONG_EVENT` | untouched |
+| 7 | The ticket's gate group is not `gate_group` | `WRONG_GATE` | untouched |
+| 8 | The ticket is `VOID` or `TRANSFERRED` | `INVALID` | untouched |
+| 9 | The device's own `result` is not `ADMITTED` | the device's result, unchanged | untouched |
+| 10 | The device said `ADMITTED`, and this is the earliest admission of the ticket by `scanned_at` (ties: the smaller `client_scan_id`) | `ADMITTED` | `USED`, `used_at` = that scan time |
+| 11 | The device said `ADMITTED`, and an earlier admission exists | `DUPLICATE` | stays `USED` |
+
+Rows 6 and 7 are checked against the ticket's own row, so they hold when no token is sent.
+Row 9: the steward turned the person away, and the server never turns a refusal into an
+admission afterwards. `overridden` is true when the result differs from what the device
+sent. `first_admitted_at` is the ticket's `used_at`.
+
+**When the later scan is uploaded first.** Phone B admits a ticket at 19:01 and syncs:
+`ADMITTED`, ticket `USED`, `used_at` 19:01. Phone A, which admitted the same ticket at
+19:00, syncs later. By the rule A's scan is the admission: A is answered `ADMITTED`, the
+stored result of B's scan is changed to `DUPLICATE`, and `used_at` moves to 19:00. **Phone
+B is not told.** It was answered `ADMITTED` and the server has no way to reach it. It
+learns only if it uploads that scan again (the answer is then `DUPLICATE`,
+`overridden: true`). A device should therefore resend the scans it was last told were
+`ADMITTED` once more before it closes a session. Either way two people are inside on one
+ticket; the server can name the scans, not undo the entry.
+
+**Scan times are bounded, not trusted.** `scanned_at` is the device's clock. A time in the
+future, more than 7 days old, or before the ticket was issued is replaced by the time the
+server received the batch (logged as `times_replaced`). A phone whose clock is wrong by
+minutes is believed, and can win or lose a tie it should not; the order of two scans from
+two phones is only as good as their clocks.
+
+**A ticket voided after it was scanned** (refund, cancelled event). The stored scan keeps
+its `ADMITTED` result and the ticket keeps `used_at`; its status is `VOID`. A scan of that
+ticket uploaded after the void is `INVALID`, even if it was made before: the server judges
+by the status at upload and keeps no history of statuses. The scan log still holds its
+`scanned_at`.
+
+**Other answers.** An `event_id` that does not exist is 400 for the whole batch (field
+`scans[i].event_id`, rule `event`). While an organiser's cancel or edit holds the event for
+more than 3 seconds the answer is 409 `EVENT_BUSY`: send the batch again. Limits: 120
+uploads a minute per device (counted per signed-in user and `device_id`) and 3,000 a minute
+per user, 429 with `Retry-After`.
+
+**What is stored.** One `scan_logs` row per scan: `client_scan_id`, `ticket_id`, `event_id`
+and `gate_id` (the gate group) as the device sent them, `scanned_at` (bounded as above),
+`device_id`, `scanned_by` (the signed-in user), `result` (the server's), `synced_at`. The
+device's own verdict and the token are not stored; a token is never logged.
+
+**Not uploaded.** A QR that cannot be read far enough to give a ticket id (not `TLT1`, bad
+base64, wrong length, unknown version) has nothing to put in `ticket_id` and stays on the
+device. There is no endpoint for it.
+
+**A token is optional.** Without one the server relies on the ticket id alone, so a signed-in
+gate account could mark any ticket it knows the id of as used; the manifest gives it every
+id. Scans carry `scanned_by` and `device_id` for that reason. Send the token.
+
+### The honest limit
+
+Two phones that are both offline cannot see each other's scans. If the same QR (a
+screenshot, say) is shown to both before either has synced, both admit it. Nothing on the
+server can prevent that: it hears about both scans only afterwards, keeps the earlier as
+`ADMITTED`, and marks the other `DUPLICATE`.
+
+What bounds it: a ticket is bound to one gate group. A `W-LOWER` ticket is refused
+(`WRONG_GATE`) at every gate that is not `W-LOWER`, offline, from the signature alone. So
+the two phones have to be at the same stand and tier; it is not "any two gates of the
+stadium". The window closes for a ticket as soon as one phone that admitted it has synced
+and the other has synced after that. It is not solved, and the API does not claim it is.
+
+### Contract changes made with this work
+
+- `uploadScans` gained a **409** (`EVENT_BUSY`) and a **429** answer. Generated clients
+  gain those two error cases; no success type changes.
+- `getTicketQr` gained a **429** answer (60 a minute per user).
+- Descriptions only, no field added, removed or renamed: `listGateEvents` (which statuses,
+  24 hours, at most 50), `getGateManifest` (the two-minute look-back, 7 days, indexes,
+  sizes, 404 for a draft), `uploadScans` (the decision order, results that change later,
+  scan time bounds, unknown event), `GateEventListItem.manifest_version` (**its meaning
+  changed**: a change marker, not a version to send as `since`), `GateManifest.keys`,
+  `gate_groups`, `ticket_count`, `Scan.scanned_at`, `first_admitted_at`.

@@ -15,7 +15,7 @@ import (
 func (s *Server) fanTicketRoutes(r chi.Router) {
 	r.Get("/me/tickets", s.listMyTickets)
 	r.Get("/tickets/{ticketId}", s.getTicket)
-	r.Get("/tickets/{ticketId}/qr", s.getTicketQR)
+	r.With(s.LimitByUser("ticket-qr", s.limits.TicketQRPerUser)).Get("/tickets/{ticketId}/qr", s.getTicketQR)
 }
 
 // eventSummaryDTO is the contract's EventSummary: the few event fields carried inside
@@ -182,7 +182,7 @@ func (s *Server) getTicketQR(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
-	png, err := ticketing.QRPNG(t.QRToken(), size)
+	png, err := s.qr.PNG(t.QRToken(), size)
 	if err != nil {
 		WriteError(w, r, err)
 		return

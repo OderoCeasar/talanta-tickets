@@ -14,6 +14,7 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/booking"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/config"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/events"
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/gate"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/httpapi"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/notify"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
@@ -177,6 +178,12 @@ func run() error {
 		logger.Warn("MPESA_CALLBACK_ALLOWED_CIDRS is not set: the M-Pesa callback is accepted from any address")
 	}
 
+	// Gate mode gets the verifier only: the public halves of the ticket keys.
+	gateService, err := gate.NewService(gate.Config{DB: pool, Logger: logger, Verifier: ticketKeys.Verifier})
+	if err != nil {
+		return err
+	}
+
 	srv := &http.Server{
 		Addr: cfg.Addr,
 		Handler: httpapi.NewRouter(httpapi.Deps{
@@ -194,6 +201,7 @@ func run() error {
 			Tickets:        ticketService,
 			Payments:       paymentService,
 			Pool:           pool,
+			Gate:           gateService,
 
 			AllowMockOutcome:     cfg.AllowDevShortcuts(),
 			MpesaCallbackAllowed: cfg.Payments.CallbackAllowedCIDRs,

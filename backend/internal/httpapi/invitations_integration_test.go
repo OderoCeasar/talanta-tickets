@@ -137,9 +137,19 @@ func TestInvitation_HappyPath(t *testing.T) {
 	assert.Nil(t, accepted.InviteURL)
 
 	// And the new user is in the staff list.
-	rec = e.do("GET", "/admin/users?limit=100&role=ORGANISER", nil, adminSession.AccessToken)
-	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Contains(t, rec.Body.String(), email)
+	// The tests share one database and by now it may hold more organisers than one page.
+	found, path := false, "/admin/users?limit=100&role=ORGANISER"
+	for cursor := ""; !found; {
+		rec = e.do("GET", path+cursor, nil, adminSession.AccessToken)
+		require.Equal(t, http.StatusOK, rec.Code)
+		found = strings.Contains(rec.Body.String(), email)
+		next := decode[page[userJSON]](t, rec).NextCursor
+		if next == nil {
+			break
+		}
+		cursor = "&cursor=" + *next
+	}
+	assert.True(t, found, "the new organiser %s is in the staff list", email)
 
 	// 6. The token cannot be used again: not to preview, not to accept.
 	wantError(t, e.do("GET", "/auth/invitations/"+token, nil, ""), http.StatusNotFound, domain.CodeInvitationInvalid)
