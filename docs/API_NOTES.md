@@ -117,6 +117,7 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `before_kickoff`, `after_open`, `after_from` | Times in the wrong order (`gates_open_at`, `sales_close_at`, `to`) |
 | `future` | `kickoff_at` of an event that has left `DRAFT` would be moved into the past |
 | `max_seats` | `rows` x `seats_per_row` is more than 3,000 seats in one block (on both fields) |
+| `whole_shillings` | `price_cents` of a category is not a multiple of 100: M-Pesa takes no cents |
 | `plan_bounds` | The block's outline would leave `[0, plan_width] × [0, plan_height]` |
 | `layout` | The seat geometry cannot be made (for example a row too long for the arc) |
 | `venue` | On `VENUE_MISMATCH`: the block, row, template or event is at another venue |
@@ -497,10 +498,9 @@ the 16 random bytes in each UUID.
   up): the same sum the hold showed. So any fee rate gives a payable booking
   (`BOOKING_FEE_BPS=250` on a KES 1,500 seat is KES 38.00, not 37.50). `total_cents` is what
   M-Pesa is asked for. M-Pesa takes whole shillings: a booking whose total is not a multiple
-  of 100 cents is refused with 409 `BOOKING_NOT_PAYABLE`, never rounded. Only a category
-  **price** with cents in it can cause that now. Prices should be whole shillings; the API
-  does not refuse one that is not yet (the category handlers belong to the events work, see
-  `docs/STATUS.md`).
+  of 100 cents is refused with 409 `BOOKING_NOT_PAYABLE`, never rounded. Neither a fee
+  nor a price can cause that any more: a category price with cents in it is refused when it
+  is set (rule `whole_shillings`). The refusal stays as the last guard.
 - **`hold_expires_at`** is set while the booking is `PENDING_PAYMENT` and null afterwards.
   `latest_payment` is the newest attempt, of any status. `tickets` is empty until `PAID`.
 - **Owner only.** `GET /bookings/{reference}` and `GET /payments/{paymentId}` find a row

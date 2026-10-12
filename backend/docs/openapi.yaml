@@ -2044,10 +2044,8 @@ paths:
         `DRAFT` a price of zero is accepted (it blocks publishing); once the event has left
         `DRAFT` the price must be above zero (400 on `price_cents`, rule `gt`).
 
-        Set prices in whole shillings (`price_cents` a multiple of 100). M-Pesa takes whole
-        shillings only: a booking whose total is not a whole number of shillings is created
-        but every payment for it answers `BOOKING_NOT_PAYABLE`. The API does not refuse
-        such a price yet (see `docs/STATUS.md`).
+        A price must be whole shillings (`price_cents` a multiple of 100): M-Pesa takes no
+        cents. Anything else is refused with 400 on `price_cents`, rule `whole_shillings`.
       parameters:
         - $ref: '#/components/parameters/EventId'
       requestBody:

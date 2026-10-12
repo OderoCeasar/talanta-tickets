@@ -2,6 +2,8 @@ package events
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -309,4 +311,36 @@ func TestSeriesRange_DefaultsAlwaysFit(t *testing.T) {
 	tooFar := ago(2001 * day)
 	_, _, err = seriesRange("", &tooFar, time.Time{}, to, maxPoints)
 	require.ErrorIs(t, err, domain.Invalid())
+}
+
+func TestPriceProblem(t *testing.T) {
+	tests := []struct {
+		name   string
+		status domain.EventStatus
+		cents  int64
+		rule   string
+	}{
+		{"whole shillings on a draft", domain.EventDraft, 150000, ""},
+		{"free on a draft", domain.EventDraft, 0, ""},
+		{"free once published", domain.EventOnSale, 0, "gt"},
+		{"whole shillings once published", domain.EventOnSale, 100, ""},
+		{"cents on a draft", domain.EventDraft, 150050, "whole_shillings"},
+		{"one cent", domain.EventDraft, 1, "whole_shillings"},
+		{"cents once published", domain.EventPublished, 99999, "whole_shillings"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := priceProblem(tt.status, tt.cents)
+			if tt.rule == "" {
+				if err != nil {
+					t.Fatalf("priceProblem(%s, %d) = %v, want nil", tt.status, tt.cents, err)
+				}
+				return
+			}
+			var de *domain.Error
+			if !errors.As(err, &de) || !strings.Contains(fmt.Sprintf("%+v", de.Details), tt.rule) {
+				t.Fatalf("priceProblem(%s, %d) = %+v, want rule %q", tt.status, tt.cents, err, tt.rule)
+			}
+		})
+	}
 }

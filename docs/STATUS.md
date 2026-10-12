@@ -41,7 +41,6 @@ One line each. Updated at the end of every milestone.
 - Every "paid" callback now costs one STK query to Daraja before it is applied. If Daraja's query is down, paid callbacks wait in the inbox (retried for 7 days) and reconciliation times payments out with an alert; nothing is sold on the callback body alone.
 - An unknown-ID "paid" callback is matched to a payment only when exactly one ID-less payment has the same phone and amount in the 24 hours before it; otherwise it stays for a person, with an alert filed under a guessed event (alerts must belong to an event).
 - A stored callback is only retried while the worker runs (`payment-callback-drain`); the worker is not in the production image yet (see below).
-- Category prices are not checked to be whole shillings: a price with cents in it makes a booking that answers `BOOKING_NOT_PAYABLE` at payment. One validation line in the category handlers (events work) closes it; the fee can no longer cause it.
 - The mobile and admin apps still have the old generated `Payment` type (with `checkout_request_id` and `merchant_request_id`) and do not show `result_desc` on a `PENDING` payment ("we are checking with M-Pesa"); the admin does not yet use `Alert.event_title`, `Alert.resolution`, `Refund.booking_status`, `already_completed` or the `booking_reference` filter. Regenerate the clients (`make openapi-clients`).
 - The ticket QR is static, so a screenshot copies it. The rotating QR of §9.3 is not built.
 - Booking status FAILED is never written: a failed payment leaves the booking payable while its hold lives.
