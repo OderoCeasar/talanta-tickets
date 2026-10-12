@@ -75,6 +75,7 @@ One line each. Updated at the end of every milestone. Test counts are in `docs/T
   - To take real payments: `MPESA_ENV`, `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, `MPESA_CALLBACK_URL` (https) and `MPESA_CALLBACK_ALLOWED_CIDRS`. With none of them set the API starts with payments off and answers every attempt to pay "not available"; with only some set it refuses to start. The mock is refused in production.
   - The worker, once it runs in production, needs the same `TICKET_SIGNING_KEY`, key ID, `PUBLIC_BASE_URL` and `MPESA_*` values as the API.
   - Optional: `CALLBACK_DRAIN_INTERVAL` (worker, default 5s) — how often stored M-Pesa callbacks are retried.
+  - Optional, for testing before an SMS provider is connected: `OTP_TEST_CODES` — phone=code pairs (for example `+2547XXXXXXXX=<six digits>`) that sign in with a fixed code and get no SMS. Anyone who knows a pair can sign in as that number; remove it once SMS works.
   - Optional: `BOOKING_FEE_BPS` (default 0) — booking fee in basis points of the subtotal.
   - The full list with defaults is in `backend/.env.example`.
 - Before merging the schema commit, check production has no rows that migration 000002 rejects, or the migrate step fails and leaves the schema marked dirty: `SELECT count(*) FROM users WHERE phone_e164 !~ '^\+[1-9][0-9]{7,14}$';` and `SELECT lower(email), count(*) FROM users WHERE email IS NOT NULL GROUP BY 1 HAVING count(*) > 1;` must both return nothing.

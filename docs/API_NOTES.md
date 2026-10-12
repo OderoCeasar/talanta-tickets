@@ -842,3 +842,17 @@ and the other has synced after that. It is not solved, and the API does not clai
   scan time bounds, unknown event), `GateEventListItem.manifest_version` (**its meaning
   changed**: a change marker, not a version to send as `since`), `GateManifest.keys`,
   `gate_groups`, `ticket_count`, `Scan.scanned_at`, `first_admitted_at`.
+
+## Test phone numbers (`OTP_TEST_CODES`)
+
+A server can name up to 20 phone numbers that always get a fixed sign-in code. It is for
+signing in to the app before an SMS provider is connected, and it works in production.
+
+- `POST /auth/otp/request` for a test number answers exactly as for any phone. The code is
+  never in the answer, and no SMS is sent.
+- `POST /auth/otp/verify` is unchanged: the code is stored hashed, expires after 5 minutes,
+  works once per request, and has the same limit of 5 wrong attempts.
+- Test numbers do not count against the hourly and daily SMS caps. The per-phone limits
+  (one request a minute, five an hour) still apply.
+- A code that is one digit repeated or a run such as 123456 is refused at startup.
+- The API logs a warning at startup with how many test numbers are set, never the codes.

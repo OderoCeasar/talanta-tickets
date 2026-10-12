@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"log/slog"
+	"maps"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -85,6 +86,9 @@ type Config struct {
 	// OTPCountryCodes are the calling codes (digits, no plus) a sign-in code may be sent to.
 	// Empty means DefaultOTPCountryCodes.
 	OTPCountryCodes []string
+	// OTPTestCodes maps a test phone (E.164) to the fixed code it always gets. No SMS is sent
+	// to these numbers and they do not count against the SMS caps. See RequestOTP.
+	OTPTestCodes map[string]string
 	// Argon2MaxConcurrent caps password hashing and verification running at once. Zero means
 	// DefaultArgon2MaxConcurrent.
 	Argon2MaxConcurrent int
@@ -110,6 +114,8 @@ type Service struct {
 	hasher       *passwordHasher
 	// otpCountryCodes is the allow-list for sign-in SMS, as calling codes without the plus.
 	otpCountryCodes []string
+	// otpTestCodes: test phone → its fixed code. Read-only after NewService.
+	otpTestCodes map[string]string
 	// dummyHash is verified when a login names an email with no account, so that answer
 	// takes as long as a wrong password does.
 	dummyHash string
@@ -171,6 +177,7 @@ func NewService(cfg Config) (*Service, error) {
 		hasher:       newPasswordHasher(cfg.Argon2MaxConcurrent),
 
 		otpCountryCodes: append([]string(nil), cfg.OTPCountryCodes...),
+		otpTestCodes:    maps.Clone(cfg.OTPTestCodes),
 		dummyHash:       dummy,
 	}, nil
 }

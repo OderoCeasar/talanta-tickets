@@ -62,6 +62,11 @@ func run() error {
 	if cfg.AllowDevShortcuts() {
 		logger.Warn("development shortcuts are ON: sign-in codes are returned in API answers", "app_env", cfg.AppEnv)
 	}
+	if n := len(cfg.OTPTestCodes); n > 0 {
+		// Loud on purpose: each of these is a phone number anyone who knows its code can sign
+		// in as, with no SMS. The codes themselves are never logged.
+		logger.Warn("OTP_TEST_CODES is set: these numbers sign in with a fixed code and get no SMS. Remove it once an SMS provider is connected", "test_numbers", n)
+	}
 	if len(cfg.TrustedProxies) == 0 {
 		logger.Info("no TRUSTED_PROXY_CIDRS: forwarding headers are ignored and the TCP peer is taken as the client address")
 	}
@@ -103,6 +108,7 @@ func run() error {
 		Policy:       authPolicy,
 
 		OTPCountryCodes:     cfg.OTPCountryCodes,
+		OTPTestCodes:        cfg.OTPTestCodes,
 		Argon2MaxConcurrent: cfg.Argon2MaxConcurrent,
 	})
 	if err != nil {
