@@ -159,7 +159,7 @@ var nairobi = time.FixedZone("EAT", 3*60*60)
 
 func nairobiTime(t time.Time) string { return t.In(nairobi).Format("Mon 2 Jan 2006, 3:04 PM") + " EAT" }
 
-func newWebBookingView(b ticketing.WebBooking) (*webBookingView, error) {
+func newWebBookingView(b ticketing.WebBooking, qr *ticketing.QRCache) (*webBookingView, error) {
 	first := b.Tickets[0]
 	ev := first.Row.Event
 	view := &webBookingView{
@@ -183,7 +183,7 @@ func newWebBookingView(b ticketing.WebBooking) (*webBookingView, error) {
 		}
 		switch t.Status() {
 		case domain.TicketValid:
-			png, err := ticketing.QRPNG(t.QRToken(), webQRPixels)
+			png, err := qr.PNG(t.QRToken(), webQRPixels)
 			if err != nil {
 				return nil, err
 			}
@@ -245,7 +245,7 @@ func (s *Server) getWebTicket(w http.ResponseWriter, r *http.Request) {
 	}
 	var view *webBookingView
 	if err == nil {
-		view, err = newWebBookingView(booking)
+		view, err = newWebBookingView(booking, s.qr)
 	}
 	if err != nil {
 		logInternal(r, err)

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -66,6 +67,11 @@ func NewSigner(keyID string, key []byte) (*Signer, error) {
 		return nil, fmt.Errorf("the signing key must be 32 bytes (seed) or 64 bytes (seed and public key), got %d", len(key))
 	}
 	public := private.Public().(ed25519.PublicKey)
+	// Cannot fail for a key made from a seed; checked so that every public key this
+	// package hands out or trusts has passed the same test.
+	if err := CheckPublicKey(public); err != nil {
+		return nil, fmt.Errorf("the signing key's public half: %w", err)
+	}
 	return &Signer{
 		keyID:  keyID,
 		public: public,
@@ -129,6 +135,9 @@ func NewVerifier(keys ...PublicKey) (*Verifier, error) {
 		}
 		if len(k.Key) != ed25519.PublicKeySize {
 			return nil, fmt.Errorf("public key %s must be %d bytes, got %d", k.KeyID, ed25519.PublicKeySize, len(k.Key))
+		}
+		if err := CheckPublicKey(k.Key); err != nil {
+			return nil, fmt.Errorf("public key %s cannot be trusted: %w", k.KeyID, err)
 		}
 		if old, dup := v.keys[k.KeyID]; dup && !bytes.Equal(old, k.Key) {
 			return nil, fmt.Errorf("key ID %s is given twice with different public keys", k.KeyID)
@@ -280,20 +289,33 @@ func LoadKeyring(l *config.Loader, b config.Base) *Keyring {
 		fail("%s / %s: %v", EnvSigningKey, EnvSigningKeyID, err)
 	}
 
+	// Entries are named by position, never quoted: a private key pasted here by mistake
+	// must not be repeated in a startup error, which goes to the log and the terminal.
 	var retired []PublicKey
-	for _, pair := range retiredRaw {
+	for i, pair := range retiredRaw {
 		id, encoded, found := strings.Cut(pair, ":")
 		pub, err := decodeKey(encoded)
 		switch {
 		case !found || err != nil || len(pub) != ed25519.PublicKeySize:
-			fail("%s: each entry must be <key id>:<base64 of a 32-byte public key>, for example k1:11qYAYKx…; entry for %q is not", EnvVerifyKeys, id)
+			fail("%s: each entry must be <key id>:<base64 of a 32-byte public key>, for example k1:11qYAYKx…; entry %d is not", EnvVerifyKeys, i+1)
 			continue
 		case id == EphemeralKeyID:
 			fail("%s: %s is reserved for the ephemeral development key and cannot be trusted", EnvVerifyKeys, EphemeralKeyID)
 			continue
 		}
 		if _, err := ParseKeyID(id); err != nil {
-			fail("%s: %v", EnvVerifyKeys, err)
+			fail("%s: entry %d: %v", EnvVerifyKeys, i+1, err)
+			continue
+		}
+		// Everything in this list is sent to every gate device. The one private value this
+		// function can recognise is the signing seed itself, pasted here by mistake; any
+		// other 32 bytes look like a public key.
+		if len(key) >= ed25519.SeedSize && subtle.ConstantTimeCompare(pub, key[:ed25519.SeedSize]) == 1 {
+			fail("%s: entry %d (%s) is the private signing key, not a public key; it would be sent to every gate device. Remove it and change the signing key", EnvVerifyKeys, i+1, id)
+			continue
+		}
+		if err := CheckPublicKey(pub); err != nil {
+			fail("%s: entry %d (%s): %v; a signature could be forged under it", EnvVerifyKeys, i+1, id, err)
 			continue
 		}
 		retired = append(retired, PublicKey{KeyID: id, Key: pub})

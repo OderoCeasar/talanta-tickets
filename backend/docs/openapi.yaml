@@ -1359,7 +1359,7 @@ paths:
       description: |
         **Role:** FAN, owner only. The image encodes the same `TLT1.…` string as
         `qr_token`. The app normally draws the QR itself from `qr_token`; this endpoint is
-        for sharing and printing. Errors are JSON.
+        for sharing and printing. Errors are JSON. 60 requests a minute per user.
       parameters:
         - $ref: '#/components/parameters/TicketId'
         - name: size
@@ -1380,6 +1380,7 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
 
   /t/{webToken}:
@@ -2545,8 +2546,11 @@ paths:
       tags: [Gate]
       summary: Events a gate device can scan for
       description: |
-        **Role:** GATE_STAFF, ADMIN. Published events whose kickoff is within the last day
-        or still ahead, soonest first, each with its gate groups. Not paged.
+        **Role:** GATE_STAFF, ADMIN. Published events (`PUBLISHED`, `ON_SALE`, `SOLD_OUT`)
+        whose kickoff is within the last 24 hours or still ahead, soonest first, each with
+        its gate groups. Not paged; at most 50. A cancelled event is not listed, but its
+        manifest still answers, so a device that already holds it hears that every ticket
+        is void.
       responses:
         '200':
           description: The events.
@@ -2571,11 +2575,20 @@ paths:
 
         **With `since=<version>`** (`full: false`): only tickets that changed after that
         version, in any status, including ones that became `VOID`. The device applies them
-        on top of what it has. If the version is unreadable or too old the server answers
-        `full: true` instead; always check `full`.
+        on top of what it has: each tuple is that ticket's status now, so applying one
+        twice is harmless. The server looks back two minutes before the version it is
+        given, so a ticket that changed shortly before the last download is sent again;
+        that is deliberate. If the version is unreadable, belongs to another event or is
+        older than 7 days the server answers `full: true` instead; always check `full`.
 
-        `version` is an opaque string. Send with `Accept-Encoding: gzip`; a full stadium
-        is about 60,000 tuples.
+        `version` is an opaque string. Store it together with the ticket set it came with
+        and send back only that one. Send with `Accept-Encoding: gzip`; a full stadium is
+        about 60,000 tuples (2.8 MB, 1.3 MB gzipped).
+
+        `gate_group_index` points into the `gate_groups` array of the same answer. Store
+        the gate group's text with each ticket, not the index.
+
+        A draft event answers 404. A cancelled or finished event still answers.
 
         The private signing key is never in this or any other answer.
       parameters:
@@ -2623,22 +2636,45 @@ paths:
       tags: [Gate]
       summary: Upload a batch of scans made at the gate
       description: |
-        **Role:** GATE_STAFF, ADMIN. Up to 500 scans per call, from one device. Each scan
-        carries a UUID made on the device (`client_scan_id`); a scan that was already
-        uploaded is not stored again and gets the same answer as the first time, so the
-        device can resend a batch whenever it is unsure.
+        **Role:** GATE_STAFF, ADMIN. Up to 500 scans per call, from one device; more is
+        413. Each scan carries a UUID made on the device (`client_scan_id`). A scan that
+        was already uploaded is not stored again and is not judged again: the answer is
+        the result the server holds for it now, so the device can resend a batch whenever
+        it is unsure. Nothing about a stored scan is taken from the second upload.
 
-        The server decides the final result of each scan, which may differ from what the
-        device showed offline:
+        The server decides the final result of each new scan, which may differ from what
+        the device showed offline. In this order, the first that applies:
 
-        - The earliest `ADMITTED` scan of a ticket (by `scanned_at`) wins and marks the
-          ticket `USED`. Every other admit of that ticket becomes `DUPLICATE`.
-        - A ticket the server does not know, a void ticket, or a `token` that fails
-          signature checking is `INVALID`.
-        - A ticket for another event is `WRONG_EVENT`; for another gate group, `WRONG_GATE`.
+        1. A `token` that fails signature checking, or is not the text issued for
+           `ticket_id`: `INVALID`. A token for another event: `WRONG_EVENT`; for another
+           gate group: `WRONG_GATE`.
+        2. A ticket the server does not know: `INVALID` (the scan is still stored).
+        3. A ticket of another event than the scan's `event_id`: `WRONG_EVENT`; of another
+           gate group than the scan's `gate_group`: `WRONG_GATE`.
+        4. A `VOID` or `TRANSFERRED` ticket: `INVALID`, also when it was scanned before it
+           was voided.
+        5. Otherwise, a scan the device did **not** report as `ADMITTED` keeps the device's
+           result: the server never turns a refusal into an admission.
+        6. Otherwise the scan is an admission. The admission of a ticket with the earliest
+           `scanned_at` (ties: the smaller `client_scan_id`) is `ADMITTED` and the ticket
+           is `USED`; every other admission of that ticket is `DUPLICATE`, whichever was
+           uploaded first.
 
         `overridden` is true where the final result differs from the device's verdict:
         those are the scans this device lost.
+
+        **A result can change after it was given.** If another device later uploads an
+        earlier scan of the same ticket, that scan becomes `ADMITTED` and the one answered
+        `ADMITTED` before becomes `DUPLICATE`. The first device is not told; it sees the
+        change only if it uploads that scan again.
+
+        `scanned_at` is the device's clock and is bounded: a time in the future, more than
+        7 days old, or before the ticket was issued is replaced by the time the server
+        received the batch.
+
+        An `event_id` that does not exist is 400 for the whole batch. While an organiser
+        is cancelling or editing the event the answer may be 409 `EVENT_BUSY`: nothing was
+        stored, send the batch again.
 
         A QR that could not be read as a ticket ID at all is not uploaded.
       requestBody:
@@ -2685,9 +2721,13 @@ paths:
         '400': { $ref: '#/components/responses/ValidationFailed' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
-        '413':
-          description: '`PAYLOAD_TOO_LARGE` - split the batch.'
+        '409':
+          description: '`EVENT_BUSY` - an event of the batch is being cancelled or edited. Nothing was stored; send the batch again.'
           content: *err
+        '413':
+          description: '`PAYLOAD_TOO_LARGE` - more than 500 scans, or a body over 1 MiB. Split the batch.'
+          content: *err
+        '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
 
 components:
@@ -4909,7 +4949,14 @@ components:
           description: Every gate group of the venue, for the "which gate are you at" picker.
           items: { $ref: '#/components/schemas/GateGroup' }
         ticket_count: { type: integer, description: Tickets that are `VALID` or `USED`. }
-        manifest_version: { type: string, description: 'The current manifest `version`. If it equals the one on the device, there is nothing to download.' }
+        manifest_version:
+          type: string
+          description: |
+            An opaque change marker. It differs from the value in an earlier listing
+            exactly when something a device stores about the event changed in between:
+            a ticket was issued, used, voided or transferred, or the event's details,
+            gate groups or keys changed. It is **not** a manifest `version`: never send
+            it as `since` (the answer would be a full manifest).
     GateEventList:
       type: object
       additionalProperties: false
@@ -4961,7 +5008,8 @@ components:
         keys:
           type: array
           description: |
-            Every public key that signed a ticket for this event; normally one. A token
+            Every public key the server accepts ticket signatures from, so every key
+            that signed a ticket for this event; normally one. Public keys only. A token
             names its key by ID. A token whose key ID is not here is invalid.
           minItems: 1
           items:
@@ -4982,9 +5030,9 @@ components:
                 description: The 32-byte Ed25519 public key, base64url without padding.
         gate_groups:
           type: array
-          description: The table `gate_group_index` points into. Always the venue's full list in a stable order, also in a changes-only manifest.
+          description: The table `gate_group_index` points into. Always the venue's full list, sorted, also in a changes-only manifest. An index is only good for the answer it came in.
           items: { $ref: '#/components/schemas/GateGroup' }
-        ticket_count: { type: integer, description: 'Tickets that are `VALID` or `USED` for the event as of `version`, whatever `tickets` holds. A device can check its stored set against it.' }
+        ticket_count: { type: integer, description: 'Tickets that are `VALID` or `USED` for the event, read in the same snapshot as `tickets`, whatever `tickets` holds. After applying the answer a device holds exactly this many tickets.' }
         tickets:
           type: array
           items: { $ref: '#/components/schemas/ManifestTicketTuple' }
@@ -5001,7 +5049,7 @@ components:
         gate_group:
           $ref: '#/components/schemas/GateGroup'
           description: The gate group the device was set to.
-        scanned_at: { type: string, format: date-time, description: Device clock at the moment of the scan. }
+        scanned_at: { type: string, format: date-time, description: 'Device clock at the moment of the scan. Bounded by the server, see the operation.' }
         result:
           $ref: '#/components/schemas/ScanResult'
           description: What the device decided offline and showed to the steward.
@@ -5047,4 +5095,4 @@ components:
               first_admitted_at:
                 type: [string, 'null']
                 format: date-time
-                description: When the winning admit of this ticket was scanned. Null if it was never admitted.
+                description: When the winning admit of this ticket was scanned (the ticket's `used_at`). Null if it was never admitted.

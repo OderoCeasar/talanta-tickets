@@ -57,6 +57,9 @@ sqlc: ## Regenerate the Go query code (needs the sqlc CLI, v1.31.1)
 openapi-clients: ## Regenerate the TypeScript API types from backend/docs/openapi.yaml
 	pnpm --filter @talanta/shared generate
 
+loadtest: ## 500 fans go for the same 50 seats through the local API (needs `make dev` and `make seed`)
+	cd backend && go run ./cmd/loadtest -db "$(DATABASE_URL)"
+
 test: ## Backend unit tests
 	$(MAKE) -C backend test
 

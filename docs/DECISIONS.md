@@ -457,7 +457,7 @@ One line each: what was chosen and why. Newest at the bottom.
 - **The web ticket page has its own route group and reads no access token.** Under
   `OptionalAuth` a stale `Authorization` header would turn the page into a JSON 401. Every
   answer of the page is HTML, including 429 and 500, and it has its own per-IP limit
-  (`RateLimits.WebTicketPerIP`, 3,000 a minute: a stand of fans shares an address).
+  (`RateLimits.WebTicketPerIP`, 300 a minute since the M10 review fix; it was 3,000).
 - **The web ticket page loads nothing and runs nothing.** `default-src 'none'`, images only
   as `data:` URLs (the QR codes are inline PNGs), one style block allowed by its SHA-256,
   no script. `Referrer-Policy: no-referrer` because the page's address is the secret. A QR
@@ -606,6 +606,78 @@ One line each: what was chosen and why. Newest at the bottom.
   tickets; money that bought nothing has a refund) and every payment test ends with it. A
   test proves each ledger rule fires on a deliberately corrupt state.
 - **No new Go dependency and no migration 000009 for M7 bookings and payments.**
+- **Gate mode lives in `internal/gate` and is built from the verifier only (M10).** The
+  manifest sends public keys and the scan upload checks signatures; neither needs the
+  signer, so the package is never given it and a private key has no path into a gate answer.
+- **A manifest version is the database clock read before the select, and a changes-only
+  answer looks back two minutes before it.** The same discipline as the seat map marker,
+  with a longer overlap: `tickets.updated_at` is stamped at write time, and the longest
+  transaction that writes tickets is an event cancel, cut off at 55 s (the ordinary limits
+  are 15 s). Tickets changed in the last two minutes are sent again on each sync; a tuple is
+  a status, so that is harmless. Versions that are unreadable, foreign, from the future or
+  older than 7 days get the full manifest. A test commits two transactions out of order
+  and shows the late one is delivered; with the overlap removed it is lost.
+- **The manifest's tickets and `ticket_count` are read in one REPEATABLE READ, read-only
+  transaction**, so a device can check the size of its set against the count.
+- **`GateEventListItem.manifest_version` is a change marker, not a version.** The contract
+  promised "equal means nothing to download", which a clock-based version can never give.
+  The list now carries a digest of what a device stores (event details, keys, gate groups,
+  ticket counts per gate group and status); it starts with `s1.`, which cannot decode as a
+  version, so sending it as `since` gets a full manifest rather than a wrong delta.
+- **No ETag on the manifest.** A changes-only request for an unchanged event is a few
+  hundred bytes; a validator would be a second mechanism for the same saving.
+- **The earliest admission by scan time holds a ticket, and the server rewrites history to
+  keep it so.** When an earlier scan is uploaded after a later one was answered `ADMITTED`,
+  the later scan's stored result becomes `DUPLICATE` and `used_at` moves back. The other
+  choice, "first to reach the server wins", would make the result depend on which phone
+  found signal first. The cost is said plainly in `API_NOTES`: a device can be told
+  `ADMITTED` for a scan that later loses, and learns it only by uploading the scan again.
+  Ties go to the smaller `client_scan_id`.
+- **A scan the device did not report as `ADMITTED` never becomes one.** The steward turned
+  the person away; marking the ticket used afterwards would lock out the real holder.
+- **A stored scan is never judged again and never overwritten by a re-upload.** The answer
+  to a repeat is the stored row as it is now, which is also the only way a device hears
+  that an admission of its lost later.
+- **Device scan times are bounded:** future, older than 7 days, or before the ticket's
+  `issued_at` becomes the server's receive time. Refusing the scan instead would leave it
+  stuck on the device for ever; believing it would let a clock set to last year win every
+  tie. Clocks that are wrong by minutes are believed; that is a limit, not a feature.
+- **A scan uploaded after its ticket was voided is `INVALID`, whenever it was made;** a
+  scan stored before the void keeps `ADMITTED`. The server keeps no history of ticket
+  statuses, and `VOID` is final in `domain.TransitionTicket`.
+- **An unknown `event_id` fails the whole batch with 400.** `scan_logs.event_id` is a
+  foreign key, so such a scan cannot be stored, and a device only scans for events the
+  server listed. Unknown ticket ids are stored (`INVALID`), as the table was designed for.
+- **Unreadable QR codes are not uploaded.** `scan_logs.ticket_id` is NOT NULL and the
+  contract's scan requires a ticket id; a text with none stays on the device.
+- **LOCK ORDER, extended for M10.** Ticket rows come last and are always taken in id
+  order. A scan upload takes every scanned event shared first (steps 0 and 1, bounded wait,
+  `EVENT_BUSY`), then locks the batch's tickets `FOR UPDATE ORDER BY id`, writes `scan_logs`,
+  and writes tickets last. The event lock is needed for two reasons: cancel voids all of an
+  event's tickets in one statement in no particular order while holding the event
+  exclusive, and a `scan_logs` insert key-share-locks its event row through the foreign key.
+  An upload locks only tickets of events it has taken (a ticket of another event is
+  `WRONG_EVENT` from its unchanging columns, read without a lock). `VoidTicketsOfBooking`
+  (refund) now locks its tickets in id order before updating them, for the same reason.
+  Tests race uploads against each other, against a refund's void and against a cancel.
+- **No migration for M10.** `scan_logs` and `tickets` had what gate mode needs. Not stored:
+  the device's own verdict and the token. The full manifest reads the event's tickets in
+  one pass (sequential when the event is most of the table); an index on
+  `(event_id, status)` would make the changes-only `ticket_count` index-only and can be
+  added (as 000010; 000009 is taken) if 80 ms per sync ever matters.
+- **Scan upload limits: 120 a minute per (user, `device_id`), 3,000 a minute per user.**
+  The device id is the device's own word, so the per-user limit stands in front; it is
+  loose because stewards at a gate may share a sign-in.
+- **Drawn QR images are cached in process, 1,024 images by (token, size) (review fix).**
+  Drawing took 14 ms at 384 px and 54 ms at 1024; a token never changes, so the image never
+  does. The QR image route is limited to 60 a minute per user and the web ticket page to
+  300 a minute per IP (was 3,000; the page is for fans without the app).
+- **Ticket public keys are checked at startup with `math/big`, no new dependency (review
+  fix).** Non-canonical encodings and the eight small-order points are refused for the
+  verify set and the signing key's public half: under the identity one fixed signature
+  verifies every payload. Key errors name the variable and entry position, never the value.
+- **The ticket SMS is logged as "NOT delivered" (warn) when the sender is the log-only mock
+  in production (review fix),** not as handed over.
 - **Money-path review: the rule.** Once there is any evidence that money moved for a
   payment, the payment ends in exactly one of (a) seats `SOLD` and tickets issued, or (b) a
   refund row and an organiser alert. Never neither, never both. Every item below serves it,
@@ -694,3 +766,34 @@ One line each: what was chosen and why. Newest at the bottom.
   the rule; the seeded codes are N, S, E and W. No new Go dependency.
 - **Fonts are bundled, not fetched from Google at run time.** The app must render with no
   network, and the admin site makes no third-party requests.
+- **Mobile fonts: `@expo-google-fonts/inter` 0.4.2 and `@expo-google-fonts/plus-jakarta-sans`
+  0.4.2.** The owner asked for Inter (body, labels, buttons, inputs, tab bar) and Plus Jakarta
+  Sans (titles, headers, headline prices), the same pair as the admin site. The packages
+  carry the .ttf files, so the fonts ship inside the app and nothing is fetched at run time.
+  Only six weights are imported, each from its own folder; importing the package index would
+  bundle every weight.
+- **`expo-font` 57.0.4 loads them, two ways.** Its config plugin embeds the six files
+  natively (development and release builds), and `useFonts` in `mobile/app/_layout.tsx`
+  registers the same files under the same names, which is what Expo Go uses. Each weight is
+  its own family name (`mobile/src/fonts.ts`): Android does not pick a bundled weight from
+  `fontWeight`. The Skia seat canvas reads the Inter file directly for row labels.
+- **`expo-splash-screen` 57.0.9.** Sets the launch screen (the stadium mark on Emerald Ink)
+  and keeps it up until the fonts are registered, so no screen is drawn in the system font
+  first. If a font cannot be read the app carries on in the system font.
+- **`sharp` 0.35.5, mobile devDependency.** Renders the app icon, adaptive icon layers,
+  splash mark and favicon from the SVG sources in `mobile/assets/src/`
+  (`node mobile/assets/src/render.mjs`). The machine has no `rsvg-convert`, Inkscape or
+  ImageMagick; sharp needs no system package. It is not part of the app bundle.
+- **The mobile app makes the booking when the fan taps Pay, not when checkout opens.** The
+  hold carries `subtotal_cents`, `fee_cents` and `total_cents`, so the total can be shown
+  without a booking; a fan who only looks leaves nothing behind. The idempotency key is
+  still made once, with the hold, and sent on every Pay for it.
+- **`@fontsource-variable/inter` 5.3.0 (admin).** Inter is the organiser site's text and
+  control font, asked for by the project owner. The package carries the font files, so Vite
+  serves them from the site itself and the browser never asks Google or anyone else for a
+  font. `admin/src/fonts.css` declares only the Latin variable file (one 48 kB woff2 covers
+  every weight), not the package's own stylesheet, which would ship six more subsets.
+- **`@fontsource-variable/plus-jakarta-sans` 5.3.0 (admin).** Plus Jakarta Sans is the
+  organiser site's heading font (headings, the brand name, the dashboard's big figures),
+  bundled the same way and for the same reason: one 27 kB Latin variable woff2, no outside
+  request.

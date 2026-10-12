@@ -131,6 +131,10 @@ const maxKeyNumber = math.MaxUint16
 // a configured key may not use it, so a real verifier never trusts it.
 const EphemeralKeyID = "k0"
 
+// errKeyID says what a key ID must look like and never what was given: the value comes from
+// configuration, where the thing most easily pasted into the wrong variable is the key.
+var errKeyID = fmt.Errorf("a key ID must be the letter k followed by a number from 1 to %d", maxKeyNumber)
+
 // KeyID is the text form of a key number.
 func KeyID(number uint16) string { return "k" + strconv.FormatUint(uint64(number), 10) }
 
@@ -138,16 +142,16 @@ func KeyID(number uint16) string { return "k" + strconv.FormatUint(uint64(number
 func ParseKeyID(id string) (uint16, error) {
 	digits, ok := strings.CutPrefix(id, "k")
 	if !ok || digits == "" || len(digits) > 5 || (len(digits) > 1 && digits[0] == '0') {
-		return 0, fmt.Errorf("key ID %q is not the letter k followed by a number from 1 to %d", id, maxKeyNumber)
+		return 0, errKeyID
 	}
 	for _, c := range digits {
 		if c < '0' || c > '9' {
-			return 0, fmt.Errorf("key ID %q is not the letter k followed by a number from 1 to %d", id, maxKeyNumber)
+			return 0, errKeyID
 		}
 	}
 	n, err := strconv.ParseUint(digits, 10, 16)
 	if err != nil {
-		return 0, fmt.Errorf("key ID %q is not the letter k followed by a number from 1 to %d", id, maxKeyNumber)
+		return 0, errKeyID
 	}
 	return uint16(n), nil
 }

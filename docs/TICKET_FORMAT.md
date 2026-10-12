@@ -102,16 +102,36 @@ public keys only, so a stolen device cannot make tickets.
 
 The server signs with one key at a time. When the key is changed the new one gets a new
 number, and the old public key stays in the server's verify set (`TICKET_VERIFY_KEYS`) for
-as long as tickets signed with it are in use. The manifest for an event lists every public
-key that signed a ticket of that event, so a device simply looks the key up by ID. A key ID
-is never re-used for a different key.
+as long as tickets signed with it are in use. The manifest lists every public key the
+server accepts (so every key that signed a ticket of the event), and a device simply looks
+the key up by ID. A key ID is never re-used for a different key. The server refuses to
+start with a verify key that is not a canonical point or is a small-order point.
 
 ## 4. How a gate device checks a ticket, offline
 
+### 4.1 What the device holds
+
 Before the gates open the device downloads the manifest
-(`GET /v1/gate/events/{eventId}/manifest`): the public keys by key ID, the event, the list
-of gate groups, and every ticket ID with its status. The steward picks the gate group the
-device is standing at.
+(`GET /v1/gate/events/{eventId}/manifest`, with `Accept-Encoding: gzip`: about 1.3 MB for a
+full stadium) and stores, per event:
+
+- `keys`: public key by key ID (32 bytes each, from 43 characters of base64url);
+- `gate_groups`, and the one the steward picked for this device;
+- the **ticket set**: for each ticket ID its gate group (the text, looked up through
+  `gate_group_index` in the same answer; an index means nothing in a later answer) and its
+  status letter, `V` or `U`;
+- `version`, stored in the same write as the ticket set it came with.
+
+Whenever it has a connection it asks again with `since=<the stored version>`. If the answer
+says `full: true`, replace the whole ticket set. If `full: false`, for each tuple: `V` or
+`U`, insert or overwrite; `X` or `T`, delete. Then store the new `version`. The same ticket
+will come back in several answers in a row (the server looks back two minutes on purpose);
+applying it again changes nothing. After applying, the size of the set must equal
+`ticket_count`; if it does not, download in full. One rule on top: **never turn a ticket
+this device has admitted back to `V`** because a manifest says so. The device's own scan is
+newer than a manifest that was made before its upload arrived.
+
+### 4.2 Checking a scan
 
 For each scan, do these steps **in this order** and stop at the first that fails.
 
@@ -128,8 +148,8 @@ For each scan, do these steps **in this order** and stop at the first that fails
 | 9 | The event ID equals the event the device is scanning for. | `WRONG_EVENT` |
 | 10 | The gate group equals the device's gate group, compared exactly as text. | `WRONG_GATE` |
 | 11 | The ticket ID is in the manifest's ticket set. | `INVALID` (not a ticket of this event, or voided) |
-| 12 | The ticket's manifest status is `V` and this device has not admitted it already. | `DUPLICATE` |
-|  | All passed. | `ADMITTED`: record the scan and mark the ticket used locally |
+| 12 | The ticket's status in the device's set is `V`. (Admitting a ticket sets it to `U` on the device, so this one check covers both "the manifest says used" and "this device already let it in".) | `DUPLICATE` |
+|  | All passed. | `ADMITTED` |
 
 Why this order matters:
 
@@ -141,11 +161,52 @@ Why this order matters:
 - Step 10 comes before 11 and 12 so that a fan at the wrong stand is sent to the right gate
   without their ticket being marked used.
 
-Every scan, whatever its result, is stored on the device with a UUID made on the device
-(`client_scan_id`) and uploaded later (`POST /v1/gate/scans`) with the ticket ID read from
-the payload and the full QR text in `token`, so the server can check the signature itself.
-A text that fails steps 1 to 5 has no ticket ID to read and is not uploaded; one that fails
-at step 6 or later is uploaded as `INVALID` with the ticket ID as read from bytes 3 to 18.
+### 4.3 Recording and uploading
+
+**Write before you show.** For every scan that got as far as step 6 (so a ticket ID could
+be read from bytes 3 to 18, whether or not the signature was good), do this in one durable
+local write **before** the steward sees green or red:
+
+1. make a `client_scan_id` (a random UUID), once, for this scan;
+2. store the scan: `client_scan_id`, `ticket_id` (as read from the payload), `event_id`
+   and `gate_group` (what the device is set to, not what the ticket says), `scanned_at`
+   (the device clock, UTC), `result`, and `token` (the full QR text);
+3. if the result is `ADMITTED`, set the ticket to `U` in the device's set.
+
+If the app dies between the write and the screen, the scan exists and the next scan of
+that ticket is `DUPLICATE`. The other way round a person walks in on a scan that was never
+recorded. A text that fails steps 1 to 5 has no ticket ID; it is shown as `INVALID` and is
+not uploaded (keep a local count if you want one).
+
+**Upload** with `POST /v1/gate/scans`: `device_id` (stable per install) and up to 500
+scans, oldest first. Always send `token`. A scan leaves the upload queue only when a 200
+answer lists its `client_scan_id`. On a network error, a 409 (`EVENT_BUSY`), a 429 (wait
+`Retry-After`) or a 5xx, send the very same batch again later: the upload is idempotent on
+`client_scan_id`, so a batch that did arrive is not stored twice. A 400 means the batch is
+malformed and will never be accepted as it is; a 413 means split it.
+
+**Reading the answer.** `results` has one entry per uploaded scan, in the same order.
+`result` is the server's final word and `overridden: true` marks where it differs from the
+device's:
+
+- device `ADMITTED`, server `DUPLICATE`: another device admitted this ticket earlier
+  (`first_admitted_at` says when). Both people are inside. Show it to the supervisor.
+- device `ADMITTED`, server `INVALID`: the ticket was voided (refund, cancelled event) or
+  the server does not know it. The device's manifest was stale; sync it.
+- device `ADMITTED`, server `WRONG_EVENT` or `WRONG_GATE`: the device's checks have a bug.
+
+`ticket_status` is the ticket's status on the server now; set the device's copy from it
+(`VOID` and `TRANSFERRED`: delete), except that a ticket this device admitted stays `U`.
+
+**A result can still change after a 200.** If another phone later uploads an earlier scan
+of the same ticket, the server moves the admission to that scan and marks this device's as
+`DUPLICATE`. Nothing is pushed to the device. To find out, resend the scans that were last
+answered `ADMITTED` (the same `client_scan_id`s) once before closing the session: the
+answer is their result as it stands then.
+
+**Clocks.** `scanned_at` decides which of two admissions was first. A time in the future,
+more than 7 days old or before the ticket was issued is replaced by the server's receive
+time. Keep the device clock on network time.
 
 The server runs the same steps 1 to 10 in `ticketing.Verifier.Verify`, `Claims.CheckEvent`
 and `Claims.CheckGate`. Each failure there is a distinct error value (`ErrBadPrefix`,
