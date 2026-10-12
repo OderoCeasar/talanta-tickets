@@ -94,6 +94,10 @@ type API struct {
 	Argon2MaxConcurrent int
 	// OTPCountryCodes are the calling codes (digits, no plus) sign-in SMS may be sent to.
 	OTPCountryCodes []string
+	// OTPTestCodes maps a test phone number (E.164) to the fixed sign-in code it always gets
+	// (OTP_TEST_CODES). No SMS is sent to these numbers. It exists so the app can be signed
+	// in to on a server that has no SMS provider yet. Empty means no test numbers.
+	OTPTestCodes map[string]string
 	// OTPGlobalHourlyLimit and OTPGlobalDailyLimit cap sign-in SMS across all phones.
 	OTPGlobalHourlyLimit int
 	OTPGlobalDailyLimit  int
@@ -175,6 +179,7 @@ func LoadAPI() (API, error) {
 		OTPGlobalHourlyLimit: l.Int("OTP_GLOBAL_HOURLY_LIMIT", 2000),
 		OTPGlobalDailyLimit:  l.Int("OTP_GLOBAL_DAILY_LIMIT", 10000),
 	}
+	cfg.OTPTestCodes = l.otpTestCodes(cfg.OTPCountryCodes)
 	cfg.TrustedProxies = l.trustedProxies(cfg.Base)
 	cfg.AdminBaseURL = l.adminBaseURL(cfg.Base)
 	cfg.PublicBaseURL = l.publicBaseURL(cfg.Base)
@@ -393,6 +398,78 @@ func (l *Loader) err() error {
 		return nil
 	}
 	return errors.New("config: " + strings.Join(l.problems, "; "))
+}
+
+// MaxOTPTestCodes bounds OTP_TEST_CODES: it is for a handful of testers, not a user list.
+const MaxOTPTestCodes = 20
+
+// otpTestCodes reads OTP_TEST_CODES, a comma-separated list of phone=code pairs such as
+// "+254700000011=482913,+254700000012=771204". Each phone must be a number a real code could
+// be sent to, and each code six digits. Codes like 000000 or 123456 are refused: a test
+// number is a standing way in, so its code must not be the first thing anyone tries.
+func (l *Loader) otpTestCodes(countryCodes []string) map[string]string {
+	entries := l.list("OTP_TEST_CODES", "")
+	if len(entries) == 0 {
+		return nil
+	}
+	if len(entries) > MaxOTPTestCodes {
+		l.fail("OTP_TEST_CODES holds %d numbers; at most %d are allowed", len(entries), MaxOTPTestCodes)
+		return nil
+	}
+	out := make(map[string]string, len(entries))
+	for i, entry := range entries {
+		rawPhone, code, ok := strings.Cut(entry, "=")
+		// Problems name the entry by position, never by value: the code is a credential.
+		if !ok {
+			l.fail("OTP_TEST_CODES entry %d must be phone=code: a phone number, an equals sign, then six digits", i+1)
+			continue
+		}
+		phone, valid := domain.NormalisePhone(strings.TrimSpace(rawPhone))
+		if !valid || !domain.PhoneHasCountryCode(phone, countryCodes) {
+			l.fail("OTP_TEST_CODES entry %d: the phone is not a number sign-in codes are sent to (see OTP_ALLOWED_COUNTRY_CODES)", i+1)
+			continue
+		}
+		code = strings.TrimSpace(code)
+		if !isSixDigits(code) {
+			l.fail("OTP_TEST_CODES entry %d: the code must be exactly six digits", i+1)
+			continue
+		}
+		if isGuessableCode(code) {
+			l.fail("OTP_TEST_CODES entry %d: the code is too easy to guess (all one digit, or a run such as 123456); pick six random digits", i+1)
+			continue
+		}
+		if _, dup := out[phone]; dup {
+			l.fail("OTP_TEST_CODES entry %d repeats a phone number", i+1)
+			continue
+		}
+		out[phone] = code
+	}
+	return out
+}
+
+func isSixDigits(s string) bool {
+	if len(s) != 6 {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// isGuessableCode reports the codes an attacker tries first: one digit repeated, or six
+// digits each one more (or one less) than the last.
+func isGuessableCode(code string) bool {
+	same, up, down := true, true, true
+	for i := 1; i < len(code); i++ {
+		d := int(code[i]) - int(code[i-1])
+		same = same && d == 0
+		up = up && d == 1
+		down = down && d == -1
+	}
+	return same || up || down
 }
 
 func (l *Loader) fail(format string, args ...any) {

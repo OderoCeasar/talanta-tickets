@@ -248,6 +248,7 @@ type envConfig struct {
 	// holdDB is the pool the hold service runs on; nil means the shared one.
 	holdDB       booking.DB
 	otpCountries []string
+	otpTestCodes map[string]string
 	// venueLockWait is how long a layout change waits for a publish; zero means the default.
 	venueLockWait time.Duration
 	// ticketKeys is the ticket keyring; nil means a fresh random key with the ID k1.
@@ -285,6 +286,11 @@ func withMailError(err error) envOption { return func(c *envConfig) { c.mailErr 
 // withOTPCountries sets OTP_ALLOWED_COUNTRY_CODES; without it the default (254) applies.
 func withOTPCountries(codes ...string) envOption {
 	return func(c *envConfig) { c.otpCountries = codes }
+}
+
+// withOTPTestCodes sets OTP_TEST_CODES: test phone → the fixed code it always gets.
+func withOTPTestCodes(codes map[string]string) envOption {
+	return func(c *envConfig) { c.otpTestCodes = codes }
 }
 
 // env is one API instance (its own limiter, clock, SMS and mail boxes) on the shared database.
@@ -354,6 +360,7 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 		Now:          e.clock.Now,
 
 		OTPCountryCodes: cfg.otpCountries,
+		OTPTestCodes:    cfg.otpTestCodes,
 	})
 	require.NoError(t, err)
 	e.auth = svc

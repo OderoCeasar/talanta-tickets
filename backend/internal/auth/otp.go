@@ -82,15 +82,26 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string, ip netip.Addr
 	if d := s.limiter.Take("otp:phone:"+phone, s.policy.OTPPerPhone); !d.Allowed {
 		return OTPRequested{}, domain.RateLimited(ratelimit.RetryAfterSeconds(d.RetryAfter))
 	}
+	// A test number (OTP_TEST_CODES) always gets its configured code and no SMS. Everything
+	// else about it is ordinary: the code is stored hashed, expires, is retired by a newer
+	// request and has the same attempt limit, so the verify path has no special case and a
+	// test number cannot be guessed at any faster than a real one.
+	testCode, isTest := s.otpTestCodes[phone]
+
 	// Last, so only requests that would really send an SMS count against the global caps;
 	// checked first, one phone hammering "resend" could use them up without costing a cent.
-	if err := s.takeGlobalOTP(ctx); err != nil {
-		return OTPRequested{}, err
+	if !isTest {
+		if err := s.takeGlobalOTP(ctx); err != nil {
+			return OTPRequested{}, err
+		}
 	}
 
-	code, err := randomDigits(otpDigits)
-	if err != nil {
-		return OTPRequested{}, err
+	code := testCode
+	if !isTest {
+		var err error
+		if code, err = randomDigits(otpDigits); err != nil {
+			return OTPRequested{}, err
+		}
 	}
 	var requestIP *netip.Addr
 	if ip.IsValid() {
@@ -117,13 +128,20 @@ func (s *Service) RequestOTP(ctx context.Context, rawPhone string, ip netip.Addr
 		return OTPRequested{}, fmt.Errorf("request otp: %w", err)
 	}
 
+	out := OTPRequested{ExpiresIn: s.policy.OTPLifetime, ResendAfter: s.policy.OTPResendAfter}
+	if isTest {
+		// The answer is the same as for any phone, and the code is never in it: whoever set
+		// OTP_TEST_CODES already knows it, and nobody else may learn it from the API.
+		s.log.InfoContext(ctx, "sign-in code requested for a test number: no SMS sent")
+		return out, nil
+	}
+
 	text := fmt.Sprintf("Your Talanta Tickets code is %s. It expires in %d minutes. Do not share it.",
 		code, int(s.policy.OTPLifetime/time.Minute))
 	if err := s.sms.SendSMS(ctx, phone, text); err != nil {
 		return OTPRequested{}, fmt.Errorf("request otp: send sms: %w", err)
 	}
 
-	out := OTPRequested{ExpiresIn: s.policy.OTPLifetime, ResendAfter: s.policy.OTPResendAfter}
 	// The dev shortcut. In production this branch must never run: the code would let anyone
 	// sign in as any phone number.
 	if s.devShortcuts {
