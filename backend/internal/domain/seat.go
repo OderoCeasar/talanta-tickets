@@ -82,27 +82,3 @@ func (c SeatCounts) Add(o SeatCounts) SeatCounts {
 
 // GateGroup names the gates a seat in a stand may be entered by: "<stand code>-<tier>".
 func GateGroup(standCode, tier string) string { return standCode + "-" + tier }
-
-// PaymentFailureReason turns a payment's status and the provider's result code into the
-// stable value the contract calls failure_reason. Nil while the payment is live and when it
-// succeeded. The codes are Daraja's STK result codes.
-func PaymentFailureReason(status string, resultCode *int32) *string {
-	if status != "FAILED" && status != "TIMEOUT" {
-		return nil
-	}
-	reason := "other"
-	switch {
-	case status == "TIMEOUT":
-		reason = "timeout"
-	case resultCode == nil:
-	case *resultCode == 1:
-		reason = "insufficient_funds"
-	case *resultCode == 2001:
-		reason = "wrong_pin"
-	case *resultCode == 1032:
-		reason = "cancelled"
-	case *resultCode == 1037:
-		reason = "timeout"
-	}
-	return &reason
-}

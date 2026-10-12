@@ -318,40 +318,42 @@ func TestHolds_ReleaseConflicts(t *testing.T) {
 	assert.Equal(t, 1, checkInventory(t, ev.ID).Sold)
 }
 
-// The fee and total on a hold: basis points of the subtotal, whole cents, rounded down.
+// The fee and total on a hold: basis points of the subtotal, rounded to the nearest whole
+// shilling (M-Pesa takes nothing smaller), half a shilling rounding up.
 func TestHolds_FeeAndTotal(t *testing.T) {
 	e := newEnv(t, withHoldPolicy(func(p *booking.Policy) { p.BookingFeeBPS = 250 }))
 	v := e.newVenue(1, 2, 4)
 	ev := e.readyEvent(v)
-	// 999.99 KES: 2.5% of one seat is 2,499.975 cents, which must come out as 2,499.
-	want(t, e.do("PATCH", fmt.Sprintf("/admin/categories/%d", ev.Cats["Regular"]), obj{"price_cents": 99_999}, ev.Token), http.StatusOK)
+	// KES 1,500: 2.5% of one seat is 37.50 shillings, which must come out as 38.00.
+	want(t, e.do("PATCH", fmt.Sprintf("/admin/categories/%d", ev.Cats["Regular"]), obj{"price_cents": 150_000}, ev.Token), http.StatusOK)
 	want(t, e.publish(ev), http.StatusOK)
 	seats := eventSeatIDs(t, ev.ID, v.BlockIDs[0])
 	_, fan := e.newFan()
 
 	one := want(t, e.hold(fan, ev.ID, seats[4]), http.StatusCreated)
-	assert.EqualValues(t, 99_999, one["subtotal_cents"])
-	assert.EqualValues(t, 2_499, one["fee_cents"])
-	assert.EqualValues(t, 102_498, one["total_cents"])
+	assert.EqualValues(t, 150_000, one["subtotal_cents"])
+	assert.EqualValues(t, 3_800, one["fee_cents"])
+	assert.EqualValues(t, 153_800, one["total_cents"])
 
-	// Three seats: the fee is worked out on the subtotal (299,997 → 7,499), not per seat
-	// (3 × 2,499 = 7,497).
+	// Three seats: the fee is worked out once, on the subtotal (112.50 shillings → 113.00),
+	// not three times 38.00.
 	three := want(t, e.best(fan, ev.ID, ev.Cats["Regular"], 3), http.StatusCreated)
-	assert.EqualValues(t, 299_997, three["subtotal_cents"])
-	assert.EqualValues(t, 7_499, three["fee_cents"])
-	assert.EqualValues(t, 307_496, three["total_cents"])
+	assert.EqualValues(t, 450_000, three["subtotal_cents"])
+	assert.EqualValues(t, 11_300, three["fee_cents"])
+	assert.EqualValues(t, 461_300, three["total_cents"])
 
 	got := want(t, e.do("GET", fmt.Sprintf("/holds/%d", id64(three["id"])), nil, fan), http.StatusOK)
-	assert.EqualValues(t, 7_499, got["fee_cents"])
+	assert.EqualValues(t, 11_300, got["fee_cents"])
 	mine := items(want(t, e.do("GET", "/me/holds", nil, fan), http.StatusOK))
 	require.Len(t, mine, 2)
 	for _, m := range mine {
 		h := m.(obj)
 		assert.EqualValues(t, id64(h["subtotal_cents"])+id64(h["fee_cents"]), h["total_cents"])
 		assert.Positive(t, id64(h["fee_cents"]))
+		assert.Zero(t, id64(h["fee_cents"])%100, "the fee is always a whole number of shillings")
 	}
 	// Every amount is a whole number in the JSON itself.
-	assert.NotContains(t, e.do("GET", "/me/holds", nil, fan).Body.String(), ".9")
+	assert.NotRegexp(t, `_cents":-?\d+[.eE]`, e.do("GET", "/me/holds", nil, fan).Body.String())
 	checkInventory(t, ev.ID)
 }
 

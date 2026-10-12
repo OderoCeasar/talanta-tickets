@@ -132,9 +132,11 @@ func TestConcurrency_ThousandMultiSeatRequests(t *testing.T) {
 	})
 
 	// Ten overlapping windows of three over twelve seats ({0,1,2}, {1,2,3}, … {9,10,11}), 100
-	// requests each. Which windows win depends on timing, so the number of winners is 3 or
-	// 4; what is exact is that winners never overlap, every winner has all three seats, and
-	// no window is left entirely free (a request only ever loses to a committed hold).
+	// requests each. Which windows win depends on timing, so the number of winners is 2, 3
+	// or 4 (two is possible: with {2,3,4} and {7,8,9} held, every other window overlaps one
+	// of them); what is exact is that winners never overlap, every winner has all three
+	// seats, and no window is left entirely free (a request only ever loses to a committed
+	// hold).
 	t.Run("overlapping windows", func(t *testing.T) {
 		f := newFixture(t, fixtureOpts{Rows: 1, SeatsPerRow: 12, MaxPerUser: 6})
 		svc := newService(t)
@@ -168,7 +170,7 @@ func TestConcurrency_ThousandMultiSeatRequests(t *testing.T) {
 		counts := tally(outs)
 		t.Logf("requests=%d winners=%d seats_unavailable=%d other_errors=%d seats_held_twice=%d", requests, winners, counts[domain.CodeSeatsUnavailable], requests-winners-counts[domain.CodeSeatsUnavailable], heldTwice)
 		assert.Zero(t, heldTwice, "seats held twice")
-		assert.Contains(t, []int{3, 4}, winners)
+		assert.Contains(t, []int{2, 3, 4}, winners)
 		assert.Equal(t, requests-winners, counts[domain.CodeSeatsUnavailable])
 		c := f.check()
 		assert.Equal(t, winners*3, c.Held, "no partial hold")
@@ -427,44 +429,49 @@ func TestConcurrency_TicketLimitCannotBeRaced(t *testing.T) {
 	assert.Equal(t, rounds*4, f.check().Held)
 }
 
-// Test 6. Best available under contention: 50 groups of 4 ask at the same moment. Every
-// group gets 4 neighbouring seats in one row, and no seat is given to two groups.
+// Test 6. Best available under contention, with demand equal to supply: 50 groups of 4 ask
+// at the same moment for a category that has exactly 50 runs of four. Every group gets 4
+// neighbouring seats in one row, and no seat is given to two groups. Several rounds: before
+// the later tries walked several runs each, one to three groups a round were told
+// NO_ADJACENT_SEATS while a whole run stood free.
 func TestConcurrency_BestAvailableFiftyGroupsOfFour(t *testing.T) {
-	const groups, size = 50, 4
-	// 2 blocks × 10 rows × 20 seats = 400 seats, 100 possible runs of four.
-	f := newFixture(t, fixtureOpts{Blocks: 2, Rows: 10, SeatsPerRow: 20})
+	const groups, size, rounds = 50, 4, 5
 	svc := newService(t)
-	users := newUsers(t, groups)
+	for round := 1; round <= rounds; round++ {
+		// 1 block x 10 rows x 20 seats = 200 seats: exactly 50 runs of four, no spare.
+		f := newFixture(t, fixtureOpts{Blocks: 1, Rows: 10, SeatsPerRow: 20})
+		users := newUsers(t, groups)
 
-	started := time.Now()
-	outs := storm(t, groups, stormDeadline, func(i int) (booking.Hold, error) {
-		return svc.HoldBestAvailable(context.Background(), users[i], f.EventID, f.CategoryID, size)
-	})
-	took := time.Since(started)
-	noDeadlocks(t, outs)
+		started := time.Now()
+		outs := storm(t, groups, stormDeadline, func(i int) (booking.Hold, error) {
+			return svc.HoldBestAvailable(context.Background(), users[i], f.EventID, f.CategoryID, size)
+		})
+		took := time.Since(started)
+		noDeadlocks(t, outs)
 
-	owner := map[int64]int{}
-	shared := 0
-	for i, o := range outs {
-		require.NoError(t, o.Err, "group %d", i)
-		require.Len(t, o.Hold.Seats, size, "group %d", i)
-		first := o.Hold.Seats[0]
-		for k, s := range o.Hold.Seats {
-			assert.Equal(t, first.BlockID, s.BlockID, "group %d: one block", i)
-			assert.Equal(t, first.RowLabel, s.RowLabel, "group %d: one row", i)
-			assert.Equal(t, first.SeatNumber+int32(k), s.SeatNumber, "group %d: neighbouring seat numbers", i)
-			owner[s.EventSeatID]++
-			if owner[s.EventSeatID] > 1 {
-				shared++
+		owner := map[int64]int{}
+		shared := 0
+		for i, o := range outs {
+			require.NoError(t, o.Err, "round %d, group %d", round, i)
+			require.Len(t, o.Hold.Seats, size, "round %d, group %d", round, i)
+			first := o.Hold.Seats[0]
+			for k, s := range o.Hold.Seats {
+				assert.Equal(t, first.BlockID, s.BlockID, "group %d: one block", i)
+				assert.Equal(t, first.RowLabel, s.RowLabel, "group %d: one row", i)
+				assert.Equal(t, first.SeatNumber+int32(k), s.SeatNumber, "group %d: neighbouring seat numbers", i)
+				owner[s.EventSeatID]++
+				if owner[s.EventSeatID] > 1 {
+					shared++
+				}
 			}
 		}
+		t.Logf("round=%d groups=%d runs=%d got_seats=%d seats_shared=%d took=%s", round, groups, groups, tally(outs)[""], shared, took.Round(time.Millisecond))
+		assert.Zero(t, shared, "seats given to two groups")
+		assert.Len(t, owner, groups*size)
+		c := f.check()
+		assert.Equal(t, groups*size, c.Held)
+		assert.Zero(t, c.Available, "every seat of the category is held")
 	}
-	t.Logf("groups=%d got_seats=%d seats_shared=%d took=%s", groups, tally(outs)[""], shared, took.Round(time.Millisecond))
-	assert.Zero(t, shared, "seats given to two groups")
-	assert.Len(t, owner, groups*size)
-	c := f.check()
-	assert.Equal(t, groups*size, c.Held)
-	assert.Equal(t, 400-groups*size, c.Available)
 }
 
 // Test 7. The sweeper and live hold requests at the same time: nothing blocks, nothing

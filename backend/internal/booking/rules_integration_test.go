@@ -554,7 +554,7 @@ func TestExtendForPayment(t *testing.T) {
 	setExpiry(t, live.Row.ID, time.Minute)
 	tx, err := pool.Begin(ctx)
 	require.NoError(t, err)
-	ext, err = booking.ExtendForPayment(ctx, tx, me, live.Row.ID, svc.PaymentWindow())
+	ext, err = booking.ExtendForPayment(ctx, tx, me, live.Row.ID, svc.PaymentWindow(), svc.EventLockWait())
 	require.NoError(t, err)
 	assert.True(t, ext.Extended)
 	require.NoError(t, tx.Rollback(ctx))

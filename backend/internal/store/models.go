@@ -138,6 +138,8 @@ type OrganiserAlert struct {
 	Message        string
 	CreatedAt      time.Time
 	AcknowledgedAt *time.Time
+	PaymentID      *int64
+	Resolution     *string
 }
 
 type OtpCode struct {
@@ -168,6 +170,26 @@ type Payment struct {
 	CompletedAt       *time.Time
 	LastQueriedAt     *time.Time
 	QueryAttempts     int32
+	Dispatch          string
+}
+
+type PaymentCallback struct {
+	ID                int64
+	PaymentID         int64
+	CheckoutRequestID string
+	MerchantRequestID *string
+	ResultCode        int32
+	ResultDesc        *string
+	AmountCents       *int64
+	MpesaReceipt      *string
+	PhoneE164         *string
+	Raw               json.RawMessage
+	ReceivedAt        time.Time
+	Attempts          int32
+	NextAttemptAt     time.Time
+	ProcessedAt       *time.Time
+	Verdict           *string
+	LastError         *string
 }
 
 type RefreshToken struct {
@@ -251,6 +273,26 @@ type Ticket struct {
 	KeyID       string
 	UpdatedAt   time.Time
 	QrToken     string
+}
+
+type UnmatchedCallback struct {
+	ID                int64
+	CheckoutRequestID string
+	MerchantRequestID *string
+	ResultCode        int32
+	ResultDesc        *string
+	AmountCents       *int64
+	MpesaReceipt      *string
+	PhoneE164         *string
+	Raw               json.RawMessage
+	ReceivedAt        time.Time
+	Attempts          int32
+	NextAttemptAt     time.Time
+	ProcessedAt       *time.Time
+	Verdict           *string
+	MatchedPaymentID  *int64
+	AlertID           *int64
+	LastError         *string
 }
 
 type User struct {

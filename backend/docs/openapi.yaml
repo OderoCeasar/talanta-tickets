@@ -1027,7 +1027,16 @@ paths:
         copied onto the booking here and never change afterwards.
 
         `Idempotency-Key` is required. The app makes one key per checkout. Sending the same
-        key again returns the same booking with **200** instead of 201 and creates nothing.
+        key again returns the same booking with **200** instead of 201 and creates nothing,
+        also after the hold has ended. One hold has at most one live booking: a second key
+        for the same hold answers `HOLD_ALREADY_BOOKED`, however close together the two
+        requests arrive.
+
+        `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal rounded to the nearest
+        whole shilling (a multiple of 100 cents; half a shilling rounds up), the same sum
+        the hold showed as an estimate. M-Pesa takes whole shillings only, so a fee with a
+        fraction of a shilling would make the booking unpayable. `reference` is `TLT-` and six characters from
+        `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no 0, O, 1, I or L).
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1060,6 +1069,7 @@ paths:
             - `HOLD_EXPIRED` - the 10 minutes ran out.
             - `HOLD_NOT_ACTIVE` - the hold was released or already paid for.
             - `HOLD_ALREADY_BOOKED` - the hold already has a booking made with a different key; `details.booking_reference` names it.
+            - `EVENT_BUSY` - an organiser's publish, cancel or edit has the event locked; nothing was created, send the same request (same key) again.
           content: *err
         '422':
           description: '`IDEMPOTENCY_KEY_REUSED` - this key was already used for a different hold.'
@@ -1105,10 +1115,41 @@ paths:
 
         Starting the first payment pushes the hold's expiry out once so at least 6 minutes
         remain; re-read the booking for the new `hold_expires_at`. After a failed payment
-        the fan may retry for as long as the hold is alive.
+        the fan may retry for as long as the hold has at least 2 minutes left (a hold is
+        extended only once, so a late retry can find too little: `HOLD_EXPIRED`).
+
+        `phone` may be written the Kenyan ways (`07…`, `2547…`); it is stored and returned
+        as E.164. Only Kenyan (`+254`) numbers are accepted.
+
+        How a payment ends, as `GET /payments/{paymentId}` shows it:
+
+        | What happened | `status` | `failure_reason` | `booking_status` |
+        |---|---|---|---|
+        | Paid, seats sold, tickets issued | `SUCCESS` | null | `PAID` |
+        | Insufficient funds, wrong PIN, cancelled, prompt timed out | `FAILED` | that reason | `PENDING_PAYMENT` while the hold lives, else `EXPIRED` |
+        | No answer from M-Pesa within 5 minutes | `TIMEOUT` | `timeout` | as above |
+        | M-Pesa itself reports a different amount paid | `FAILED` | `wrong_amount` | `REFUND_REQUIRED` |
+        | Paid, but the tickets could not be issued | `SUCCESS` | null | `REFUND_REQUIRED` |
+        | Paid, but the seats were gone (hold ended and seats resold, event cancelled) | `SUCCESS` | null | `REFUND_REQUIRED` |
+        | Paid a second time for a booking another payment already paid | `SUCCESS` | null | `PAID` (tickets kept; this payment is refunded) |
+
+        `FAILED` and `TIMEOUT` are not always the last word: if M-Pesa later confirms that
+        the money did arrive, the payment becomes `SUCCESS` and ends as one of the three
+        "Paid" rows above. Keep showing what `GET /payments/{paymentId}` says.
+
+        **When we cannot tell whether the request reached M-Pesa** (it timed out after it
+        was sent, or the answer was lost) the answer is still **202** with the payment
+        `PENDING`, and its `result_desc` says "We are checking with M-Pesa whether the
+        request went through. Do not pay again yet." The fan may or may not get a prompt.
+        Until that payment resolves, a second one for the booking is refused with 409
+        `PAYMENT_IN_PROGRESS`, so the fan cannot pay twice. It resolves as any other payment
+        does, or is closed as `TIMEOUT` after 5 minutes.
 
         **Dev only:** `X-Mock-Outcome` chooses what the mock provider does. Sending the
-        header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`.
+        header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`. A value
+        that is not one of the outcomes is 400 on `X-Mock-Outcome`. Without the header the
+        mock succeeds, except for the phone numbers `+254700000101` to `+254700000108`,
+        which play the outcomes in the order of the `MockOutcome` enum after `success`.
       parameters:
         - $ref: '#/components/parameters/MockOutcome'
       requestBody:
@@ -1119,7 +1160,9 @@ paths:
             example: { booking_id: 8801, phone: '+254712345678' }
       responses:
         '202':
-          description: The prompt was sent; the payment is `PENDING`.
+          description: |
+            The payment is `PENDING`. Normally the prompt was sent. When `result_desc` is not
+            null the request may not have reached M-Pesa and is being checked (see above).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Payment' }
@@ -1134,8 +1177,9 @@ paths:
         '409':
           description: |
             - `BOOKING_NOT_PAYABLE` - the booking is not `PENDING_PAYMENT`; `details.booking_status` says what it is.
-            - `HOLD_EXPIRED` - the seats are no longer held; start again from the map.
+            - `HOLD_EXPIRED` - the seats are no longer held, or the hold has under 2 minutes left (then `details.hold_status` is still `ACTIVE`); start again from the map.
             - `PAYMENT_IN_PROGRESS` - a payment for this booking is still `INITIATED` or `PENDING`; `details.payment_id` names it.
+            - `EVENT_BUSY` - an organiser's publish, cancel or edit has the event locked; nothing was started, send the request again.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -1147,7 +1191,7 @@ paths:
         '429': { $ref: '#/components/responses/TooManyRequests' }
         '500': { $ref: '#/components/responses/Internal' }
         '502':
-          description: '`PAYMENT_PROVIDER_UNAVAILABLE` - M-Pesa did not accept the request. No payment is left live; the fan may retry.'
+          description: '`PAYMENT_PROVIDER_UNAVAILABLE` - the request provably did not reach M-Pesa, or M-Pesa refused it. The attempt is kept as a `FAILED` payment (the booking shows it as `latest_payment`); no payment is left live and the fan may retry at once. (A request that MAY have reached M-Pesa is not this: it is a 202.)'
           content: *err
 
   /payments/{paymentId}:
@@ -1159,7 +1203,12 @@ paths:
         **Role:** FAN, owner only. `failure_reason` is the stable value to switch on;
         `result_desc` is the provider's own wording. `booking_status` is included so one
         poll tells the app both that the money arrived and whether tickets were issued
-        (`PAID`) or the seats were lost and a refund is owed (`REFUND_REQUIRED`).
+        (`PAID`) or the seats were lost and a refund is owed (`REFUND_REQUIRED`). The table
+        under `POST /payments/mpesa/stk` lists every combination.
+
+        Stop polling when `status` is `SUCCESS`, `FAILED` or `TIMEOUT`. A `TIMEOUT` can still
+        change afterwards, to `SUCCESS` or `FAILED`, if M-Pesa reports late; the booking
+        (`GET /bookings/{reference}`) always shows the truth.
       parameters:
         - $ref: '#/components/parameters/PaymentId'
       responses:
@@ -1181,8 +1230,6 @@ paths:
                     amount_cents: 100000
                     currency: KES
                     phone: '+254712345678'
-                    merchant_request_id: 29115-34620561-1
-                    checkout_request_id: ws_CO_191220191020363925
                     mpesa_receipt: null
                     failure_reason: wrong_pin
                     result_code: 2001
@@ -1204,14 +1251,33 @@ paths:
         **Role:** public; called by Safaricom, not by our clients. No bearer token: the
         source IP is checked against an allowlist from config.
 
-        The body is never trusted alone. The server finds the payment by
-        `CheckoutRequestID`, checks it is still pending and that the `Amount` equals the
-        booking total. An unknown ID, a repeat, a forged body or a disallowed IP all get
-        the same answer and change nothing.
+        The body is never trusted alone: it is a hint to ask Daraja. The server finds the
+        payment by `CheckoutRequestID` and, for a "paid", asks Daraja itself (the
+        authenticated STK query) before anything is sold or queued for refund. Only
+        Daraja's own answer moves money. The `Amount` in the body is never treated as
+        money: Daraja's query names no amount and an STK prompt cannot be paid in part or
+        in excess, so a confirmed payment is paid in full at the amount we requested, and
+        a body naming a different amount only raises an `AMOUNT_MISMATCH` alert (no refund
+        is queued for the body's figure). A failure is taken from the body when its
+        `ResultCode` is a documented final failure; any other code is checked with Daraja.
 
-        Always answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body
-        that cannot be parsed, so Daraja does not retry and nothing is revealed to a
-        prober.
+        The callback is **written down before the answer is sent** (the callback inbox), so
+        it survives a busy event, a failed query and a restart; the work itself runs after
+        the answer and is retried by the worker until it is done. A success that arrives
+        for a payment already `FAILED` or `TIMEOUT` is still applied.
+
+        A "paid" whose `CheckoutRequestID` no payment has (the STK request reached M-Pesa
+        but its answer never reached us) is stored too, raises a `PAYMENT_UNRESOLVED` alert
+        naming the receipt and amount, and is matched to a payment with no M-Pesa ID by
+        phone and amount once Daraja confirms it. An unknown ID with a failure, a repeat, a
+        body that is not Daraja's, a `ResultCode` that does not fit 32 bits and a
+        disallowed IP change nothing. When payments are switched off
+        (`PAYMENT_PROVIDER=none`) every callback is ignored. The body is limited to 64 KiB.
+
+        Answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body that
+        cannot be parsed or comes from a disallowed address, so nothing is revealed to a
+        prober. The one exception is **503**: a real callback that could not be written
+        down (the database is unreachable) is not acknowledged as accepted.
       security: []
       requestBody:
         required: true
@@ -1246,11 +1312,21 @@ paths:
                       ResultDesc: Request cancelled by user.
       responses:
         '200':
-          description: Always.
+          description: Always, except as below.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/MpesaCallbackAck' }
               example: { ResultCode: 0, ResultDesc: Accepted }
+        '503':
+          description: The callback is a valid one from an allowed address and could not be stored. Nothing was accepted; send it again.
+          headers:
+            Retry-After:
+              schema: { type: integer }
+              description: Seconds to wait before sending it again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MpesaCallbackNotStored' }
+              example: { ResultCode: 1, ResultDesc: Temporarily unavailable }
 
   # ---------------------------------------------------------------------------
   # Tickets
@@ -1967,6 +2043,9 @@ paths:
         **Role:** ORGANISER, ADMIN. The name is unique within the event. While the event is
         `DRAFT` a price of zero is accepted (it blocks publishing); once the event has left
         `DRAFT` the price must be above zero (400 on `price_cents`, rule `gt`).
+
+        A price must be whole shillings (`price_cents` a multiple of 100): M-Pesa takes no
+        cents. Anything else is refused with 400 on `price_cents`, rule `whole_shillings`.
       parameters:
         - $ref: '#/components/parameters/EventId'
       requestBody:
@@ -2270,6 +2349,10 @@ paths:
         - name: event_id
           in: query
           schema: { $ref: '#/components/schemas/Id' }
+        - name: booking_reference
+          in: query
+          description: Only the refunds of this booking. Lets an alert link to its refund.
+          schema: { $ref: '#/components/schemas/BookingReference' }
         - $ref: '#/components/parameters/Limit'
         - $ref: '#/components/parameters/Cursor'
       responses:
@@ -2290,13 +2373,21 @@ paths:
       summary: Record that a refund was paid
       description: |
         **Role:** ORGANISER, ADMIN. No request body. Marks the refund `DONE`; when a
-        booking has no refund left pending it becomes `REFUNDED`. This records the fact,
-        it does not move money. Safe to repeat.
+        `REFUND_REQUIRED` booking has no refund left pending it becomes `REFUNDED` and any
+        ticket it still has is voided. A booking that is `PAID` (the refund was for a second,
+        duplicate payment) stays `PAID` and keeps its tickets. Seats are not touched: see
+        `docs/API_NOTES.md`. This records the fact, it does not move money.
+
+        Safe to repeat: a refund that is already `DONE` answers 200 again with the first
+        `completed_at`, and `already_completed: true` says this call changed nothing.
+
+        The open `REFUND_REQUIRED` and `AMOUNT_MISMATCH` alerts about the refunded payment
+        are closed in the same step, with a `resolution`.
       parameters:
         - $ref: '#/components/parameters/RefundId'
       responses:
         '200':
-          description: The refund.
+          description: The refund, with `already_completed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Refund' }
@@ -2304,6 +2395,9 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { $ref: '#/components/responses/Forbidden' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: '`EVENT_BUSY` - a publish, a cancel or another edit has the event locked; nothing changed, send the request again.'
+          content: *err
         '500': { $ref: '#/components/responses/Internal' }
 
   # ---------------------------------------------------------------------------
@@ -2844,17 +2938,32 @@ components:
         `REFUND_REQUIRED` means money arrived but the seats could not be given (the hold
         had lapsed and they were resold, or the amount was wrong), or the event was
         cancelled after the booking was paid. No valid tickets exist; a refund is queued.
+        It becomes `REFUNDED` when every refund is recorded as paid.
+
+        `EXPIRED`: the hold ran out before a payment succeeded. `CANCELLED`: the fan
+        released the hold, or the event was cancelled before payment. Either can still
+        become `REFUND_REQUIRED` if M-Pesa reports a payment afterwards. `FAILED` is
+        reserved; nothing sets it today. A `PAID` booking only ever changes to
+        `REFUND_REQUIRED`, and only when its event is cancelled.
       enum: [PENDING_PAYMENT, PAID, FAILED, EXPIRED, CANCELLED, REFUND_REQUIRED, REFUNDED]
     PaymentStatus:
       type: string
-      description: '`INITIATED` and `PENDING` are live; the rest are final.'
+      description: |
+        `INITIATED` and `PENDING` are live. `SUCCESS` and `FAILED` are M-Pesa's verdicts and
+        final. `TIMEOUT` is ours (no answer in 5 minutes): the fan may start another
+        payment, and if M-Pesa reports afterwards it still becomes `SUCCESS` or `FAILED`.
+        `SUCCESS` means the money arrived, not that tickets exist: read `booking_status`.
+        `REVERSED` is reserved.
       enum: [INITIATED, PENDING, SUCCESS, FAILED, TIMEOUT, REVERSED]
     PaymentProvider:
       type: string
       enum: [MPESA]
     PaymentFailureReason:
       type: string
-      description: Why a payment did not succeed, in a form the app can switch on.
+      description: |
+        Why a payment did not succeed, in a form the app can switch on. `wrong_amount`: M-Pesa
+        reported a payment of a different amount from the booking total; the payment is
+        `FAILED`, the booking `REFUND_REQUIRED`, and what was paid is queued for refund.
       enum: [insufficient_funds, wrong_pin, cancelled, timeout, wrong_amount, other]
     MockOutcome:
       type: string
@@ -2864,8 +2973,12 @@ components:
         - `timeout` - the fan never answers the prompt; the callback reports a timeout.
         - `no_callback` - no callback at all; reconciliation finds the (successful) result.
         - `duplicate_callback` - the success callback is delivered twice.
-        - `late_callback` - the success callback arrives after the hold has expired.
-        - `wrong_amount` - the callback reports a different amount from the booking total.
+        - `late_callback` - the success callback arrives late (after `MOCK_LATE_CALLBACK_DELAY`,
+          7 minutes by default): after the payment has been marked `TIMEOUT` and the hold
+          has expired. The payment then becomes `SUCCESS`; the booking is `PAID` if the hold
+          still had every seat, otherwise `REFUND_REQUIRED`.
+        - `wrong_amount` - the callback reports one shilling more than the booking total:
+          payment `FAILED` with `failure_reason: wrong_amount`, booking `REFUND_REQUIRED`.
       enum: [success, insufficient_funds, wrong_pin, user_cancel, timeout, no_callback, duplicate_callback, late_callback, wrong_amount]
     TicketStatus:
       type: string
@@ -2878,6 +2991,20 @@ components:
       enum: [PENDING, DONE]
     AlertKind:
       type: string
+      description: |
+        - `REFUND_REQUIRED` - a payment arrived and bought nothing (seats resold, hold gone,
+          event cancelled, or the booking was already paid). A refund is in the queue.
+        - `AMOUNT_MISMATCH` - M-Pesa itself reported a payment of the wrong amount: a refund
+          for what M-Pesa says was paid is in the queue. Or a callback named an amount other
+          than the one requested for a payment M-Pesa confirmed: the payment was treated as
+          paid in full, NO refund is queued, and the message says to check the statement.
+        - `PAYMENT_UNRESOLVED` - we do not know what became of some money. Either M-Pesa gave
+          no final answer for a payment within 5 minutes and it was closed as `TIMEOUT`; or a
+          payment request may have reached M-Pesa without us learning its ID; or M-Pesa
+          reported a payment we cannot match to any booking (the message names the receipt,
+          the amount and the phone); or a stored callback could not be confirmed in 7 days.
+          Check the M-Pesa portal; nothing is queued. It is closed automatically, with a
+          `resolution`, if the payment later ends in tickets or a queued refund.
       enum: [REFUND_REQUIRED, AMOUNT_MISMATCH, PAYMENT_UNRESOLVED]
     NumberingDirection:
       type: string
@@ -3042,7 +3169,7 @@ components:
         available: { type: integer, description: 'Seats still available in the category, together or not.' }
     HoldStateDetails:
       type: object
-      description: For `HOLD_EXPIRED`, `HOLD_NOT_ACTIVE`.
+      description: 'For `HOLD_EXPIRED`, `HOLD_NOT_ACTIVE`. `hold_status` is `EXPIRED` for a hold that ran out; a payment refused because the hold has too little time left carries `ACTIVE` and the real `expires_at`.'
       additionalProperties: false
       required: [hold_id, hold_status, expires_at]
       properties:
@@ -3852,9 +3979,10 @@ components:
           format: int64
           minimum: 0
           description: |
-            The booking fee a booking made from this hold would charge on `subtotal_cents`,
-            in whole cents, rounded down. Zero when there is no fee. An estimate, like
-            `subtotal_cents`.
+            The booking fee a booking made from this hold would charge on `subtotal_cents`:
+            always a whole number of shillings (a multiple of 100), rounded to the nearest
+            shilling with half a shilling rounding up. Zero when there is no fee. An
+            estimate, like `subtotal_cents`.
         total_cents:
           type: integer
           format: int64
@@ -4013,6 +4141,10 @@ components:
           description: The M-Pesa number to prompt. May differ from the account's phone.
     Payment:
       type: object
+      description: |
+        A payment as its owner (and staff) see it. Daraja's request IDs
+        (`CheckoutRequestID`, `MerchantRequestID`) are deliberately NOT part of it: the
+        `CheckoutRequestID` is the key a callback is matched by, and no client needs it.
       additionalProperties: false
       required:
         - id
@@ -4024,8 +4156,6 @@ components:
         - amount_cents
         - currency
         - phone
-        - merchant_request_id
-        - checkout_request_id
         - mpesa_receipt
         - failure_reason
         - result_code
@@ -4042,16 +4172,21 @@ components:
         amount_cents: { type: integer, format: int64 }
         currency: { $ref: '#/components/schemas/Currency' }
         phone: { $ref: '#/components/schemas/Phone' }
-        merchant_request_id: { type: [string, 'null'] }
-        checkout_request_id: { type: [string, 'null'], description: Daraja's ID for the prompt. }
         mpesa_receipt: { type: [string, 'null'], description: 'M-Pesa receipt number, once paid.' }
         failure_reason:
-          description: Null while live and on success. Set for `FAILED` and `TIMEOUT`.
+          description: 'Null while live and on success. Set for `FAILED` and `TIMEOUT`. `wrong_amount` is a `FAILED` payment whose `result_code` is 0: M-Pesa took the money, we refused it, `booking_status` is `REFUND_REQUIRED`. A `FAILED` or `TIMEOUT` payment can still become `SUCCESS` later, when M-Pesa confirms the money did arrive.'
           anyOf:
             - { $ref: '#/components/schemas/PaymentFailureReason' }
             - { type: 'null' }
         result_code: { type: [integer, 'null'], description: The provider's raw result code. }
-        result_desc: { type: [string, 'null'], description: The provider's own wording. For display or support only. }
+        result_desc:
+          type: [string, 'null']
+          description: |
+            The provider's own wording, for display or support only. On a `PENDING` payment
+            it is normally null; when it is set there ("We are checking with M-Pesa whether
+            the request went through. Do not pay again yet.") the request may or may not
+            have reached M-Pesa, and the app should show that text instead of "check your
+            phone".
         created_at: { type: string, format: date-time }
         completed_at: { type: [string, 'null'], format: date-time }
     MpesaCallback:
@@ -4086,6 +4221,16 @@ components:
                           Value:
                             description: Amount is in shillings (may be fractional). Some items arrive with no value.
                             type: [string, number]
+    MpesaCallbackNotStored:
+      type: object
+      additionalProperties: false
+      required: [ResultCode, ResultDesc]
+      properties:
+        ResultCode:
+          type: integer
+          enum: [1]
+        ResultDesc:
+          type: string
     MpesaCallbackAck:
       type: object
       additionalProperties: false
@@ -4663,10 +4808,11 @@ components:
     Alert:
       type: object
       additionalProperties: false
-      required: [id, event_id, booking_id, booking_reference, kind, message, created_at, acknowledged_at]
+      required: [id, event_id, event_title, booking_id, booking_reference, kind, message, created_at, acknowledged_at, resolution]
       properties:
         id: { $ref: '#/components/schemas/Id' }
         event_id: { $ref: '#/components/schemas/Id' }
+        event_title: { type: string, description: The title of the event the alert is filed under. }
         booking_id:
           anyOf:
             - { $ref: '#/components/schemas/Id' }
@@ -4678,7 +4824,18 @@ components:
         kind: { $ref: '#/components/schemas/AlertKind' }
         message: { type: string }
         created_at: { type: string, format: date-time }
-        acknowledged_at: { type: [string, 'null'], format: date-time }
+        acknowledged_at:
+          type: [string, 'null']
+          format: date-time
+          description: When the alert was closed, by a person (`ackAlert`) or by the system (then `resolution` is set).
+        resolution:
+          type: [string, 'null']
+          description: |
+            Null for an open alert and for one a person acknowledged. Set when the SYSTEM
+            closed it because what it asked for is done, and says which:
+            a `PAYMENT_UNRESOLVED` alert whose payment later sold its seats or had a refund
+            queued; a `REFUND_REQUIRED` or `AMOUNT_MISMATCH` alert whose refund was marked
+            as paid back. For display.
     AlertPage:
       type: object
       additionalProperties: false
@@ -4691,14 +4848,23 @@ components:
     Refund:
       type: object
       additionalProperties: false
-      required: [id, booking_id, booking_reference, event_id, payment_id, amount_cents, currency, phone, mpesa_receipt, reason, status, created_at, completed_at]
+      required: [id, booking_id, booking_reference, booking_status, event_id, payment_id, amount_cents, currency, phone, mpesa_receipt, reason, status, created_at, completed_at]
       properties:
         id: { $ref: '#/components/schemas/Id' }
         booking_id: { $ref: '#/components/schemas/Id' }
         booking_reference: { $ref: '#/components/schemas/BookingReference' }
+        booking_status:
+          $ref: '#/components/schemas/BookingStatus'
+          description: |
+            The booking's status now. `REFUND_REQUIRED`: completing its last pending refund
+            makes it `REFUNDED` and voids its tickets. `PAID`: the refund is for a second
+            payment; the booking keeps its tickets.
+        already_completed:
+          type: boolean
+          description: Only in the answer of `completeRefund`. True when the refund was already `DONE` and this call changed nothing.
         event_id: { $ref: '#/components/schemas/Id' }
         payment_id: { $ref: '#/components/schemas/Id' }
-        amount_cents: { type: integer, format: int64, description: What was actually received and must go back. }
+        amount_cents: { type: integer, format: int64, description: 'What must go back: the amount M-Pesa itself confirmed, never a figure taken from a callback body alone.' }
         currency: { $ref: '#/components/schemas/Currency' }
         phone:
           $ref: '#/components/schemas/Phone'

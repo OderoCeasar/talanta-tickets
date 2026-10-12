@@ -627,31 +627,32 @@ func newSalesSummaryDTO(s events.Sales) salesSummaryDTO {
 	return out
 }
 
+// paymentDTO is the contract's Payment. The provider's request IDs (CheckoutRequestID,
+// MerchantRequestID) are deliberately not in it: the CheckoutRequestID is the key a callback
+// is matched by, and nothing a client does needs it.
 type paymentDTO struct {
-	ID                int64   `json:"id"`
-	BookingID         int64   `json:"booking_id"`
-	BookingReference  string  `json:"booking_reference"`
-	BookingStatus     string  `json:"booking_status"`
-	Provider          string  `json:"provider"`
-	Status            string  `json:"status"`
-	AmountCents       int64   `json:"amount_cents"`
-	Currency          string  `json:"currency"`
-	Phone             string  `json:"phone"`
-	MerchantRequestID *string `json:"merchant_request_id"`
-	CheckoutRequestID *string `json:"checkout_request_id"`
-	MpesaReceipt      *string `json:"mpesa_receipt"`
-	FailureReason     *string `json:"failure_reason"`
-	ResultCode        *int32  `json:"result_code"`
-	ResultDesc        *string `json:"result_desc"`
-	CreatedAt         string  `json:"created_at"`
-	CompletedAt       *string `json:"completed_at"`
+	ID               int64   `json:"id"`
+	BookingID        int64   `json:"booking_id"`
+	BookingReference string  `json:"booking_reference"`
+	BookingStatus    string  `json:"booking_status"`
+	Provider         string  `json:"provider"`
+	Status           string  `json:"status"`
+	AmountCents      int64   `json:"amount_cents"`
+	Currency         string  `json:"currency"`
+	Phone            string  `json:"phone"`
+	MpesaReceipt     *string `json:"mpesa_receipt"`
+	FailureReason    *string `json:"failure_reason"`
+	ResultCode       *int32  `json:"result_code"`
+	ResultDesc       *string `json:"result_desc"`
+	CreatedAt        string  `json:"created_at"`
+	CompletedAt      *string `json:"completed_at"`
 }
 
 func newPaymentDTO(p store.Payment, booking store.Booking) paymentDTO {
 	return paymentDTO{
 		ID: p.ID, BookingID: p.BookingID, BookingReference: booking.Reference, BookingStatus: booking.Status,
 		Provider: p.Provider, Status: p.Status, AmountCents: p.AmountCents, Currency: domain.Currency, Phone: p.PhoneE164,
-		MerchantRequestID: p.MerchantRequestID, CheckoutRequestID: p.CheckoutRequestID, MpesaReceipt: p.MpesaReceipt,
+		MpesaReceipt:  p.MpesaReceipt,
 		FailureReason: domain.PaymentFailureReason(p.Status, p.ResultCode),
 		ResultCode:    p.ResultCode, ResultDesc: p.ResultDesc, CreatedAt: ts(p.CreatedAt), CompletedAt: tsPtr(p.CompletedAt),
 	}
@@ -661,6 +662,7 @@ type refundDTO struct {
 	ID               int64   `json:"id"`
 	BookingID        int64   `json:"booking_id"`
 	BookingReference string  `json:"booking_reference"`
+	BookingStatus    string  `json:"booking_status"`
 	EventID          int64   `json:"event_id"`
 	PaymentID        int64   `json:"payment_id"`
 	AmountCents      int64   `json:"amount_cents"`
@@ -671,6 +673,9 @@ type refundDTO struct {
 	Status           string  `json:"status"`
 	CreatedAt        string  `json:"created_at"`
 	CompletedAt      *string `json:"completed_at"`
+	// AlreadyCompleted is only in the answer of completeRefund: true when the refund was
+	// DONE before this call.
+	AlreadyCompleted *bool `json:"already_completed,omitempty"`
 }
 
 type bookingUserDTO struct {
@@ -714,7 +719,8 @@ func newAdminBookingDTO(b events.AdminBooking) adminBookingDTO {
 	if b.Refund != nil {
 		rf := b.Refund.Refund
 		out.Refund = &refundDTO{
-			ID: rf.ID, BookingID: rf.BookingID, BookingReference: r.Reference, EventID: r.EventID, PaymentID: rf.PaymentID,
+			ID: rf.ID, BookingID: rf.BookingID, BookingReference: r.Reference, BookingStatus: r.Status,
+			EventID: r.EventID, PaymentID: rf.PaymentID,
 			AmountCents: rf.AmountCents, Currency: domain.Currency, Phone: b.Refund.PaymentPhone, MpesaReceipt: b.Refund.MpesaReceipt,
 			Reason: rf.Reason, Status: rf.Status, CreatedAt: ts(rf.CreatedAt), CompletedAt: tsPtr(rf.CompletedAt),
 		}

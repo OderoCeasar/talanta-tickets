@@ -1,16 +1,18 @@
 -- name: GetEventSalesTotals :one
 -- Money figures of the sales dashboard. Revenue counts PAID bookings only. What is owed back
--- on a REFUND_REQUIRED booking is its queued refunds, or its total when none is queued yet.
+-- is every refund of the event still PENDING, whatever its booking's status: a second payment
+-- for a booking that stays PAID is owed back too. A refund that is DONE no longer counts. A
+-- REFUND_REQUIRED booking with no refund row at all (none queued yet) counts its whole total.
 SELECT
     COALESCE((SELECT sum(b.total_cents) FROM bookings b
                WHERE b.event_id = sqlc.arg(event_id) AND b.status = 'PAID'), 0)::bigint AS revenue_cents,
     (SELECT count(*) FROM bookings b
       WHERE b.event_id = sqlc.arg(event_id) AND b.status = 'REFUND_REQUIRED')::bigint AS refund_required_count,
-    COALESCE((SELECT sum(COALESCE(
-                  (SELECT sum(r.amount_cents) FROM refunds r WHERE r.booking_id = b.id AND r.status = 'PENDING'),
-                  b.total_cents))
-               FROM bookings b
-               WHERE b.event_id = sqlc.arg(event_id) AND b.status = 'REFUND_REQUIRED'), 0)::bigint AS refund_required_cents,
+    (COALESCE((SELECT sum(r.amount_cents) FROM refunds r JOIN bookings b ON b.id = r.booking_id
+                WHERE b.event_id = sqlc.arg(event_id) AND r.status = 'PENDING'), 0)
+     + COALESCE((SELECT sum(b.total_cents) FROM bookings b
+                  WHERE b.event_id = sqlc.arg(event_id) AND b.status = 'REFUND_REQUIRED'
+                    AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.booking_id = b.id)), 0))::bigint AS refund_required_cents,
     (SELECT count(*) FROM organiser_alerts a
       WHERE a.event_id = sqlc.arg(event_id) AND a.acknowledged_at IS NULL)::bigint AS open_alert_count;
 

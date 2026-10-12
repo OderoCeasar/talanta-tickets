@@ -266,26 +266,57 @@ func LockEventOfHold(ctx context.Context, db DBTX, holdID int64) (int64, error) 
 // LockedHold is a hold row read under its lock, with the database clock.
 type LockedHold struct {
 	Hold
+	// Now is the database's wall clock read AFTER the row lock was granted.
 	Now time.Time
 }
 
 // Locks: one holds row, FOR UPDATE, until the transaction ends.
-// Why: release, the payment extension and the sale of a hold's seats each read the hold's
-// status and then act on it and on its seats. The row lock makes them take turns, so a
+// Why: release, the payment extension, booking and the sale of a hold's seats each read the
+// hold's status and then act on it and on its seats. The row lock makes them take turns, so a
 // release cannot free seats a payment is in the middle of selling, and the "extended once"
 // check cannot be passed twice. It is taken before any seat lock (lock order).
+//
+// The clock is NOT read in this statement. Postgres computes the select list before it waits
+// for the row lock, so a clock_timestamp() here is the time the wait BEGAN: a caller that
+// queued behind another transaction for longer than the hold had left would judge a hold
+// that has since run out as still live, and could extend (revive) it. LockHold reads the
+// clock in a second statement, once the lock is held.
 const lockHold = `
-SELECT id, event_id, user_id, expires_at, status, created_at, extended_at, clock_timestamp()
+SELECT id, event_id, user_id, expires_at, status, created_at, extended_at
 FROM holds
 WHERE id = $1
 FOR UPDATE`
 
-// LockHold takes a hold's row lock and returns it. ErrNoRows when there is no such hold.
+// LockHold takes a hold's row lock and returns the row together with the database clock as
+// it is once the lock is held. ErrNoRows when there is no such hold.
 func LockHold(ctx context.Context, db DBTX, holdID int64) (LockedHold, error) {
 	var h LockedHold
 	err := db.QueryRow(ctx, lockHold, holdID).
-		Scan(&h.ID, &h.EventID, &h.UserID, &h.ExpiresAt, &h.Status, &h.CreatedAt, &h.ExtendedAt, &h.Now)
-	return h, err
+		Scan(&h.ID, &h.EventID, &h.UserID, &h.ExpiresAt, &h.Status, &h.CreatedAt, &h.ExtendedAt)
+	if err != nil {
+		return h, err
+	}
+	if h.Now, err = Clock(ctx, db); err != nil {
+		return h, fmt.Errorf("read the clock under the lock of hold %d: %w", holdID, err)
+	}
+	return h, nil
+}
+
+// Clock reads the database's wall clock. Everything that judges a time under a lock calls it
+// in a statement of its own AFTER the lock is held (see lockHold for why).
+func Clock(ctx context.Context, db DBTX) (time.Time, error) {
+	var now time.Time
+	err := db.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now)
+	return now, err
+}
+
+// CountHeldSeatsOfHold counts the seats still HELD by a hold. A plain read: the caller has
+// the hold's row lock, which is what a release, a sweep, a sale and a prepared take-over of
+// the same hold wait for.
+func CountHeldSeatsOfHold(ctx context.Context, db DBTX, holdID int64) (int, error) {
+	var n int
+	err := db.QueryRow(ctx, `SELECT count(*)::int FROM event_seats WHERE hold_id = $1 AND status = 'HELD'`, holdID).Scan(&n)
+	return n, err
 }
 
 // Locks: the event_seats rows still HELD by the given holds, FOR UPDATE, in id order.
@@ -378,20 +409,58 @@ func SellSeatsOfHold(ctx context.Context, db DBTX, holdID int64, expected int) (
 	return out, err
 }
 
-// Locks: the PENDING_PAYMENT booking of the given holds, FOR UPDATE (as part of the UPDATE).
-// Why (correction 7): a hold that is closed takes its unpaid booking with it, unless a
-// payment for it is still live: then the booking is left for the payment flow, which finds
-// no held seats to sell and refunds. Bookings are locked after holds and seats (lock order).
-const closeUnpaidBookingsOfHolds = `
-UPDATE bookings b SET status = $2
-WHERE b.hold_id = ANY($1::bigint[]) AND b.status = 'PENDING_PAYMENT'
-  AND NOT EXISTS (
-      SELECT 1 FROM payments p WHERE p.booking_id = b.id AND p.status IN ('INITIATED', 'PENDING'))`
+// BookingOfHold is one booking of a hold, read under its row lock.
+type BookingOfHold struct {
+	ID     int64
+	HoldID int64
+	// Status is the booking's status as stored, whatever it is.
+	Status string
+	// LivePayment is true while a payment for the booking is INITIATED or PENDING.
+	LivePayment bool
+}
 
-// CloseUnpaidBookingsOfHolds moves the unpaid bookings of the given holds, those with no
-// live payment, to status (EXPIRED or CANCELLED) and returns how many it moved.
-func CloseUnpaidBookingsOfHolds(ctx context.Context, db DBTX, holdIDs []int64, status string) (int64, error) {
-	tag, err := db.Exec(ctx, closeUnpaidBookingsOfHolds, holdIDs, status)
+// Locks: every bookings row of the given holds, in any status, FOR UPDATE, in id order.
+// Why (correction 7): a hold that is closed takes its unpaid booking with it, unless a
+// payment for it is still live: then the booking is left for the payment flow, which closes
+// it when the payment ends. The rows are read WITHOUT a status filter on purpose: the caller
+// asks domain.TransitionBooking with the status each row really has, so a booking that is
+// already PAID, REFUND_REQUIRED or closed is refused by the rule and left alone, instead of
+// being filtered out by a WHERE clause that only repeats what the caller hoped to find.
+// Bookings are locked after their hold (lock order); the caller has the hold rows locked,
+// and a payment is only ever inserted or finished under that same hold lock, so
+// live_payment cannot change while this transaction runs.
+const lockBookingsOfHolds = `
+SELECT b.id, b.hold_id, b.status,
+       EXISTS (SELECT 1 FROM payments p WHERE p.booking_id = b.id AND p.status IN ('INITIATED', 'PENDING')) AS live_payment
+FROM bookings b
+WHERE b.hold_id = ANY($1::bigint[])
+ORDER BY b.id
+FOR UPDATE OF b`
+
+// LockBookingsOfHolds locks and returns every booking made from the given holds.
+func LockBookingsOfHolds(ctx context.Context, db DBTX, holdIDs []int64) ([]BookingOfHold, error) {
+	rows, err := db.Query(ctx, lockBookingsOfHolds, holdIDs)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (BookingOfHold, error) {
+		var b BookingOfHold
+		err := row.Scan(&b.ID, &b.HoldID, &b.Status, &b.LivePayment)
+		return b, err
+	})
+}
+
+// Writes: the given bookings, already locked by the caller (LockBookingsOfHolds), to status.
+// The caller has asked domain.TransitionBooking for each row's real status; the WHERE clause
+// repeats that status so a row that is not what was read changes nothing.
+const setBookingsStatus = `UPDATE bookings SET status = $2 WHERE id = ANY($1::bigint[]) AND status = $3`
+
+// SetBookingsStatus moves bookings from one status to another and returns how many it moved.
+func SetBookingsStatus(ctx context.Context, db DBTX, bookingIDs []int64, to, from string) (int64, error) {
+	if len(bookingIDs) == 0 {
+		return 0, nil
+	}
+	tag, err := db.Exec(ctx, setBookingsStatus, bookingIDs, to, from)
 	return tag.RowsAffected(), err
 }
 

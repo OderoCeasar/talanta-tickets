@@ -65,10 +65,18 @@ type CategoryInput struct {
 	Description *string
 }
 
-// priceProblem is the rule readiness enforces at publish, kept true afterwards: once an event
-// has left DRAFT none of its categories may be free. A draft may hold a zero price while the
-// organiser is still setting things up.
+// priceProblem holds the two rules about a category's price.
+//
+// A price is always whole shillings: M-Pesa takes no cents, so a booking with cents in its
+// total could be created, hold its seats, and then never be paid for.
+//
+// And the rule readiness enforces at publish stays true afterwards: once an event has left
+// DRAFT none of its categories may be free. A draft may hold a zero price while the organiser
+// is still setting things up.
 func priceProblem(status domain.EventStatus, priceCents int64) error {
+	if priceCents%100 != 0 {
+		return domain.InvalidField("price_cents", "whole_shillings", "A price must be in whole shillings, with no cents.")
+	}
 	if status == domain.EventDraft || priceCents > 0 {
 		return nil
 	}

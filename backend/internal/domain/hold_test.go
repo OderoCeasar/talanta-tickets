@@ -76,28 +76,41 @@ func TestBookingFeeCents(t *testing.T) {
 		{100_000, 0, 0},
 		{0, 250, 0},
 		{100_000, 250, 2_500},
-		{99_999, 250, 2_499},  // 2,499.975 rounds down
-		{299_997, 250, 7_499}, // 7,499.925 rounds down
-		{39, 250, 0},          // 0.975 of a cent is no cent
-		{40, 250, 1},          // exactly one cent
-		{100_000, 1, 10},      // one basis point
+		// The case that made bookings unpayable: 2.5% of KES 1,500 is KES 37.50. Half a
+		// shilling rounds up.
+		{150_000, 250, 3_800},
+		{200_000, 133, 2_700}, // 26.60 rounds up
+		{100_000, 133, 1_300}, // 13.30 rounds down
+		{99_999, 250, 2_500},  // 24.99975 shillings
+		{299_997, 250, 7_500}, // 74.99925 shillings
+		{1_960, 250, 0},       // 0.49 of a shilling is no shilling
+		{2_000, 250, 100},     // exactly half a shilling rounds up
+		{100_000, 1, 0},       // one basis point of KES 1,000 is 10 cents: no shilling
+		{500_000, 1, 100},     // of KES 5,000 it is exactly half a shilling
 		{100_000, 10_000, 100_000},
 		{100_000, 10_001, 0}, // not a rate
 		{100_000, -5, 0},
 		{-100_000, 250, 0},
-		{math.MaxInt64, 10_000, math.MaxInt64}, // no overflow at the top of the range
-		{math.MaxInt64, 250, math.MaxInt64/10_000*250 + (math.MaxInt64%10_000)*250/10_000},
+		// No overflow in the arithmetic for a subtotal no stadium will ever reach.
+		{math.MaxInt64 / 200, 10_000, (math.MaxInt64/200 + 50) / 100 * 100},
 	}
 	for _, c := range cases {
 		if got := BookingFeeCents(c.subtotal, c.bps); got != c.want {
 			t.Errorf("BookingFeeCents(%d, %d) = %d, want %d", c.subtotal, c.bps, got, c.want)
 		}
 	}
-	// The same as exact integer division wherever that does not overflow.
-	for subtotal := int64(0); subtotal < 30_000; subtotal += 7 {
+	// Always whole shillings, never more than half a shilling from the exact fee, and the
+	// same as exact integer arithmetic wherever that does not overflow.
+	for subtotal := int64(0); subtotal < 3_000_000; subtotal += 7_919 {
 		for _, bps := range []int{1, 99, 250, 333, 9_999} {
-			if got, want := BookingFeeCents(subtotal, bps), subtotal*int64(bps)/10_000; got != want {
+			got := BookingFeeCents(subtotal, bps)
+			exact := subtotal * int64(bps) // in units of 1/10,000 of a cent
+			want := (exact + 500_000) / 1_000_000 * 100
+			if got != want || got%100 != 0 {
 				t.Fatalf("BookingFeeCents(%d, %d) = %d, want %d", subtotal, bps, got, want)
+			}
+			if diff := got*10_000 - exact; diff > 500_000 || diff < -500_000 {
+				t.Fatalf("BookingFeeCents(%d, %d) = %d is more than half a shilling from the exact fee", subtotal, bps, got)
 			}
 		}
 	}

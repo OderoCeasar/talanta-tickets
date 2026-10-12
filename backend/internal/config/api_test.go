@@ -24,6 +24,9 @@ func clearAPIEnv(t *testing.T) {
 		"DB_STATEMENT_TIMEOUT", "DB_IDLE_IN_TX_TIMEOUT",
 		"SMTP_ALLOW_PLAINTEXT", "ARGON2_MAX_CONCURRENT", "BOOKING_FEE_BPS",
 		"OTP_ALLOWED_COUNTRY_CODES", "OTP_GLOBAL_HOURLY_LIMIT", "OTP_GLOBAL_DAILY_LIMIT",
+		"PAYMENT_PROVIDER", "MPESA_ENV", "MPESA_CONSUMER_KEY", "MPESA_CONSUMER_SECRET", "MPESA_SHORTCODE",
+		"MPESA_PASSKEY", "MPESA_CALLBACK_URL", "MPESA_TRANSACTION_TYPE", "MPESA_CALLBACK_ALLOWED_CIDRS",
+		"MOCK_CALLBACK_DELAY", "MOCK_LATE_CALLBACK_DELAY", "SWEEP_INTERVAL", "RECONCILE_INTERVAL",
 	} {
 		t.Setenv(k, "")
 	}
@@ -40,6 +43,24 @@ func productionEnv(t *testing.T) {
 	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
 	t.Setenv("ADMIN_BASE_URL", "https://talanta.example.com")
 	t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com")
+	mpesaEnv(t)
+	t.Setenv("MPESA_ENV", "production")
+	t.Setenv("MPESA_CALLBACK_ALLOWED_CIDRS", "196.201.214.0/24")
+}
+
+const (
+	testConsumerSecret = "consumer-secret-do-not-print-0123456789"
+	testPasskey        = "passkey-do-not-print-abcdefghijklmnop"
+)
+
+// mpesaEnv sets every Daraja setting.
+func mpesaEnv(t *testing.T) {
+	t.Helper()
+	t.Setenv("MPESA_CONSUMER_KEY", "consumer-key")
+	t.Setenv("MPESA_CONSUMER_SECRET", testConsumerSecret)
+	t.Setenv("MPESA_SHORTCODE", "174379")
+	t.Setenv("MPESA_PASSKEY", testPasskey)
+	t.Setenv("MPESA_CALLBACK_URL", "https://talanta.example.com/v1/webhooks/mpesa/callback")
 }
 
 // Production mode fails closed: a server whose env file was lost must not come up with

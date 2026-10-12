@@ -46,6 +46,9 @@ type Policy struct {
 	// BookingFeeBPS is the booking fee in basis points of the subtotal (BOOKING_FEE_BPS).
 	// Zero means no fee. A hold shows the fee as an estimate; the booking charges it.
 	BookingFeeBPS int
+	// BestAvailableWalk is how many candidate runs one later try of best available walks
+	// through (in an order shuffled per request) before it reads the free seats again.
+	BestAvailableWalk int
 }
 
 // DefaultPolicy is what production runs.
@@ -54,6 +57,7 @@ func DefaultPolicy() Policy {
 		HoldTTL:            10 * time.Minute,
 		PaymentWindow:      6 * time.Minute,
 		BestAvailableTries: 6,
+		BestAvailableWalk:  8,
 		SweepBatch:         200,
 		SweepMaxBatches:    50,
 		EventLockWait:      3 * time.Second,
@@ -96,6 +100,9 @@ func NewService(cfg Config) (*Service, error) {
 	}
 	if p.BestAvailableTries <= 0 {
 		p.BestAvailableTries = def.BestAvailableTries
+	}
+	if p.BestAvailableWalk <= 0 {
+		p.BestAvailableWalk = def.BestAvailableWalk
 	}
 	if p.SweepBatch <= 0 {
 		p.SweepBatch = def.SweepBatch
@@ -148,7 +155,7 @@ func ownsSeats(status domain.HoldStatus) bool {
 }
 
 // attachSeats reads the seats of the given holds in one query.
-func (s *Service) attachSeats(ctx context.Context, holds []Hold) error {
+func (s *Service) attachSeats(ctx context.Context, q *store.Queries, holds []Hold) error {
 	var ids []int64
 	for _, h := range holds {
 		if ownsSeats(h.Status) {
@@ -158,7 +165,7 @@ func (s *Service) attachSeats(ctx context.Context, holds []Hold) error {
 	if len(ids) == 0 {
 		return nil
 	}
-	seats, err := s.q.ListSeatsOfHolds(ctx, ids)
+	seats, err := q.ListSeatsOfHolds(ctx, ids)
 	if err != nil {
 		return fmt.Errorf("list seats of holds: %w", err)
 	}
@@ -182,7 +189,12 @@ func (s *Service) attachSeats(ctx context.Context, holds []Hold) error {
 // Get returns one hold of the given user in whatever status it has. Someone else's hold is
 // NOT_FOUND, the same as one that does not exist.
 func (s *Service) Get(ctx context.Context, userID, holdID int64) (Hold, error) {
-	row, err := s.q.GetHoldForUser(ctx, store.GetHoldForUserParams{ID: holdID, UserID: userID})
+	return s.load(ctx, s.q, userID, holdID)
+}
+
+// load is Get on the pool or on a transaction.
+func (s *Service) load(ctx context.Context, q *store.Queries, userID, holdID int64) (Hold, error) {
+	row, err := q.GetHoldForUser(ctx, store.GetHoldForUserParams{ID: holdID, UserID: userID})
 	if errors.Is(err, store.ErrNoRows) {
 		return Hold{}, domain.ErrNotFound
 	}
@@ -190,7 +202,7 @@ func (s *Service) Get(ctx context.Context, userID, holdID int64) (Hold, error) {
 		return Hold{}, fmt.Errorf("get hold %d: %w", holdID, err)
 	}
 	holds := []Hold{newHold(row.Hold, row.NowAt, row.BookingReference)}
-	if err := s.attachSeats(ctx, holds); err != nil {
+	if err := s.attachSeats(ctx, q, holds); err != nil {
 		return Hold{}, err
 	}
 	return holds[0], nil
@@ -206,8 +218,42 @@ func (s *Service) ListMine(ctx context.Context, userID int64, eventID *int64) ([
 	for _, row := range rows {
 		holds = append(holds, newHold(row.Hold, row.NowAt, row.BookingReference))
 	}
-	if err := s.attachSeats(ctx, holds); err != nil {
+	if err := s.attachSeats(ctx, s.q, holds); err != nil {
 		return nil, err
 	}
 	return holds, nil
+}
+
+// closeUnpaidBookings moves the bookings of the given holds that may become `to` (EXPIRED
+// when the hold ran out, CANCELLED when the fan released it) and returns how many it moved.
+// The caller has the hold rows locked.
+//
+// Each booking is read under its row lock in whatever status it has, and
+// domain.TransitionBooking is asked with that status: a booking the rule will not move
+// (PAID, REFUND_REQUIRED, already closed) is left alone. A booking with a payment still in
+// flight is left alone too; the payment flow closes it when the payment ends.
+func closeUnpaidBookings(ctx context.Context, tx store.DBTX, holdIDs []int64, to domain.BookingStatus) (int64, error) {
+	bookings, err := store.LockBookingsOfHolds(ctx, tx, holdIDs)
+	if err != nil {
+		return 0, fmt.Errorf("lock bookings of holds: %w", err)
+	}
+	byStatus := map[string][]int64{}
+	for _, b := range bookings {
+		if b.LivePayment || domain.TransitionBooking(domain.BookingStatus(b.Status), to) != nil {
+			continue
+		}
+		byStatus[b.Status] = append(byStatus[b.Status], b.ID)
+	}
+	var moved int64
+	for from, ids := range byStatus {
+		n, err := store.SetBookingsStatus(ctx, tx, ids, string(to), from)
+		if err != nil {
+			return 0, fmt.Errorf("move bookings %s -> %s: %w", from, to, err)
+		}
+		if int(n) != len(ids) {
+			return 0, fmt.Errorf("move bookings %s -> %s: wrote %d of %d locked rows", from, to, n, len(ids))
+		}
+		moved += n
+	}
+	return moved, nil
 }

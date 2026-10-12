@@ -19,8 +19,9 @@ import (
 // The first try always takes the single best run, so a fan with nobody else around gets the
 // best seats there are. A lost try means others are after the same seats; if every loser
 // then went for the next best run they would all collide again, one winner per round. So
-// each later try picks at random among a window of the best runs that grows fourfold, which
-// spreads a crowd out in a few rounds while still keeping everyone near the front.
+// each later try works through a window of the best runs that grows fourfold, in an order
+// shuffled per request (up to Policy.BestAvailableWalk runs a try), which spreads a crowd
+// out in a few rounds while still keeping everyone near the front.
 func bestWindow(attempt int) int {
 	if attempt <= 1 {
 		return 1
@@ -72,15 +73,24 @@ func (s *Service) HoldBestAvailable(ctx context.Context, userID, eventID, catego
 		if len(runs) == 0 {
 			break
 		}
-		pick := runs[0]
+		// The first try takes the single best run. A later try means others are after the
+		// same seats: it walks several of the candidate runs, in an order shuffled for this
+		// request alone, before it reads the free seats again. One random pick per try was
+		// not enough: with as many groups as runs, a few groups lost all six picks while a
+		// whole run stood free.
 		if attempt > 1 {
-			pick = runs[rand.IntN(len(runs))]
+			rand.Shuffle(len(runs), func(i, j int) { runs[i], runs[j] = runs[j], runs[i] })
+			runs = runs[:min(len(runs), s.policy.BestAvailableWalk)]
+		} else {
+			runs = runs[:1]
 		}
-		hold, err := s.Hold(ctx, userID, eventID, pick.SeatIDs)
-		if domain.CodeOf(err) == domain.CodeSeatsUnavailable {
-			continue
+		for _, pick := range runs {
+			hold, err := s.Hold(ctx, userID, eventID, pick.SeatIDs)
+			if domain.CodeOf(err) == domain.CodeSeatsUnavailable {
+				continue
+			}
+			return hold, err
 		}
-		return hold, err
 	}
 
 	free := int32(0)

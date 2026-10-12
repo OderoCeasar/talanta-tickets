@@ -32,6 +32,14 @@ func TestClientIP_DefaultConfigIgnoresCFConnectingIP(t *testing.T) {
 	t.Setenv("PUBLIC_BASE_URL", "https://talanta.example.com")
 	t.Setenv("TRUSTED_PROXY_CIDRS", "172.16.0.0/12")
 	t.Setenv("CLIENT_IP_HEADER", "")
+	// Production must also configure M-Pesa in full (fake values).
+	t.Setenv("MPESA_ENV", "sandbox")
+	t.Setenv("MPESA_CONSUMER_KEY", "key")
+	t.Setenv("MPESA_CONSUMER_SECRET", "secret")
+	t.Setenv("MPESA_SHORTCODE", "174379")
+	t.Setenv("MPESA_PASSKEY", "passkey")
+	t.Setenv("MPESA_CALLBACK_URL", "https://talanta.example.com/v1/webhooks/mpesa/callback")
+	t.Setenv("MPESA_CALLBACK_ALLOWED_CIDRS", "196.201.214.0/24")
 
 	// What an attacker sends straight to the origin through Caddy: a forged CF-Connecting-IP
 	// and a forged left-most X-Forwarded-For entry. Caddy appends the address it really saw.

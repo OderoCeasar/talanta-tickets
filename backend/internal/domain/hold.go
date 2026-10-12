@@ -24,16 +24,25 @@ const (
 const MaxBookingFeeBPS = 10_000
 
 // BookingFeeCents is the one place the booking fee is worked out: feeBPS basis points of the
-// subtotal, in whole cents, rounded down. Integer arithmetic only. A hold shows it as an
-// estimate and the booking charges it; both call this function so they cannot disagree.
+// subtotal, rounded to the nearest whole shilling (a multiple of 100 cents), half a shilling
+// rounding up. Integer arithmetic only.
+//
+// Whole shillings because M-Pesa takes nothing smaller: a fee of KES 37.50 would make a
+// booking no payment could ever be started for. With prices in whole shillings the total is
+// then always payable. A hold shows the fee as an estimate and the booking charges it; both
+// call this function so they cannot disagree.
 // A fee rate outside 0..MaxBookingFeeBPS, or a negative subtotal, gives zero.
 func BookingFeeCents(subtotalCents int64, feeBPS int) int64 {
 	if subtotalCents <= 0 || feeBPS <= 0 || feeBPS > MaxBookingFeeBPS {
 		return 0
 	}
-	// Quotient and remainder separately, so the product cannot overflow for any subtotal.
-	whole, rest := subtotalCents/10_000, subtotalCents%10_000
-	return whole*int64(feeBPS) + rest*int64(feeBPS)/10_000
+	// The fee in shillings is subtotal*bps / 1,000,000 (10,000 for the basis points, 100 for
+	// cents to shillings). Quotient and remainder separately, so the product cannot overflow
+	// for any subtotal; half of the divisor is added before dividing to round half up.
+	const perShilling = 1_000_000
+	whole, rest := subtotalCents/perShilling, subtotalCents%perShilling
+	shillings := whole*int64(feeBPS) + (rest*int64(feeBPS)+perShilling/2)/perShilling
+	return shillings * 100
 }
 
 // holdMoves is every legal change of a hold's status. A hold only ever leaves ACTIVE; the

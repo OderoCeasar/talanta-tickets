@@ -13,6 +13,8 @@ One line each. Updated at the end of every milestone.
 - M5 Seat map API: three levels plus the changed-since poll. Level 1 is 4,800 B, level 2 at most 6,557 B, level 3 for the largest block (1,312 seats) 43,617 B raw / 14,541 B gzipped; a poll with one change is 110 B.
 - M5 follow-up, review fixes: requests behind a publish answer 409 `EVENT_BUSY` after 3 to 5 s instead of 500; edits after publish keep the sales window, a future kickoff and prices above zero; cancel of a sold-out venue (57,568 tickets) takes 10.7 to 16.0 s under its own timeouts; the default sales call always succeeds; a block is capped at 3,000 seats; drafts and templates can be deleted. Contract is 74 operations.
 - M6 Holds and locking: hold, release, best available, sweeper, per-user limit, one payment extension, sell-by-hold. 1,000 parallel requests at 10 seats: 10 winners, 990 `SEATS_UNAVAILABLE`, 0 other errors, 0 seats held twice; 10 runs in a row passed. With the seat row lock removed the same test goes red (seats with 2 and 4 winners).
+- M7 Bookings, payments, tickets: booking from a hold with an idempotency key; mock provider with nine outcomes; M-Pesa Daraja provider (tested against a fake server only); callback; reconciliation worker; refunds and organiser alerts; signed tickets issued in the payment transaction. A test passes for every row of the §8.2 table; a double-tapped Pay makes one booking; a late payment for resold seats ends REFUND_REQUIRED with no seat sold twice. Whole suite green; checked by hand on the local api + worker.
+- Money-path review fixes (branch `payments-review-fixes`, migration 000009): a success after a FAILED or TIMEOUT verdict is applied; an STK push whose answer was lost stays live and its callback is matched; callbacks are stored before the webhook answers and retried by a worker job; TIMEOUT payments are re-queried for 7 days; every "paid" callback is confirmed with an STK query before anything is sold or refunded; unsignable tickets end in a refund; fees are whole shillings; the ledger checker sees dropped money. Each has a test on real Postgres that was seen red first.
 - M8 Mobile fan flow (on `main`): ran end to end on an Android 16 emulator against a stand-in server; not yet re-run against the real API.
 - M9 Admin web (on `main`): events, pricing, seat painting, publish, venue layout, templates, sales dashboard. A real full-venue publish through the browser showed the wait state and "Published" after 37.9 s.
 - Admin web, first slice (on `main`): login, Team (invite, resend, revoke), set-password page, account page.
@@ -24,7 +26,6 @@ One line each. Updated at the end of every milestone.
 
 ## Not started
 
-- M7 Bookings, payments, tickets
 - M10 Gate mode
 - M11 Hardening
 
@@ -36,6 +37,14 @@ One line each. Updated at the end of every milestone.
 - An ended hold (expired or released) lists no seats, because there is no hold-seats table.
 - `booking.ExtendForPayment` (used by M7) still waits without limit for an event that is being cancelled or published; M7 should bound it like hold and release.
 - The admin and mobile apps do not yet handle `EVENT_BUSY` (retry, or "this event is being published").
+- M-Pesa is untested against Safaricom: no real OAuth, STK push, STK query or callback has been made, and the callback source ranges in `.env.example` are placeholders. In particular unverified: the list of STK result codes treated as final failures (`domain.IsFinalSTKFailure`, written from Daraja's documentation), that Daraja's callback carries the full paying number (an unknown-ID callback is matched by it; a masked number matches nothing and is left to a person), how long Daraja answers an STK query for an old CheckoutRequestID (TIMEOUT payments are re-queried for 7 days), and whether Daraja resends a callback answered 503.
+- Every "paid" callback now costs one STK query to Daraja before it is applied. If Daraja's query is down, paid callbacks wait in the inbox (retried for 7 days) and reconciliation times payments out with an alert; nothing is sold on the callback body alone.
+- An unknown-ID "paid" callback is matched to a payment only when exactly one ID-less payment has the same phone and amount in the 24 hours before it; otherwise it stays for a person, with an alert filed under a guessed event (alerts must belong to an event).
+- A stored callback is only retried while the worker runs (`payment-callback-drain`); the worker is not in the production image yet (see below).
+- The mobile and admin apps still have the old generated `Payment` type (with `checkout_request_id` and `merchant_request_id`) and do not show `result_desc` on a `PENDING` payment ("we are checking with M-Pesa"); the admin does not yet use `Alert.event_title`, `Alert.resolution`, `Refund.booking_status`, `already_completed` or the `booking_reference` filter. Regenerate the clients (`make openapi-clients`).
+- The ticket QR is static, so a screenshot copies it. The rotating QR of §9.3 is not built.
+- Booking status FAILED is never written: a failed payment leaves the booking payable while its hold lives.
+- Diagrams (the booking and payment state diagram, ERD, sequence diagrams) are deferred on the owner's instruction.
 - No real SMS provider: in production the OTP is not delivered, so fans cannot sign in there until one is added (M7 adds the interface; a provider account is the owner's).
 - Rate limits (including the per-user TOTP cap and the global SMS caps), TOTP replay protection and MFA-token single use are held in memory per process: a restart resets them, and a second API instance would not share them.
 - TOTP setup and enable do not re-ask for the password: a borrowed signed-in session can turn two-step sign-in on with its own authenticator (turning it off does ask).
@@ -60,10 +69,14 @@ One line each. Updated at the end of every milestone.
   - Optional: `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM` to email invitations. Without them the admin copies the link. The server must offer STARTTLS (or use port 465); otherwise mail is not sent unless `SMTP_ALLOW_PLAINTEXT=true`.
   - Before merging `backend/payments-tickets`: `TICKET_SIGNING_KEY` — required; base64 of a 32-byte Ed25519 seed (`openssl rand -base64 32`). Keep a safe copy: tickets signed with a lost key can still be checked with its public half, but no new ones can be issued under that key ID. `TICKET_SIGNING_KEY_ID` defaults to `k1`.
   - Before merging `backend/payments-tickets`: `PUBLIC_BASE_URL=https://talanta.vendorsoko.com` — required, https; used for the ticket link sent by SMS.
+  - To take real payments: `MPESA_ENV`, `MPESA_CONSUMER_KEY`, `MPESA_CONSUMER_SECRET`, `MPESA_SHORTCODE`, `MPESA_PASSKEY`, `MPESA_CALLBACK_URL` (https) and `MPESA_CALLBACK_ALLOWED_CIDRS`. With none of them set the API starts with payments off and answers every attempt to pay "not available"; with only some set it refuses to start. The mock is refused in production.
+  - The worker, once it runs in production, needs the same `TICKET_SIGNING_KEY`, key ID, `PUBLIC_BASE_URL` and `MPESA_*` values as the API.
+  - Optional: `CALLBACK_DRAIN_INTERVAL` (worker, default 5s) — how often stored M-Pesa callbacks are retried.
   - Optional: `BOOKING_FEE_BPS` (default 0) — booking fee in basis points of the subtotal.
   - The full list with defaults is in `backend/.env.example`.
 - Before merging the schema commit, check production has no rows that migration 000002 rejects, or the migrate step fails and leaves the schema marked dirty: `SELECT count(*) FROM users WHERE phone_e164 !~ '^\+[1-9][0-9]{7,14}$';` and `SELECT lower(email), count(*) FROM users WHERE email IS NOT NULL GROUP BY 1 HAVING count(*) > 1;` must both return nothing.
 - The venue layout exists only after the seeder runs. Against production it creates the venue and the template only: no demo events and no demo users.
+- Migration 000009 adds a CHECK on `stands.code` (`^[A-Z0-9]{1,10}$`); it fails if production has a stand code outside it: `SELECT code FROM stands WHERE code !~ '^[A-Z0-9]{1,10}$';` must return nothing.
 - Migrations 000005 and 000008 add NOT NULL columns to `tickets` (and 000005 to `scan_logs`); they fail if production already has rows in those tables.
-- The worker (`cmd/worker`: hold sweeper, payment reconciliation, hourly `auth-cleanup`) is not in the production image or compose file. Until it is, expired holds are still reclaimed at hold time, but unpaid bookings are not expired, payments are not reconciled, and `otp_codes` and `refresh_tokens` grow without being trimmed.
+- The worker (`cmd/worker`: hold sweeper, payment reconciliation, the callback drain, hourly `auth-cleanup`) is not in the production image or compose file. Until it is, expired holds are still reclaimed at hold time, but unpaid bookings are not expired, payments are not reconciled, a callback that could not be applied at once is not retried, and `otp_codes` and `refresh_tokens` grow without being trimmed.
 - New env vars for `/opt/talanta/.env` will be listed here as each milestone adds them.

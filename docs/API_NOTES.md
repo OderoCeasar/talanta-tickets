@@ -4,7 +4,7 @@ Companion to `backend/docs/openapi.yaml`, which is the contract. This file holds
 easier to read as a table: error codes, the compact array layouts, the one-letter codes, and
 where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 
-74 operations on 64 paths. Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
+74 operations on 64 paths (all but the three gate operations are implemented). Lint: `pnpm --package=@redocly/cli@2.62.1 dlx redocly lint backend/docs/openapi.yaml`.
 
 ## Basics
 
@@ -58,7 +58,7 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 | `EVENT_NOT_ON_SALE` | 409 | Event status is not `ON_SALE` | `event_status, sales_open_at, sales_close_at` |
 | `SALES_NOT_OPEN` | 409 | Before `sales_open_at` | same |
 | `SALES_CLOSED` | 409 | After `sales_close_at` | same |
-| `HOLD_EXPIRED` | 409 | The hold ran out | `hold_id, hold_status, expires_at` |
+| `HOLD_EXPIRED` | 409 | The hold ran out; or, when starting a payment, it has under 2 minutes left (`hold_status` is then still `ACTIVE`) | `hold_id, hold_status, expires_at` |
 | `HOLD_NOT_ACTIVE` | 409 | The hold was released or already paid for | same |
 | `HOLD_ALREADY_BOOKED` | 409 | The hold has a booking made with a different idempotency key | `booking_reference, booking_status` |
 | `BOOKING_NOT_PAYABLE` | 409 | Booking is not `PENDING_PAYMENT` | `booking_reference, booking_status` |
@@ -66,7 +66,7 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 | `EVENT_NOT_READY` | 409 | Publish refused | `problems[]` (same as readiness) |
 | `INVALID_STATE_TRANSITION` | 409 | Publish or cancel not allowed from the current status | `current_status` |
 | `EVENT_NOT_EDITABLE` | 409 | Event is past the status where this edit is allowed | `current_status` |
-| `EVENT_BUSY` | 409 | The event is locked by a publish, a cancel or another edit that did not finish within the lock wait; nothing changed, send the request again | null |
+| `EVENT_BUSY` | 409 | The event is locked by a publish, a cancel or another edit that did not finish within the lock wait; nothing changed, send the request again. Also on `POST /bookings`, `POST /payments/mpesa/stk` and `POST /admin/refunds/{id}/complete` | null |
 | `BLOCK_HAS_INVENTORY` | 409 | Block is used by a published event, or an event at the venue is being published right now; cannot delete or regenerate | `event_ids[]` (empty in the second case) |
 | `CATEGORY_IN_USE` | 409 | Category has inventory or bookings | `seats, sold, held` |
 | `CONFIRMATION_REQUIRED` | 409 | Price change after the event has left `DRAFT` needs `confirm: true` | `sold, held` |
@@ -86,7 +86,7 @@ where the API differs from `docs/ARCHITECTURE.md` §10 and §11.
 | `RATE_LIMITED` | 429 | Too many requests | `retry_after_seconds` |
 | `OTP_ATTEMPTS_EXCEEDED` | 429 | 5 wrong phone codes; request a new one | `retry_after_seconds` |
 | `INTERNAL` | 500 | Fault on our side | null |
-| `PAYMENT_PROVIDER_UNAVAILABLE` | 502 | M-Pesa did not accept the STK request | null |
+| `PAYMENT_PROVIDER_UNAVAILABLE` | 502 | M-Pesa did not accept the STK request. The attempt is kept as a `FAILED` payment; the booking stays payable | null |
 
 Wrong password and wrong TOTP code on signed-in routes are 422, not 401, so a client that
 refreshes its token on any 401 does not mistake them for an expired session.
@@ -109,7 +109,7 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `unknown` | The body has a field the endpoint does not accept |
 | `json` | The body is not valid JSON |
 | `content_type` | The body was not sent as `application/json` |
-| `id`, `range`, `cursor` | Path ID, `limit`, or `cursor` is malformed; `range` on `from` of the sales call: a `from` the caller sent is more than 2,000 buckets back |
+| `id`, `range`, `cursor`, `reference` | Path ID, `limit`, `cursor` or booking reference is malformed; `range` on `from` of the sales call: a `from` the caller sent is more than 2,000 buckets back |
 | `datetime` | Not an RFC 3339 time (body field or `from`/`to` query) |
 | `url` | `poster_url` is not an `http(s)` address |
 | `unique` | A list repeats a value (`block_ids`, `row_ids`); also the rule on `ALREADY_EXISTS` |
@@ -117,6 +117,7 @@ missing, is not JSON, or is not a single object) and the name of an unknown fiel
 | `before_kickoff`, `after_open`, `after_from` | Times in the wrong order (`gates_open_at`, `sales_close_at`, `to`) |
 | `future` | `kickoff_at` of an event that has left `DRAFT` would be moved into the past |
 | `max_seats` | `rows` x `seats_per_row` is more than 3,000 seats in one block (on both fields) |
+| `whole_shillings` | `price_cents` of a category is not a multiple of 100: M-Pesa takes no cents |
 | `plan_bounds` | The block's outline would leave `[0, plan_width] × [0, plan_height]` |
 | `layout` | The seat geometry cannot be made (for example a row too long for the arc) |
 | `venue` | On `VENUE_MISMATCH`: the block, row, template or event is at another venue |
@@ -284,6 +285,8 @@ the 16 random bytes in each UUID.
 - **`POST /bookings`** answers 200 instead of 201 when the idempotency key replays.
 - **`X-Mock-Outcome`** header on `POST /payments/mpesa/stk`, dev only.
 - **`Payment.failure_reason`** added: a stable value for the app, next to Daraja's text.
+- **`EVENT_BUSY`** can answer `POST /bookings`, `POST /payments/mpesa/stk` and
+  `POST /admin/refunds/{refundId}/complete` (see "Bookings and payments behaviour").
 - **Scan results** include `WRONG_GATE` (correction 8). Booking statuses include
   `REFUND_REQUIRED` (correction 3).
 - **Manifest carries `keys[]`**, not one `public_key`, because tickets record the key that
@@ -377,8 +380,10 @@ the 16 random bytes in each UUID.
   2,000 buckets.
 - **Sales.** Day buckets are Nairobi days (21:00 UTC to 21:00 UTC). `refund_required_cents`
   is the queued refunds of `REFUND_REQUIRED` bookings, or a booking's total while none is
-  queued. `Payment.failure_reason` is derived from Daraja's result code (1 insufficient
-  funds, 2001 wrong PIN, 1032 cancelled, 1037 timeout) in `domain.PaymentFailureReason`.
+  queued. A refund that is `DONE` no longer counts, and a booking leaves both figures when
+  it becomes `REFUNDED`. `Payment.failure_reason` is derived from Daraja's result code (1
+  insufficient funds, 2001 wrong PIN, 1032 cancelled, 1037 and 1019 timeout; a `FAILED`
+  payment with code 0 is `wrong_amount`) in `domain.PaymentFailureReason`.
 
 ## Seat map behaviour (M5)
 
@@ -478,3 +483,189 @@ the 16 random bytes in each UUID.
   description says what the page shows; `GateManifest.keys[].key_id` has the pattern
   `^k[1-9][0-9]{0,4}$`; the `uploadScans` example token is the worked example of
   `docs/TICKET_FORMAT.md`; `Ticket.qr_token` says it is 160 characters.
+
+## Bookings and payments behaviour (M7)
+
+- **Booking.** `POST /bookings` needs `Idempotency-Key` (8 to 128 of `A-Z a-z 0-9 - _`);
+  missing or malformed is 400 `IDEMPOTENCY_KEY_REQUIRED` with `details.fields` naming
+  `Idempotency-Key`. The same key again answers 200 with the same booking, also after the
+  hold has ended. Another key for a hold that has a live booking is 409
+  `HOLD_ALREADY_BOOKED`; the same key for another hold is 422 `IDEMPOTENCY_KEY_REUSED`. Two
+  requests arriving together for one hold make one booking, whatever keys they carry.
+- **Money.** `items[].unit_price_cents` is copied from the seat's category when the booking
+  is made and never changes. `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal
+  **rounded to the nearest whole shilling** (a multiple of 100 cents; half a shilling rounds
+  up): the same sum the hold showed. So any fee rate gives a payable booking
+  (`BOOKING_FEE_BPS=250` on a KES 1,500 seat is KES 38.00, not 37.50). `total_cents` is what
+  M-Pesa is asked for. M-Pesa takes whole shillings: a booking whose total is not a multiple
+  of 100 cents is refused with 409 `BOOKING_NOT_PAYABLE`, never rounded. Neither a fee
+  nor a price can cause that any more: a category price with cents in it is refused when it
+  is set (rule `whole_shillings`). The refusal stays as the last guard.
+- **`hold_expires_at`** is set while the booking is `PENDING_PAYMENT` and null afterwards.
+  `latest_payment` is the newest attempt, of any status. `tickets` is empty until `PAID`.
+- **Owner only.** `GET /bookings/{reference}` and `GET /payments/{paymentId}` find a row
+  only for the fan it belongs to; anyone else's is the same 404 as one that does not exist.
+  A reference of the wrong shape is 400 (field `reference`). Staff roles get 403.
+- **`GET /me/bookings`.** Newest first, every status unless `status` is sent. Answers that
+  can carry ticket QR texts are sent `Cache-Control: private, no-store`.
+- **Starting a payment.** `phone` may be `07…`, `01…`, `2547…` or E.164, Kenyan (`+254`)
+  only; anything else is 400 on `phone`. The first payment pushes the hold's expiry out to
+  6 minutes, once. Any payment needs 2 minutes left on the hold; with less it is 409
+  `HOLD_EXPIRED` whose `details.hold_status` is `ACTIVE`. A booking with a live payment
+  answers 409 `PAYMENT_IN_PROGRESS` naming it. 30 bookings-plus-payments a minute per user.
+  What M-Pesa does with the request has three answers:
+  - it accepts: **202**, payment `PENDING`;
+  - the request provably did not reach it, or it refused (no connection, a 4xx, Daraja's own
+    error): **502** `PAYMENT_PROVIDER_UNAVAILABLE`, the attempt is kept as a `FAILED`
+    payment (`failure_reason: other`) and the fan can retry at once;
+  - we cannot tell (it timed out after it was sent, the answer was unreadable): **202**,
+    payment `PENDING`, and `result_desc` is "We are checking with M-Pesa whether the
+    request went through. Do not pay again yet." The fan may or may not get a prompt. A
+    second payment is refused with `PAYMENT_IN_PROGRESS` until this one resolves (by its
+    callback, or `TIMEOUT` after 5 minutes), so the fan cannot pay twice. Clients should
+    show that text when `status` is `PENDING` and `result_desc` is not null.
+- **`Payment` no longer carries `checkout_request_id` or `merchant_request_id`.** They were
+  removed from the schema: the CheckoutRequestID is the key callbacks are matched by, and
+  no client used it for anything.
+- **How a payment ends** (the same table is in the contract under the STK operation):
+
+  | What happened | `Payment.status` | `failure_reason` | `booking_status` |
+  |---|---|---|---|
+  | Paid, seats sold, tickets issued | `SUCCESS` | null | `PAID` |
+  | Insufficient funds, wrong PIN, cancelled, prompt timed out | `FAILED` | that reason | `PENDING_PAYMENT` while the hold lives, else `EXPIRED` |
+  | No answer from M-Pesa within 5 minutes | `TIMEOUT` | `timeout` | as above |
+  | **Paid the wrong amount** | **`FAILED`** | **`wrong_amount`** | **`REFUND_REQUIRED`** |
+  | Paid, but the seats were gone | `SUCCESS` | null | `REFUND_REQUIRED` |
+  | Paid twice (a second payment for a `PAID` booking) | `SUCCESS` | null | `PAID`: tickets kept, that payment refunded |
+
+  So `status: SUCCESS` alone does not mean tickets: read `booking_status`. A `FAILED`
+  payment with `failure_reason: wrong_amount` has `result_code` 0: M-Pesa itself reported a
+  different amount, and that amount is in the refund queue. (Against real Daraja this cannot
+  happen: its query names no amount and a prompt cannot be paid in part or in excess. The
+  mock's `wrong_amount` outcome is the provider reporting a different amount.) One more row:
+  **paid, but the tickets could not be issued** is `SUCCESS` / `REFUND_REQUIRED`, refunded.
+- **Polling.** Stop when `status` is `SUCCESS`, `FAILED` or `TIMEOUT`. **Neither `FAILED`
+  nor `TIMEOUT` is always the last word**: if M-Pesa later confirms the money arrived, the
+  payment becomes `SUCCESS` (seats sold if the hold still has them all, otherwise a refund).
+  The fan may start another payment meanwhile; `GET /bookings/{reference}` always shows the
+  truth, and is what the app resumes from after being closed.
+- **Late money.** When a payment succeeds after its hold ran out: if nobody took a seat of
+  the hold and no sweeper closed it, the seats are sold and the booking is `PAID` as if it
+  had been on time. If any seat was taken by someone else, or the hold was closed, nothing
+  is sold: payment `SUCCESS`, booking `REFUND_REQUIRED`, a refund for the amount paid, an
+  organiser alert. The same when the event was cancelled meanwhile. No seat is ever sold
+  twice to make the ledger come out right.
+- **The callback, `POST /v1/webhooks/mpesa/callback`.** 200
+  `{"ResultCode":0,"ResultDesc":"Accepted"}` for any body from any address; no token is read.
+  A callback is taken up only when it comes from `MPESA_CALLBACK_ALLOWED_CIDRS` and is
+  Daraja's envelope (at most 64 KiB; a `ResultCode` that does not fit 32 bits is not one).
+  Then:
+  - **It is written down before the 200 is sent** (`payment_callbacks`, the inbox). The work
+    runs after the answer and, if it cannot finish (the event is busy, Daraja cannot be
+    asked, the API restarts), the worker's drain job (`CALLBACK_DRAIN_INTERVAL`, 5 s) tries
+    again with a growing wait, for 7 days, then raises a `PAYMENT_UNRESOLVED` alert. If the
+    callback cannot be written down the answer is **503**, not "Accepted".
+  - **The body is a hint, never the authority.** A "paid" is confirmed with Daraja's
+    authenticated STK query before anything is sold or refunded; if the query cannot be
+    made the payment stays as it is and the callback waits. A failure is taken from the body
+    when its code is a documented final failure (1, 1001, 1019, 1025, 1032, 1037, 2001,
+    9999); any other non-zero code is checked with Daraja and, if Daraja has no final
+    answer, left to reconciliation.
+  - **`Amount` is never money.** A confirmed payment is paid in full at the amount we
+    requested. A body naming another amount raises an `AMOUNT_MISMATCH` alert ("no refund
+    was queued for the callback's figure") and changes nothing else. A forged
+    `Amount: 900000.00` no longer queues a refund of KES 900,000.
+  - **A success for a `FAILED` or `TIMEOUT` payment is applied** (money received after
+    all). A failure for a `SUCCESS` payment is ignored.
+  - **A "paid" for an ID no payment has** is stored (`unmatched_callbacks`), raises a
+    `PAYMENT_UNRESOLVED` alert naming the receipt, amount and phone, and is matched to a
+    payment that has no M-Pesa ID by phone + amount + time (started within 24 hours before
+    it arrived, exactly one candidate). The match alone decides nothing: the ID is written
+    on the payment only once Daraja confirms that ID was paid; then the normal path runs.
+    A failure for an unknown ID is logged and dropped.
+  - With `PAYMENT_PROVIDER=none` every callback is ignored (200, nothing stored).
+  The body is kept in the inbox, and in `payments.raw_callback` once its result has been
+  applied. `Amount` is read as a decimal number of shillings, never through a float.
+- **Reconciliation** (worker, every `RECONCILE_INTERVAL`, 30 s), in this order:
+  1. Live payments with **no M-Pesa ID** (no call to Daraja is needed, so a slow Daraja
+     cannot hold them up). Provably never sent: `TIMEOUT` at 60 seconds, no alert. Possibly
+     sent: left until 5 minutes in case the callback comes, then `TIMEOUT` **with** a
+     `PAYMENT_UNRESOLVED` alert naming the phone and amount to look for.
+  2. Live payments with an ID, 60 seconds old: asked about with STK query and settled as a
+     callback would have settled them. Only a code Daraja documents as a final failure
+     closes a payment; "still under processing" (4999) and unknown codes are "ask again".
+     After 5 minutes with no final answer: `TIMEOUT` and a `PAYMENT_UNRESOLVED` alert.
+  3. **`TIMEOUT` payments with an ID are asked about again**: every 5 minutes for 24 hours,
+     then daily until they are 7 days old. Daraja's last word reaches the same finishing
+     function with no callback at all.
+  A run stops starting Daraja calls after a minute; the rest waits for the next run.
+- **Release and the sweeper.** `DELETE /holds/{id}` is 409 `PAYMENT_IN_PROGRESS` while a
+  payment is live. The sweeper frees a lapsed hold's seats but leaves a booking with a live
+  payment `PENDING_PAYMENT`; when that payment fails the booking becomes `EXPIRED`, and if
+  it succeeds it is refunded.
+- **Alerts** (`GET /admin/alerts`, newest first). Each carries `event_title` as well as
+  `event_id`. `REFUND_REQUIRED`: a payment bought nothing, or was a second payment for a paid
+  booking. `AMOUNT_MISMATCH`: M-Pesa reported a wrong amount (refund queued), or a callback
+  named an amount other than the one requested (no refund queued; check the statement).
+  `PAYMENT_UNRESOLVED`: we do not know what became of some money (no answer in 5 minutes; a
+  request that may have reached M-Pesa under an ID we never learned; a payment M-Pesa
+  reports that matches no booking; a callback that could not be confirmed in 7 days).
+  `acknowledged=false` gives the open ones; acknowledging twice keeps the first time.
+  **The system closes an alert itself when what it asks for is done**, in the same
+  transaction, and says so in `resolution` (null for an open alert and for one a person
+  acknowledged):
+  - a `PAYMENT_UNRESOLVED` alert, when its payment later ends in tickets ("Resolved
+    automatically: the payment succeeded and the tickets were issued.") or in a queued
+    refund ("…a refund is queued for it.");
+  - a `REFUND_REQUIRED` or `AMOUNT_MISMATCH` alert, when the refund of its payment is marked
+    as paid back ("Resolved automatically: the refund was marked as paid back.").
+  An alert a person already acknowledged is never rewritten, and an alert with no payment
+  behind it (an unmatched callback that stays unmatched) is only ever closed by a person.
+  An unmatched callback's alert is filed under the event its phone last paid for, or the
+  newest event, because an alert must belong to an event; its message says it may not be
+  that event's.
+- **Refunds** (`GET /admin/refunds`, oldest first; `status`, `event_id` and
+  `booking_reference` filter it). One per payment that has to go back, for the amount M-Pesa
+  confirmed; `phone` is the number that paid; `booking_status` is the booking's status now.
+  Event cancel queues one per successful payment the same way.
+  `POST /admin/refunds/{id}/complete` records that it was paid by hand: the refund is
+  `DONE`; a `REFUND_REQUIRED` booking with no refund left pending becomes `REFUNDED` and any
+  ticket it still has is voided; a `PAID` booking (duplicate payment) stays `PAID` with its
+  tickets. It answers 200 every time; `already_completed` is `false` on the call that did
+  the work and `true` on a repeat (the field is only in this operation's answer). **Seats
+  are not touched**: a `REFUND_REQUIRED` booking of a live event owns no sold seat, and a
+  cancelled event's sold seats stay `SOLD` (the event is off). There is no way to refund one
+  paid booking of a live event and put its seats back on sale.
+- **Sales summary.** `refund_required_cents` is every refund of the event still pending,
+  whatever its booking's status (a second payment on a booking that stays `PAID` counts),
+  plus the total of a `REFUND_REQUIRED` booking with no refund row yet.
+- **Mock payments (development and test only).** `X-Mock-Outcome` on the STK call:
+  `success`, `insufficient_funds`, `wrong_pin`, `user_cancel`, `timeout`, `no_callback`
+  (the worker's reconciliation finds the success after a minute), `duplicate_callback`,
+  `late_callback` (success after `MOCK_LATE_CALLBACK_DELAY`, 7 minutes: by then the
+  payment is `TIMEOUT` and the hold has expired), `wrong_amount`. Without the header the
+  phone numbers `+254700000101` … `+254700000108` play the same list after `success`; any
+  other number succeeds. The callback arrives after `MOCK_CALLBACK_DELAY` (2 s). In
+  production the header is 403 `MOCK_NOT_ALLOWED` before anything else is read, and the
+  mock provider cannot be configured.
+- **Contract changes made with the money-path review** (after the M7 work):
+  - `Payment`: **`checkout_request_id` and `merchant_request_id` removed** (generated
+    TypeScript type changes in mobile and admin).
+  - `Alert`: `event_title` (string) and `resolution` (string or null) added, both required.
+  - `Refund`: `booking_status` added (required); `already_completed` (boolean, optional,
+    only in the answer of `completeRefund`).
+  - `listRefunds`: optional query parameter `booking_reference`.
+  - `mpesaCallback`: a **503** answer (`MpesaCallbackNotStored`) when a real callback could
+    not be stored.
+  - `startMpesaStkPush`: no schema change; 202 now also covers "may have reached M-Pesa"
+    (`result_desc` set on a `PENDING` payment), 502 means "provably not sent or refused".
+  - Descriptions only: `fee_cents` (whole shillings), `AlertKind`, `Payment.failure_reason`,
+    `Payment.result_desc`, `Refund.amount_cents`, category prices, the outcome table.
+- **Contract changes made with the M7 work** (descriptions unless said): `createBooking`,
+  `startMpesaStkPush` gained `EVENT_BUSY` in their 409 list and `completeRefund` gained a
+  409 answer (`EVENT_BUSY`), the one change that adds a response to an operation;
+  the STK operation documents the outcome table, the 2-minute rule, phone forms and the
+  magic numbers; `Payment.status`, `Payment.failure_reason`, `PaymentStatus`,
+  `PaymentFailureReason`, `BookingStatus`, `MockOutcome`, `AlertKind`, `HoldStateDetails`,
+  `getPayment`, `mpesaCallback` and `completeRefund` say what the code does. No schema
+  gained, lost or renamed a field in that work.

@@ -57,7 +57,7 @@ touch only their own folders and start as soon as the OpenAPI contract exists.
 | M8 | Mobile fan flow | `mobile-engineer` (starts after M3's contract) | `code-reviewer` |
 | M9 | Admin web (login, invite staff and set-password pages first, then events, layout, pricing, sales) | `admin-web-engineer` (starts after M3's contract) | `code-reviewer` |
 | M10 | Gate mode: manifest, scan upload (backend), offline scanning (mobile) | `ticketing-gate-engineer`, `mobile-engineer` | `code-reviewer` |
-| M11 | Load test, end-to-end journeys, README, diagrams | `qa-engineer`, lead | `code-reviewer` |
+| M11 | Load test, end-to-end journeys, README (diagrams are deferred on the owner's instruction, 2026-10-12) | `qa-engineer`, lead | `code-reviewer` |
 
 Each milestone ends with: its "done when" lines run by the lead, a review, blocking findings
 fixed, a line in `docs/STATUS.md`, and a commit.
@@ -77,3 +77,11 @@ None block the work. Each was decided and recorded in `docs/DECISIONS.md`:
 3. What the booking fee is (zero by default, set by `BOOKING_FEE_BPS`).
 4. Which linter `make lint` runs (`gofmt` and `go vet`; staticcheck does not support Go 1.27 yet).
 5. Which tool runs the load test (decided in M11 from what is installed).
+
+## Added by the owner on 2026-10-12 (to do after payments lands)
+
+1. **App icon** in the brand colours, including the Android adaptive icon.
+2. **Fonts for the app and the admin site:** Inter for body and UI text, Plus Jakarta Sans for
+   headings. Bundled with each app, not loaded from a CDN.
+
+Google sign-in was asked for and then withdrawn the same day: fans keep phone OTP login.

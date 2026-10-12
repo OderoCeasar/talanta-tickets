@@ -50,6 +50,9 @@ func TestLoadAPI(t *testing.T) {
 
 func TestLoadWorker(t *testing.T) {
 	t.Setenv("DATABASE_URL", "postgres://x")
+	// The worker now loads the payment provider too, which production must configure in
+	// full; these cases are about the intervals.
+	t.Setenv("APP_ENV", "development")
 
 	t.Run("intervals", func(t *testing.T) {
 		t.Setenv("SWEEP_INTERVAL", "5s")
