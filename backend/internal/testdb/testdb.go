@@ -27,6 +27,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/modules/postgres"
+	"github.com/testcontainers/testcontainers-go/wait"
 )
 
 // Image is the same Postgres the compose file and production run.
@@ -64,7 +65,14 @@ func Start(ctx context.Context) (*DB, error) {
 		postgres.WithDatabase("talanta"),
 		postgres.WithUsername("talanta"),
 		postgres.WithPassword("talanta"),
-		postgres.BasicWaitStrategies(),
+		// The same two checks as postgres.BasicWaitStrategies, with a longer deadline. The
+		// default is 60 s, and when every test package starts its own Postgres at once on a
+		// busy machine the first-run initdb can take longer than that: the whole suite then
+		// fails on container start-up without a single assertion having run.
+		testcontainers.WithWaitStrategy(wait.ForAll(
+			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
+			wait.ForListeningPort("5432/tcp"),
+		).WithDeadline(150*time.Second)),
 	)
 	if err != nil {
 		if container != nil {
