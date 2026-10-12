@@ -44,6 +44,14 @@
           "resizeMode": "contain",
           "backgroundColor": "#064E3B"
         }
+      ],
+      "expo-sqlite",
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Talanta Tickets uses the camera to scan ticket QR codes at the gate.",
+          "recordAudioAndroid": false
+        }
       ]
     ],
     "experiments": {

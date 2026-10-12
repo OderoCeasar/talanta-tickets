@@ -51,7 +51,8 @@ export default function RootLayout() {
               <Stack.Screen name="index" options={{ headerShown: false }} />
               <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
               <Stack.Screen name="sign-in" options={{ title: "Sign in", presentation: "modal" }} />
-              <Stack.Screen name="gate" options={{ title: "Gate mode", headerBackVisible: false }} />
+              {/* Gate mode has its own stack (and its own headers) in app/gate/_layout.tsx. */}
+              <Stack.Screen name="gate" options={{ headerShown: false, gestureEnabled: false }} />
               <Stack.Screen name="event/[id]/index" options={{ title: "Event" }} />
               <Stack.Screen name="event/[id]/map" options={{ title: "Choose a stand" }} />
               <Stack.Screen name="event/[id]/stand/[standId]" options={{ title: "Choose a block" }} />

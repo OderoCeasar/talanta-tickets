@@ -797,3 +797,33 @@ One line each: what was chosen and why. Newest at the bottom.
   organiser site's heading font (headings, the brand name, the dashboard's big figures),
   bundled the same way and for the same reason: one 27 kB Latin variable woff2, no outside
   request.
+- **`@noble/curves` 2.4.0 (mobile).** Checks a ticket's Ed25519 signature on the gate phone
+  (`mobile/src/features/gate/token.ts`). Pure JavaScript, audited, no native module, so it
+  runs in Hermes and Expo Go; it brings `@noble/hashes` 2.4.0 for SHA-512, so nothing has
+  to be wired by hand. Chosen over `@noble/ed25519` (slower, and needs a hash supplied) and
+  over a native crypto module (would need a custom build). Verification uses the RFC 8032
+  rules (`zip215: false`), the closest match to Go's `crypto/ed25519` on the server.
+- **`expo-sqlite` 57.0.4 (mobile).** The gate phone's ticket list (about 60,000 rows), keys
+  and scan queue. A scan reads one ticket by ID and changes one row; AsyncStorage would
+  parse and rewrite one JSON blob each time. One write per manifest and per scan, WAL with
+  `synchronous=FULL`. The SQL sits behind a three-method interface
+  (`mobile/src/features/gate/sqlStore.ts`) and is tested on Node's built-in SQLite.
+- **`expo-camera` 57.0.6 (mobile).** `CameraView` reads the ticket QR in gate mode (QR only).
+  Its config plugin adds the camera permission and its wording; audio recording is off.
+- **`expo-haptics` 57.0.3 (mobile).** Two different vibration patterns for "let in" and
+  "refused", so a steward knows the result without reading the screen.
+- **`expo-keep-awake` 57.0.2 (mobile).** Keeps the screen on while the scanner is open.
+- **`expo-network` 57.0.2 (mobile).** Tells gate mode when the connection returns, so
+  waiting scans upload at once instead of at the next 20-second retry.
+- **Gate mode keeps its data in SQLite, outside TanStack Query and zustand.** The manifest
+  and the scan queue are the phone's own durable records, not a cache of server state: they
+  must be complete after a crash with no network. Only the list of gate events is a query.
+- **A text that fails before a ticket ID can be read is kept in the phone's history without
+  its text and is never uploaded** (`docs/TICKET_FORMAT.md` 4.3 allows a local count). Any
+  QR code can be shown to a gate phone; its content is not ours to store.
+- **Test phone numbers with a fixed sign-in code (`OTP_TEST_CODES`), allowed in production.**
+  The owner asked for a way to sign in to the app before SMS is connected. `CLAUDE.md` forbids
+  returning the code in the API answer in production, and this does not: the code is set by the
+  operator in the server's environment, is never in an answer or a log, and only the listed
+  numbers get it. It is a standing way in for those numbers, so obvious codes are refused and
+  the API warns at startup while it is set.

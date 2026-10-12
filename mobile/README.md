@@ -3,8 +3,8 @@
 The Expo app fans use to pick seats, pay with M-Pesa and show their tickets. Expo SDK 57,
 React Native 0.86, expo-router, TypeScript strict.
 
-Gate staff sign in to the same app; scanning mode is not built yet (milestone M10), so a
-`GATE_STAFF` user sees a "gate mode is coming" screen instead of the fan tabs.
+Gate staff sign in to the same app: a `GATE_STAFF` or `ADMIN` user lands in gate mode
+instead of the fan tabs (see "Gate mode" below).
 
 ## Run it
 
@@ -99,17 +99,65 @@ app/                        expo-router screens
   checkout/[holdId].tsx     summary, countdown, pay, payment status
   booking/[reference].tsx   confirmation with the tickets
   ticket/[id].tsx           one ticket with its QR
-  gate.tsx                  placeholder for gate staff
+  gate/index.tsx            gate mode: choose event and gate, ticket list, sync, end session
+  gate/scan.tsx             the scanner: camera, typed code, full-screen result
+  gate/history.tsx          this phone's scans, what is uploaded, what the server changed
 src/api/                    the shared typed client, tokens, TanStack Query hooks, small local storage
 src/features/seatmap/       geometry + grid index, draw batches, SVG and Skia canvases, gestures, polling
 src/features/booking/       resume banner
 src/features/tickets/       QR drawing, ticket row
+src/features/gate/          ticket check (token, verdict), manifest, scanner, upload queue: pure;
+                            sqlStore (SQLite), device (API calls), GateProvider (screen state)
 src/lib/                    phone, money, time, countdown, checkout amounts, error wording
 src/fonts.ts                the font family names (one per weight); src/fontAssets.ts the files
 assets/                     icon, adaptive icon layers, splash mark, favicon; assets/src the SVGs
 src/store/bookingFlow.ts    zustand: the seat selection and the hold expiry, nothing else
 src/ui/                     buttons, cards, banners, states, icons
 ```
+
+## Gate mode
+
+For stewards (`GATE_STAFF`) and admins. The rules it follows are `docs/TICKET_FORMAT.md`
+section 4 and "Gate mode" in `docs/API_NOTES.md`.
+
+**Using it**
+
+1. Sign in with the steward's number. The app opens in gate mode.
+2. Choose the event, then the gate this phone is at (`N-LOWER`, `W-UPPER`, ...), then
+   **Download tickets and start**. Do this with a connection: a full stadium is about
+   1.3 MB. The screen then shows how many tickets are on the phone and when the list was
+   last updated (Nairobi time), and warns if the phone's clock is more than two minutes off
+   the server's.
+3. **Start scanning.** Point the camera at a ticket's QR code. The whole screen turns green
+   (let them in) or red with the reason: already used, wrong gate (and which gate the ticket
+   is for), wrong event, not a valid ticket. The phone vibrates differently for each. The
+   result clears by itself, or on a tap. **Type a code** is for a broken camera.
+4. Scanning needs no network. Every scan is written to the phone before the result is
+   shown, and uploads by itself when the connection returns, when the app comes back to the
+   front, and every 20 seconds while gate mode is open. "N waiting to upload" is on the
+   home screen and under the camera. **Sync now** uploads and refreshes the ticket list.
+5. **History** lists this phone's scans for the event, which are uploaded, and under
+   "Changed after sync" the ones the server decided differently (for example another phone
+   scanned the ticket first).
+6. **End session** before putting the phone away: it uploads what is waiting and asks the
+   server once more about the scans it had accepted, which is the only way to learn that
+   one of them was later given to another phone's earlier scan.
+
+**What to know**
+
+- The ticket list and the scans are in a SQLite file (`talanta-gate.db`), not AsyncStorage:
+  a scan looks one ticket up by ID and changes one row out of about 60,000. The file
+  belongs to the phone, not the account: scans that have not uploaded survive a sign-out
+  and upload when a gate account is signed in again.
+- The check is done on the phone with the public keys from the manifest
+  (`@noble/curves`, Ed25519). The phone holds no secret.
+- A scan leaves the upload queue only when a `200` lists its `client_scan_id`.
+- Uploading runs while the app is open. It is not an operating-system background task: a
+  phone left in a pocket with the app closed uploads when the app is next opened.
+- Two phones that are both offline cannot see each other's scans; a ticket shown to both is
+  let in twice and the server marks the later one afterwards. Tickets are bound to one gate
+  group, so both phones have to be at the same stand and tier.
+- An emulator's camera shows a made-up room, not a ticket; use **Type a code** there.
 
 Rules the code follows:
 

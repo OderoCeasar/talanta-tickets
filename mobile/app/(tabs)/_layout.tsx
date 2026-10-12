@@ -1,6 +1,7 @@
 import { Redirect, Tabs } from "expo-router";
 import type { ColorValue } from "react-native";
 
+import { isGateRole } from "../../src/features/gate/roles";
 import { useSession } from "../../src/session";
 import { alpha, headerOptions, palette, type } from "../../src/theme";
 import { Icon, type IconName } from "../../src/ui";
@@ -13,7 +14,7 @@ const tabIcon = (name: IconName) =>
 
 export default function TabsLayout() {
   const { status, user } = useSession();
-  if (status === "signedIn" && user?.role === "GATE_STAFF") return <Redirect href="/gate" />;
+  if (status === "signedIn" && isGateRole(user?.role)) return <Redirect href="/gate" />;
 
   return (
     <Tabs
