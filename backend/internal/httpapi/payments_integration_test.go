@@ -134,7 +134,7 @@ func TestPayment_CallbackTwice_TheSecondIsANoOp(t *testing.T) {
 	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM refunds WHERE booking_id = $1`, c.BookingID))
 
 	// The same thing through the real webhook, a third and fourth time, in Daraja's envelope.
-	body := stkCallback(p["checkout_request_id"].(string), 0, "The service request is processed successfully.",
+	body := stkCallback(checkoutIDOf(t, pid), 0, "The service request is processed successfully.",
 		paidItems(json.Number(fmt.Sprintf("%d.00", c.Total/100)), first["mpesa_receipt"].(string))...)
 	e.webhook(body)
 	e.webhook(body)
@@ -277,15 +277,16 @@ func TestPayment_WrongAmount_FailedAndRefundQueued(t *testing.T) {
 	assert.Zero(t, ledger(t, ev.ID).Sold)
 }
 
-// §8.2 row 5. Forged callbacks. The body is never trusted alone: every one of these gets
-// the fixed 200 answer and sells nothing.
+// §8.2 row 5. Forged callbacks. The body is never trusted alone: it is only a hint to ask the
+// provider. Every one of these gets the fixed 200 answer and sells nothing, because the
+// provider does not say the payment was paid.
 func TestWebhook_ForgedCallbacksChangeNothing(t *testing.T) {
 	const safaricom = "196.201.214.200:44321"
 	e := newEnv(t, withCallbackAllowlist("196.201.214.0/24", "196.201.213.114/32"))
 	ev, north, south := e.ticketEvent()
 	c := e.checkout(ev.ID, north[10:12]...)
 	p := e.pay(c, mock.NoCallback)
-	pid, checkoutID := id64(p["id"]), p["checkout_request_id"].(string)
+	pid, checkoutID := id64(p["id"]), checkoutIDOf(t, id64(p["id"]))
 	shillings := json.Number(fmt.Sprintf("%d.00", c.Total/100))
 	unchanged := func(what string) {
 		t.Helper()
@@ -294,21 +295,36 @@ func TestWebhook_ForgedCallbacksChangeNothing(t *testing.T) {
 		assert.Equal(t, map[string]int{"HELD": 2}, seatStatuses(t, c.Seats), what)
 		assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM tickets WHERE booking_id = $1`, c.BookingID), what)
 		assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM refunds WHERE booking_id = $1`, c.BookingID), what)
+		assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payments WHERE id = $1 AND (mpesa_receipt IS NOT NULL OR raw_callback IS NOT NULL)`, pid), what)
 	}
 
-	// 1. An ID we never issued, from an allowed address.
+	// 1. A "paid" for an ID we never issued, from an allowed address. No payment changes. It
+	// is stored and flagged for a person (it could be a push whose answer we lost), and
+	// nothing is queued for refund on its say-so.
+	// The ID is a fixed one: start from a table that has never seen it, whatever ran before.
+	exec(t, `DELETE FROM unmatched_callbacks WHERE checkout_request_id IN ('ws_CO_never_issued_by_us', 'ws_CO_also_never_issued')`)
 	e.remoteAddr = safaricom
 	before := queryInt(t, `SELECT count(*) FROM payments`)
-	e.webhook(stkCallback("ws_CO_never_issued_by_us", 0, "ok", paidItems(shillings, newReceipt(t))...))
+	receipt := newReceipt(t)
+	e.webhook(stkCallback("ws_CO_never_issued_by_us", 0, "ok", paidItems(shillings, receipt)...))
 	assert.Equal(t, before, queryInt(t, `SELECT count(*) FROM payments`))
 	assert.Contains(t, e.logs.String(), "unknown CheckoutRequestID")
 	unchanged("unknown CheckoutRequestID")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM unmatched_callbacks WHERE checkout_request_id = 'ws_CO_never_issued_by_us' AND mpesa_receipt = $1 AND matched_payment_id IS NULL`, receipt))
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM organiser_alerts a JOIN unmatched_callbacks u ON u.alert_id = a.id
+		WHERE u.checkout_request_id = 'ws_CO_never_issued_by_us' AND a.kind = 'PAYMENT_UNRESOLVED' AND a.message LIKE '%' || $1 || '%'`, receipt),
+		"a person is told, with the receipt")
+	// A FAILURE for an unknown ID is not even stored.
+	e.webhook(stkCallback("ws_CO_also_never_issued", 1032, "Request cancelled by user."))
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM unmatched_callbacks WHERE checkout_request_id = 'ws_CO_also_never_issued'`))
 
-	// 2. The right ID and the right amount, from an address that is not Safaricom's.
+	// 2. The right ID and the right amount, from an address that is not Safaricom's: not
+	// even stored.
 	e.remoteAddr = "203.0.113.50:5555"
 	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(shillings, newReceipt(t))...))
 	assert.Contains(t, e.logs.String(), "source address is not in MPESA_CALLBACK_ALLOWED_CIDRS")
 	unchanged("disallowed source address")
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1`, pid))
 	assert.Nil(t, e.getPayment(c.Token, pid)["mpesa_receipt"])
 
 	// 2b. A forged X-Forwarded-For does not get it onto the list: no proxy is trusted.
@@ -317,66 +333,82 @@ func TestWebhook_ForgedCallbacksChangeNothing(t *testing.T) {
 	require.Equal(t, http.StatusOK, e.doReq(req).Code)
 	e.payments.Wait()
 	unchanged("forged X-Forwarded-For")
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1`, pid))
 
-	// 3. A replay of an old, real success for a DIFFERENT booking, pointed at this payment:
-	// the receipt already settled another payment.
+	// 3. The right ID, the right amount, the right address, and the provider does not say
+	// the payment was paid. THE BODY IS NOT BELIEVED: nothing is sold. This is the case that
+	// used to sell seats on the word of an unauthenticated request.
+	e.remoteAddr = safaricom
+	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(shillings, newReceipt(t))...))
+	unchanged("a success the provider does not confirm")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1 AND result_code = 0 AND processed_at IS NULL`, pid),
+		"it is kept, and asked about again later")
+	// The same with a receipt that already settled another payment, and that body verbatim.
 	e.remoteAddr = "198.51.100.7:40000"
 	old, oldPayment := e.paid(ev.ID, south[10:12]...)
 	oldReceipt := e.getPayment(old.Token, oldPayment)["mpesa_receipt"].(string)
 	var oldRaw string
 	require.NoError(t, db.Pool.QueryRow(context.Background(), `SELECT raw_callback::text FROM payments WHERE id = $1`, oldPayment).Scan(&oldRaw))
-	require.Contains(t, oldRaw, oldReceipt, "the raw callback is stored")
+	require.Contains(t, oldRaw, oldReceipt, "the raw callback of an applied result is stored on the payment")
 	e.remoteAddr = safaricom
 	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(shillings, oldReceipt)...))
 	unchanged("replayed receipt")
-	assert.Contains(t, e.logs.String(), "the M-Pesa receipt already belongs to another payment")
-	// ...and the old body replayed verbatim finds its own payment already final.
 	e.webhook(oldRaw, contracttest.LenientRequest())
 	assert.Equal(t, 2, queryInt(t, `SELECT count(*) FROM tickets WHERE booking_id = $1`, old.BookingID))
 	unchanged("old callback replayed verbatim")
 
-	// 4. "Paid" with no amount at all cannot be checked against anything. It is not applied;
-	// the provider is asked, and the provider says the fan has not paid yet.
+	// 4. "Paid" with no amount, an unreadable one, a wildly wrong one, no metadata at all.
 	e.webhook(stkCallback(checkoutID, 0, "ok", obj{"Name": "MpesaReceiptNumber", "Value": newReceipt(t)}))
 	unchanged("success with no amount")
 	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems("a lot", newReceipt(t))...), contracttest.LenientRequest())
 	unchanged("success with an unreadable amount")
+	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(json.Number("900000.00"), newReceipt(t))...))
+	unchanged("success with a huge amount: no refund is queued for a figure a body names")
+	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(json.Number("1.00"), newReceipt(t))...))
+	unchanged("success with a small amount")
 	e.webhook(stkCallback(checkoutID, 0, "ok"))
 	unchanged("success with no metadata")
 
-	// 5. Things that are not callbacks at all.
-	for _, junk := range []string{``, `{`, `[]`, `{"Body":{}}`, `{"Body":{"stkCallback":{"ResultCode":0}}}`, `not json`, strings.Repeat("x", 70<<10)} {
+	// 5. Things that are not callbacks at all. A ResultCode that does not fit 32 bits is one:
+	// 4294967296 cut down to 32 bits is 0, "paid".
+	for _, junk := range []string{``, `{`, `[]`, `{"Body":{}}`, `{"Body":{"stkCallback":{"ResultCode":0}}}`, `not json`, strings.Repeat("x", 70<<10),
+		`{"Body":{"stkCallback":{"MerchantRequestID":"m","CheckoutRequestID":"` + checkoutID + `","ResultCode":4294967296,"ResultDesc":"ok"}}}`,
+		`{"Body":{"stkCallback":{"MerchantRequestID":"m","CheckoutRequestID":"` + checkoutID + `","ResultCode":4294968328,"ResultDesc":"ok"}}}`} {
 		e.webhook(junk, contracttest.LenientRequest())
 	}
 	unchanged("junk bodies")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1`, pid), "only the one success row; none for the junk")
 
-	// 6. The wrong amount, from the right address: handled as a wrong amount (row 4), never a sale.
-	e.webhook(stkCallback(checkoutID, 0, "ok", paidItems(json.Number("1.00"), newReceipt(t))...))
-	assert.Equal(t, "FAILED", paymentStatus(t, pid))
-	assert.Equal(t, "wrong_amount", e.getPayment(c.Token, pid)["failure_reason"])
-	assert.Equal(t, map[string]int{"HELD": 2}, seatStatuses(t, c.Seats))
-	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM tickets WHERE booking_id = $1`, c.BookingID))
+	// 6. Draining the inbox again does not help a forger either: the provider still says no.
+	res := e.drain()
+	assert.Positive(t, res.Retry)
+	unchanged("after the drain job")
 
-	// What a real one looks like, for contrast: allowed address, known pending payment, right amount.
+	// What a real one looks like, for contrast: allowed address, known pending payment, and
+	// the provider itself says it was paid.
 	c2 := e.checkout(ev.ID, north[20:22]...)
 	p2 := e.pay(c2, mock.NoCallback)
-	e.webhook(stkCallback(p2["checkout_request_id"].(string), 0, "The service request is processed successfully.",
+	e.fanHasPaid()
+	e.webhook(stkCallback(checkoutIDOf(t, id64(p2["id"])), 0, "The service request is processed successfully.",
 		paidItems(json.Number(fmt.Sprintf("%d.00", c2.Total/100)), newReceipt(t))...))
 	assert.Equal(t, "PAID", bookingStatus(t, c2.BookingID))
 	assert.Equal(t, 4, ledger(t, ev.ID).Sold, "the old booking and the real one; nothing forged")
 }
 
-// §8.2 row 5: a "paid" with no amount is settled by asking the provider, never by the body.
+// §8.2 row 5: a "paid" (with or without an amount) is settled by asking the provider, never
+// by the body.
 func TestWebhook_SuccessWithoutAmountIsSettledByAskingTheProvider(t *testing.T) {
 	e := newEnv(t)
 	ev, north, _ := e.ticketEvent()
 	c := e.checkout(ev.ID, north[10:12]...)
 	p := e.pay(c, mock.NoCallback)
-	pid, checkoutID := id64(p["id"]), p["checkout_request_id"].(string)
+	pid, checkoutID := id64(p["id"]), checkoutIDOf(t, id64(p["id"]))
 
 	e.webhook(stkCallback(checkoutID, 0, "ok", obj{"Name": "MpesaReceiptNumber", "Value": newReceipt(t)}))
 	assert.Equal(t, "PENDING", paymentStatus(t, pid), "the provider has no result yet")
-	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payments WHERE id = $1 AND raw_callback IS NOT NULL`, pid), "the body is kept all the same")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1 AND result_code = 0 AND processed_at IS NULL AND raw IS NOT NULL`, pid),
+		"the body is kept all the same, in the inbox, still to be dealt with")
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payments WHERE id = $1 AND raw_callback IS NOT NULL`, pid), "and not on the payment: nothing was applied")
 
 	// Once the provider itself says "paid", the same callback gets the payment settled.
 	e.mockClock.Advance(time.Minute)
@@ -474,9 +506,10 @@ func TestPayment_CallbacksAtTheSameInstant_SellOnce(t *testing.T) {
 	for round := 0; round < rounds; round++ {
 		c := e.checkout(ev.ID, all[round*2], all[round*2+1])
 		p := e.pay(c, mock.NoCallback)
+		e.fanHasPaid()
 		amount := c.Total
 		cb := payments.Callback{
-			CheckoutRequestID: p["checkout_request_id"].(string), ResultCode: 0, ResultDesc: "ok",
+			CheckoutRequestID: checkoutIDOf(t, id64(p["id"])), ResultCode: 0, ResultDesc: "ok",
 			AmountCents: &amount, Receipt: newReceipt(t), Raw: []byte(`{"Body":{"stkCallback":{}}}`),
 		}
 		results := make([]payments.Finished, callers)
@@ -529,7 +562,7 @@ func TestPayment_CallbackAndReconciliationAtOnce_SellOnce(t *testing.T) {
 		e.mockClock.Advance(time.Minute)
 		amount := c.Total
 		cb := payments.Callback{
-			CheckoutRequestID: p["checkout_request_id"].(string), ResultCode: 0, ResultDesc: "ok", AmountCents: &amount,
+			CheckoutRequestID: checkoutIDOf(t, pid), ResultCode: 0, ResultDesc: "ok", AmountCents: &amount,
 			Raw: []byte(`{"Body":{"stkCallback":{}}}`),
 		}
 
@@ -617,31 +650,63 @@ func TestReconcile_TwoWorkersDoNotDoubleProcess(t *testing.T) {
 	ledger(t, ev.ID)
 }
 
-// A payment left INITIATED by a crash between its insert and the call to the provider has no
-// provider ID to ask about. Reconciliation closes it, and the booking is payable again.
-func TestReconcile_ClosesAPaymentThatWasNeverSent(t *testing.T) {
-	e := newEnv(t)
+// A live payment with no provider ID. There is nothing to ask the provider about, so what
+// reconciliation does depends on what is known about the send:
+//
+//   - provably never sent (dispatch NOT_SENT): closed quietly as soon as it is looked at. No
+//     money can have moved, so there is no alert;
+//   - anything else (the process died around the call, or the answer was lost): the push may
+//     be with M-Pesa under an ID we never learned. It is left alone until five minutes, in
+//     case its callback turns up, then closed TIMEOUT WITH an alert.
+func TestReconcile_ClosesAPaymentWithNoProviderID(t *testing.T) {
+	var counting *countingProvider
+	e := newEnv(t, withProvider(func(m *mock.Provider) payments.Provider { counting = &countingProvider{Provider: m}; return counting }))
 	ev, north, _ := e.ticketEvent()
-	c := e.checkout(ev.ID, north[10:12]...)
-	var pid int64
-	require.NoError(t, db.Pool.QueryRow(context.Background(),
-		`INSERT INTO payments (booking_id, amount_cents, phone_e164, status) VALUES ($1, $2, $3, 'INITIATED') RETURNING id`,
-		c.BookingID, c.Total, payPhone).Scan(&pid))
+	ctx := context.Background()
+	insert := func(c checkout, dispatch string) int64 {
+		var pid int64
+		require.NoError(t, db.Pool.QueryRow(ctx,
+			`INSERT INTO payments (booking_id, amount_cents, phone_e164, status, dispatch) VALUES ($1, $2, $3, 'INITIATED', $4) RETURNING id`,
+			c.BookingID, c.Total, payPhone, dispatch).Scan(&pid))
+		return pid
+	}
 
+	// Provably never sent.
+	c := e.checkout(ev.ID, north[10:12]...)
+	pid := insert(c, "NOT_SENT")
 	// While it is there, it blocks a second payment, as any live payment does.
 	holdErr(t, e.stk(c.Token, c.BookingID, payPhone, mock.Success), http.StatusConflict, domain.CodePaymentInProgress)
-
-	res, err := e.payments.Reconcile(context.Background())
+	res, err := e.payments.Reconcile(ctx)
 	require.NoError(t, err)
 	assert.Zero(t, res.Claimed, "under a minute old it may still be on its way to the provider")
 	agePayment(t, pid, 61*time.Second)
-	res, err = e.payments.Reconcile(context.Background())
+	res, err = e.payments.Reconcile(ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 1, res.TimedOut)
 	got := e.getPayment(c.Token, pid)
 	assert.Equal(t, "TIMEOUT", got["status"])
 	assert.Equal(t, "PENDING_PAYMENT", got["booking_status"])
-	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE booking_id = $1`, c.BookingID), "never sent: no money can have moved")
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE booking_id = $1`, c.BookingID), "provably never sent: no money can have moved")
+
+	// Nothing recorded about the send: the process died somewhere around the call.
+	c2 := e.checkout(ev.ID, north[20:22]...)
+	pid2 := insert(c2, "UNKNOWN")
+	agePayment(t, pid2, 61*time.Second)
+	res, err = e.payments.Reconcile(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.Claimed)
+	assert.Equal(t, 1, res.Pending, "it may have been sent: it is not closed while its callback could still come")
+	assert.Equal(t, "INITIATED", paymentStatus(t, pid2))
+	holdErr(t, e.stk(c2.Token, c2.BookingID, payPhone, mock.Success), http.StatusConflict, domain.CodePaymentInProgress)
+	agePayment(t, pid2, 4*time.Minute)
+	res, err = e.payments.Reconcile(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, 1, res.TimedOut)
+	assert.Equal(t, "TIMEOUT", paymentStatus(t, pid2))
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE booking_id = $1 AND payment_id = $2 AND kind = 'PAYMENT_UNRESOLVED'
+		AND acknowledged_at IS NULL AND message LIKE '%never learned its M-Pesa ID%' AND message LIKE '%' || $3 || '%'`, c2.BookingID, pid2, payPhone),
+		"money may have moved under an ID we never learned: the organiser is told, with the phone to look for")
+	assert.Zero(t, counting.queries.Load(), "there is nothing to ask the provider about")
 
 	e.pay(c, mock.Success)
 	e.timers.fire(t, soon)

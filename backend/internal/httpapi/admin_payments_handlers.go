@@ -22,26 +22,31 @@ func (s *Server) staffPaymentRoutes(r chi.Router) {
 type alertDTO struct {
 	ID               int64   `json:"id"`
 	EventID          int64   `json:"event_id"`
+	EventTitle       string  `json:"event_title"`
 	BookingID        *int64  `json:"booking_id"`
 	BookingReference *string `json:"booking_reference"`
 	Kind             string  `json:"kind"`
 	Message          string  `json:"message"`
 	CreatedAt        string  `json:"created_at"`
 	AcknowledgedAt   *string `json:"acknowledged_at"`
+	// Resolution is set when the system closed the alert itself, and says why.
+	Resolution *string `json:"resolution"`
 }
 
 func newAlertDTO(v store.AlertView) alertDTO {
 	a := v.OrganiserAlert
 	return alertDTO{
-		ID: a.ID, EventID: a.EventID, BookingID: a.BookingID, BookingReference: v.BookingReference,
+		ID: a.ID, EventID: a.EventID, EventTitle: v.EventTitle, BookingID: a.BookingID, BookingReference: v.BookingReference,
 		Kind: a.Kind, Message: a.Message, CreatedAt: ts(a.CreatedAt), AcknowledgedAt: tsPtr(a.AcknowledgedAt),
+		Resolution: a.Resolution,
 	}
 }
 
 func newRefundDTO(v store.RefundView) refundDTO {
 	r := v.Refund
 	return refundDTO{
-		ID: r.ID, BookingID: r.BookingID, BookingReference: v.BookingReference, EventID: v.EventID, PaymentID: r.PaymentID,
+		ID: r.ID, BookingID: r.BookingID, BookingReference: v.BookingReference, BookingStatus: v.BookingStatus,
+		EventID: v.EventID, PaymentID: r.PaymentID,
 		AmountCents: r.AmountCents, Currency: domain.Currency, Phone: v.PaymentPhone, MpesaReceipt: v.MpesaReceipt,
 		Reason: r.Reason, Status: r.Status, CreatedAt: ts(r.CreatedAt), CompletedAt: tsPtr(r.CompletedAt),
 	}
@@ -134,6 +139,14 @@ func (s *Server) listRefunds(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
+	if r.URL.Query().Has("booking_reference") {
+		ref := r.URL.Query().Get("booking_reference")
+		if !validBookingReference(ref) {
+			WriteError(w, r, domain.InvalidField("booking_reference", "reference", "Must be a booking reference such as TLT-8H3K2M."))
+			return
+		}
+		f.BookingReference = &ref
+	}
 	limit, err := PageLimit(r)
 	if err != nil {
 		WriteError(w, r, err)
@@ -162,10 +175,14 @@ func (s *Server) completeRefund(w http.ResponseWriter, r *http.Request) {
 		WriteError(w, r, err)
 		return
 	}
-	rf, err := s.payments.CompleteRefund(r.Context(), id)
+	rf, alreadyDone, err := s.payments.CompleteRefund(r.Context(), id)
 	if err != nil {
 		WriteError(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, newRefundDTO(rf))
+	// Still 200 on a repeat, so the action stays safe to send twice; already_completed is
+	// how the caller tells a repeat from the call that did the work.
+	dto := newRefundDTO(rf)
+	dto.AlreadyCompleted = &alreadyDone
+	writeJSON(w, http.StatusOK, dto)
 }

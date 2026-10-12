@@ -2,7 +2,6 @@ package payments
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
@@ -10,20 +9,8 @@ import (
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
 )
 
-// resultOfCallback turns a parsed callback into the report Finish takes.
-func resultOfCallback(cb Callback) Result {
-	code := int32(cb.ResultCode)
-	res := Result{
-		Source: SourceCallback, Outcome: OutcomeFailed, ResultCode: &code, ResultDesc: cb.ResultDesc,
-		AmountCents: cb.AmountCents, Receipt: cb.Receipt, Raw: cb.Raw,
-	}
-	if cb.ResultCode == domain.ResultSuccess {
-		res.Outcome = OutcomeSuccess
-	}
-	return res
-}
-
-// resultOfQuery turns a final query answer into the report Finish takes.
+// resultOfQuery turns a final query answer into the report Finish takes. It is the only way
+// a success reaches Finish.
 func resultOfQuery(st PaymentStatus) Result {
 	code := int32(st.ResultCode)
 	res := Result{
@@ -36,81 +23,19 @@ func resultOfQuery(st PaymentStatus) Result {
 	return res
 }
 
-// HandleCallback applies a provider callback: the webhook's work, and the mock's.
-//
-// The body is never trusted alone (§8.2). It is matched to a payment we know by its
-// CheckoutRequestID; an unknown ID is logged and nothing changes. What it says is then put
-// through Finish, which accepts it only for a payment that is still open and checks the
-// amount against the booking total. A "paid" with no readable amount cannot be checked
-// against anything, so it is not applied: the provider is asked instead (an authenticated
-// call), and its answer goes through Finish like any reconciliation result.
-//
-// It reports what was done; the webhook ignores that and always answers 200.
-func (s *Service) HandleCallback(ctx context.Context, cb Callback) (Finished, error) {
-	if cb.CheckoutRequestID == "" {
-		s.log.WarnContext(ctx, "payment callback ignored: no CheckoutRequestID")
-		return Finished{Action: ActionNone}, nil
-	}
-	paymentID, err := s.q.GetPaymentIDByCheckoutRequestID(ctx, cb.CheckoutRequestID)
-	if errors.Is(err, store.ErrNoRows) {
-		// Forged, or for a request whose ID we never got to record. Either way there is
-		// nothing of ours to change. Logged loudly when it claims money moved.
-		level := s.log.WarnContext
-		if cb.ResultCode == domain.ResultSuccess {
-			level = s.log.ErrorContext
-		}
-		level(ctx, "payment callback ignored: unknown CheckoutRequestID",
-			"checkout_request_id", cb.CheckoutRequestID, "result_code", cb.ResultCode)
-		return Finished{Action: ActionNone}, nil
-	}
-	if err != nil {
-		return Finished{}, fmt.Errorf("find payment of callback: %w", err)
-	}
-
-	out, err := s.Finish(ctx, paymentID, resultOfCallback(cb))
-	if err != nil {
-		return Finished{}, err
-	}
-	if out.Action != ActionUnverifiable {
-		return out, nil
-	}
-	return s.resolveByQuery(ctx, paymentID, cb.CheckoutRequestID)
-}
-
-// HandleCallbackAsync is HandleCallback off the caller's path: the webhook answers 200 at
-// once and the work runs in the background, with its own deadline. It reports whether the
-// work was started; when it was not (too much in flight), reconciliation will find the
-// payment's result.
-func (s *Service) HandleCallbackAsync(ctx context.Context, cb Callback) bool {
-	ctx = context.WithoutCancel(ctx)
-	return s.bg.Go(func() {
-		ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-		if _, err := s.HandleCallback(ctx, cb); err != nil {
-			s.log.ErrorContext(ctx, "payment callback could not be applied; reconciliation will finish the payment",
-				"checkout_request_id", cb.CheckoutRequestID, "err", err)
-		}
-	})
-}
-
-// resolveByQuery asks the provider about one payment and applies a final answer.
-func (s *Service) resolveByQuery(ctx context.Context, paymentID int64, checkoutRequestID string) (Finished, error) {
+// query asks the provider about one request, outside any transaction, with its own deadline.
+func (s *Service) query(ctx context.Context, checkoutRequestID string) (PaymentStatus, error) {
 	qctx, cancel := context.WithTimeout(ctx, s.policy.QueryTimeout)
-	st, err := s.provider.Query(qctx, checkoutRequestID)
-	cancel()
-	if err != nil {
-		return Finished{}, fmt.Errorf("query provider about payment %d: %w", paymentID, err)
-	}
-	if st.State == StatePending {
-		return Finished{PaymentID: paymentID, Action: ActionNone, Reason: "the provider has no result yet"}, nil
-	}
-	return s.Finish(ctx, paymentID, resultOfQuery(st))
+	defer cancel()
+	return s.provider.Query(qctx, checkoutRequestID)
 }
 
 // ReconcileResult counts what one reconciliation run did.
 type ReconcileResult struct {
 	// Claimed is how many live payments this run took.
 	Claimed int
+	// Requeried is how many TIMEOUT payments this run asked M-Pesa about again.
+	Requeried int
 	// Sold, Refunds and Failed count the payments it finished, by how they ended.
 	Sold, Refunds, Failed int
 	// TimedOut counts the payments it closed as TIMEOUT.
@@ -119,33 +44,41 @@ type ReconcileResult struct {
 	Pending int
 	// Errors counts the payments it could not deal with this time.
 	Errors int
+	// OutOfTime is true when the run stopped starting provider calls because
+	// Policy.ReconcileBudget was spent; what it did not get to waits for the next run.
+	OutOfTime bool
 }
 
+// reconcileChunk is how many payments are claimed at a time. A claim is a lease, so a small
+// chunk keeps a run that runs out of time from sitting on payments it never got to.
+const reconcileChunk = 10
+
 // Reconcile finds payments whose result never arrived and settles them (§8.2). The worker
-// runs it every RECONCILE_INTERVAL.
+// runs it every RECONCILE_INTERVAL. In order:
 //
-//   - A PENDING payment older than Policy.ReconcileAfter (60 s): the provider is asked, and a
-//     final answer goes through Finish, the same function the callback uses. It sells or
-//     queues a refund exactly as a callback would have.
-//   - No final answer by Policy.GiveUpAfter (5 minutes): TIMEOUT, with an alert, because
-//     money may have moved. A TIMEOUT payment is still corrected if M-Pesa reports later.
-//   - An INITIATED payment that old was written just before a crash and never sent: TIMEOUT.
+//  1. Live payments with NO provider ID. They need no call to M-Pesa, so they go first and a
+//     slow M-Pesa cannot hold them up. One that provably was never sent is closed TIMEOUT,
+//     quietly. Any other (the request may have reached M-Pesa and its answer was lost, or
+//     the process died around the call) waits until Policy.GiveUpAfter, in case its callback
+//     turns up and is matched to it, and is then closed TIMEOUT WITH an alert: money may
+//     have moved under an ID we never learned.
+//  2. Live payments with a provider ID, older than Policy.ReconcileAfter (60 s): the
+//     provider is asked, and a final answer goes through Finish, the same function a
+//     callback's result goes through. No final answer by Policy.GiveUpAfter (5 minutes):
+//     TIMEOUT, with an alert.
+//  3. TIMEOUT payments with a provider ID: the provider is asked again on a slow schedule
+//     (Policy.Requery: every 5 minutes for a day, then daily for a week). TIMEOUT is our
+//     verdict, not M-Pesa's, and this is what makes M-Pesa's last word reach Finish even if
+//     its callback never does.
 //
 // Payments are claimed with FOR UPDATE SKIP LOCKED and a lease, so two workers never ask
-// about the same payment, and a payment a callback is finishing right now is skipped. Every
-// call to the provider is made outside any transaction.
+// about the same payment, and a payment being finished right now is skipped. Every call to
+// the provider is made outside any transaction. Steps 2 and 3 stop starting calls once
+// Policy.ReconcileBudget is spent.
 func (s *Service) Reconcile(ctx context.Context) (ReconcileResult, error) {
 	var out ReconcileResult
-	claimed, err := store.ClaimPaymentsForReconcile(ctx, s.db, s.policy.ReconcileAfter, s.policy.ReconcileLease, s.policy.ReconcileBatch)
-	if err != nil {
-		return out, fmt.Errorf("claim payments to reconcile: %w", err)
-	}
-	out.Claimed = len(claimed)
-	for _, p := range claimed {
-		if err := ctx.Err(); err != nil {
-			return out, err
-		}
-		fin, err := s.reconcileOne(ctx, p)
+	deadline := s.now().Add(s.policy.ReconcileBudget)
+	count := func(p store.ClaimedPayment, fin Finished, err error) {
 		switch {
 		case err != nil:
 			out.Errors++
@@ -163,24 +96,100 @@ func (s *Service) Reconcile(ctx context.Context) (ReconcileResult, error) {
 			out.Pending++
 		}
 	}
+
+	// 1. No provider ID: nothing to ask.
+	idless, err := store.ClaimPaymentsForReconcile(ctx, s.db, s.policy.ReconcileAfter, s.policy.ReconcileLease, s.policy.ReconcileBatch, false, store.PaymentCursor{})
+	if err != nil {
+		return out, fmt.Errorf("claim payments to reconcile: %w", err)
+	}
+	out.Claimed += len(idless)
+	for _, p := range idless {
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		fin, err := s.reconcileIDLess(ctx, p)
+		count(p, fin, err)
+	}
+
+	// 2 and 3. Ask the provider, in chunks, while there is time.
+	steps := []struct {
+		claim func(after store.PaymentCursor, limit int) ([]store.ClaimedPayment, error)
+		seen  *int
+	}{
+		{func(after store.PaymentCursor, limit int) ([]store.ClaimedPayment, error) {
+			return store.ClaimPaymentsForReconcile(ctx, s.db, s.policy.ReconcileAfter, s.policy.ReconcileLease, limit, true, after)
+		}, &out.Claimed},
+		{func(after store.PaymentCursor, limit int) ([]store.ClaimedPayment, error) {
+			return store.ClaimTimedOutPaymentsForRequery(ctx, s.db, s.policy.Requery, limit, after)
+		}, &out.Requeried},
+	}
+	for _, step := range steps {
+		var after store.PaymentCursor
+		for left := s.policy.ReconcileBatch; left > 0; {
+			if !s.now().Before(deadline) {
+				out.OutOfTime = true
+				break
+			}
+			claimed, err := step.claim(after, min(left, reconcileChunk))
+			if err != nil {
+				return out, fmt.Errorf("claim payments to reconcile: %w", err)
+			}
+			if len(claimed) == 0 {
+				break
+			}
+			*step.seen += len(claimed)
+			left -= len(claimed)
+			for _, p := range claimed {
+				after = store.PaymentCursor{CreatedAt: p.CreatedAt, ID: p.ID}
+				if err := ctx.Err(); err != nil {
+					return out, err
+				}
+				if !s.now().Before(deadline) {
+					// Claimed and not asked about: it is tried again once its lease is over.
+					out.OutOfTime = true
+					out.Pending++
+					continue
+				}
+				fin, err := s.reconcileOne(ctx, p)
+				count(p, fin, err)
+			}
+		}
+	}
+	if out.OutOfTime {
+		s.log.WarnContext(ctx, "payment reconciliation: out of time; the rest waits for the next run",
+			"budget", s.policy.ReconcileBudget.String(), "claimed", out.Claimed, "requeried", out.Requeried)
+	}
 	return out, nil
 }
 
-func (s *Service) reconcileOne(ctx context.Context, p store.ClaimedPayment) (Finished, error) {
-	if p.CheckoutRequestID == nil {
-		// Never accepted by the provider: there is nothing to ask about.
+// reconcileIDLess settles a live payment that has no provider ID to ask about.
+func (s *Service) reconcileIDLess(ctx context.Context, p store.ClaimedPayment) (Finished, error) {
+	if p.Dispatch == store.DispatchNotSent {
+		// Provably never sent: no money can have moved, so no alert.
 		return s.Finish(ctx, p.ID, Result{
 			Source: SourceInternal, Outcome: OutcomeTimedOut, ResultDesc: "The request never reached M-Pesa.",
 		})
 	}
+	if p.Age < s.policy.GiveUpAfter {
+		// The fan may be entering the PIN right now; the callback, when it comes, is
+		// matched to this payment by phone and amount.
+		return Finished{PaymentID: p.ID, Action: ActionNone}, nil
+	}
+	return s.Finish(ctx, p.ID, Result{
+		Source: SourceInternal, Outcome: OutcomeTimedOut, Unresolved: true,
+		ResultDesc: "We could not confirm whether the request reached M-Pesa.",
+	})
+}
 
-	qctx, cancel := context.WithTimeout(ctx, s.policy.QueryTimeout)
-	st, err := s.provider.Query(qctx, *p.CheckoutRequestID)
-	cancel()
+// reconcileOne asks the provider about a payment that has a provider ID.
+func (s *Service) reconcileOne(ctx context.Context, p store.ClaimedPayment) (Finished, error) {
+	st, err := s.query(ctx, *p.CheckoutRequestID)
 	if err == nil && st.State != StatePending {
 		return s.Finish(ctx, p.ID, resultOfQuery(st))
 	}
-	if p.Age < s.policy.GiveUpAfter {
+	if p.Status == string(domain.PaymentTimeout) || p.Age < s.policy.GiveUpAfter {
+		// Already closed as TIMEOUT (it is only being asked about again), or not old enough
+		// to give up on.
 		if err != nil {
 			return Finished{}, fmt.Errorf("query provider: %w", err)
 		}
@@ -194,4 +203,14 @@ func (s *Service) reconcileOne(ctx context.Context, p store.ClaimedPayment) (Fin
 		Source: SourceInternal, Outcome: OutcomeTimedOut, Unresolved: true,
 		ResultDesc: fmt.Sprintf("No answer from M-Pesa within %d minutes.", int(s.policy.GiveUpAfter.Minutes())),
 	})
+}
+
+// retryDelay is how long a stored callback waits before its next attempt: the base doubled
+// per attempt already made, up to the maximum.
+func (s *Service) retryDelay(attempts int) time.Duration {
+	d := s.policy.CallbackRetryBase
+	for i := 1; i < attempts && d < s.policy.CallbackRetryMax; i++ {
+		d *= 2
+	}
+	return min(d, s.policy.CallbackRetryMax)
 }

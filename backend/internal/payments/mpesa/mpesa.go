@@ -17,12 +17,15 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
 )
 
@@ -165,7 +168,11 @@ type networkError struct {
 	// dial is true when the connection was never made, so the request was certainly not
 	// delivered.
 	dial bool
-	err  error
+	// unsent is true when the HTTP client reports that it looked for a connection and never
+	// wrote a byte of the request on one: a failed DNS lookup, dial or TLS handshake, or a
+	// deadline that passed before the write. The request cannot have reached Daraja.
+	unsent bool
+	err    error
 }
 
 func (e *networkError) Error() string {
@@ -199,14 +206,28 @@ func sanitise(err error) error {
 func (p *Provider) do(ctx context.Context, op string, build func(ctx context.Context) (*http.Request, error)) (int, []byte, error) {
 	ctx, cancel := context.WithTimeout(ctx, p.cfg.Timeout)
 	defer cancel()
+	// The trace says how far the request got. "Asked for a connection and wrote nothing" is
+	// proof it was not sent. A transport that does not report (looked stays false) proves
+	// nothing, and the error is then treated as one that may have been delivered.
+	var looked, wrote atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		GetConn:      func(string) { looked.Store(true) },
+		WroteHeaders: func() { wrote.Store(true) },
+		WroteRequest: func(httptrace.WroteRequestInfo) { wrote.Store(true) },
+	})
 	req, err := build(ctx)
 	if err != nil {
-		return 0, nil, fmt.Errorf("mpesa: %s: build request: %w", op, sanitise(err))
+		return 0, nil, payments.NotSent(fmt.Errorf("mpesa: %s: build request: %w", op, sanitise(err)))
+	}
+	if err := ctx.Err(); err != nil {
+		// Cancelled or out of time before the call was even made.
+		return 0, nil, &networkError{op: op, unsent: true, err: err}
 	}
 	resp, err := p.http.Do(req)
 	if err != nil {
 		var opErr *net.OpError
-		return 0, nil, &networkError{op: op, dial: errors.As(err, &opErr) && opErr.Op == "dial", err: sanitise(err)}
+		dial := errors.As(err, &opErr) && opErr.Op == "dial"
+		return 0, nil, &networkError{op: op, dial: dial, unsent: dial || (looked.Load() && !wrote.Load()), err: sanitise(err)}
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -325,13 +346,14 @@ func (p *Provider) password(timestamp string) string {
 
 // postJSON sends an authenticated JSON request and returns the status and body.
 func (p *Provider) postJSON(ctx context.Context, op, path string, policy retryPolicy, payload any) (int, []byte, error) {
+	// Without a token, or a body, the request itself is never made: NotSent.
 	token, err := p.accessToken(ctx)
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, payments.NotSent(err)
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
-		return 0, nil, fmt.Errorf("mpesa: %s: encode request: %w", op, err)
+		return 0, nil, payments.NotSent(fmt.Errorf("mpesa: %s: encode request: %w", op, err))
 	}
 	return p.call(ctx, op, policy, func(ctx context.Context) (*http.Request, error) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.cfg.BaseURL+path, bytes.NewReader(raw))
@@ -363,6 +385,17 @@ func msisdn(e164 string) string { return strings.TrimPrefix(e164, "+") }
 
 // Initiate sends the STK push. The amount goes to Daraja in whole shillings; an amount that
 // is not a whole number of shillings is refused, never rounded.
+//
+// Its errors say whether the push can have reached Daraja (payments.NotSent):
+//
+//   - NOT sent: the amount was refused here; no token could be had; no byte of the request
+//     was written (DNS, dial, TLS handshake, a deadline before the write); Daraja answered
+//     with a refusal of its own (any 4xx, a 5xx carrying Daraja's errorCode, or a 200 whose
+//     ResponseCode is not "0").
+//   - Everything else is ambiguous and is NOT marked: a timeout or a reset after the request
+//     was written, a 5xx with no Daraja error in it (a gateway in between may have passed the
+//     request on), a 200 whose body could not be read or is not Daraja's JSON, a 200 that
+//     says accepted and names no CheckoutRequestID. Daraja may have prompted the payer.
 func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (payments.PaymentInit, error) {
 	const op = "stk push"
 	if req.AmountCents <= 0 || req.AmountCents%100 != 0 {
@@ -386,6 +419,11 @@ func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (p
 		"TransactionDesc": "Tickets",
 	})
 	if err != nil {
+		var ne *networkError
+		if errors.As(err, &ne) && ne.unsent {
+			return payments.PaymentInit{}, payments.NotSent(err)
+		}
+		// Already marked (no token), or ambiguous (sent and no answer; answer unreadable).
 		return payments.PaymentInit{}, err
 	}
 	var out struct {
@@ -395,13 +433,20 @@ func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (p
 		ResponseDescription string `json:"ResponseDescription"`
 	}
 	if status != http.StatusOK {
-		return payments.PaymentInit{}, darajaError(status, body)
+		de := darajaError(status, body)
+		if (status >= 400 && status < 500) || de.Code != "" {
+			return payments.PaymentInit{}, payments.NotSent(de)
+		}
+		return payments.PaymentInit{}, de
 	}
 	if err := json.Unmarshal(body, &out); err != nil {
 		return payments.PaymentInit{}, fmt.Errorf("mpesa: %s: the answer is not JSON", op)
 	}
+	if out.ResponseCode != "" && out.ResponseCode != "0" {
+		return payments.PaymentInit{}, payments.NotSent(&Error{HTTPStatus: status, Code: out.ResponseCode, Message: out.ResponseDescription})
+	}
 	if out.ResponseCode != "0" || out.CheckoutRequestID == "" {
-		return payments.PaymentInit{}, &Error{HTTPStatus: status, Code: out.ResponseCode, Message: out.ResponseDescription}
+		return payments.PaymentInit{}, &Error{HTTPStatus: status, Code: out.ResponseCode, Message: "accepted without a CheckoutRequestID: " + out.ResponseDescription}
 	}
 	p.log.InfoContext(ctx, "mpesa: stk push accepted", "payment_id", req.PaymentID, "checkout_request_id", out.CheckoutRequestID)
 	return payments.PaymentInit{CheckoutRequestID: out.CheckoutRequestID, MerchantRequestID: out.MerchantRequestID}, nil
@@ -410,6 +455,13 @@ func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (p
 // Query asks Daraja what became of an STK push. While the payer has not answered, Daraja
 // replies with an error ("The transaction is being processed"); that is StatePending here,
 // not a failure. The answer names no amount and no receipt.
+//
+// StateFailed is returned only for a result code KNOWN to be a final failure
+// (domain.IsFinalSTKFailure, which says where the list comes from). Daraja answers HTTP 200
+// with a non-zero ResultCode for more than failures: "the transaction is still under
+// processing" is one. Reading every non-zero code as a failure closed payments the fan was
+// about to pay for. Any code that is not on the list is StatePending: the payment stays open
+// and Daraja is asked again.
 func (p *Provider) Query(ctx context.Context, checkoutRequestID string) (payments.PaymentStatus, error) {
 	const op = "stk query"
 	timestamp := p.cfg.Now().In(nairobi).Format("20060102150405")
@@ -447,9 +499,15 @@ func (p *Provider) Query(ctx context.Context, checkoutRequestID string) (payment
 	if err != nil {
 		return payments.PaymentStatus{}, fmt.Errorf("mpesa: %s: result code %q is not a number", op, raw)
 	}
-	st := payments.PaymentStatus{State: payments.StateFailed, ResultCode: code, ResultDesc: out.ResultDesc}
-	if code == 0 {
+	st := payments.PaymentStatus{State: payments.StatePending, ResultCode: code, ResultDesc: out.ResultDesc}
+	switch {
+	case code == domain.ResultSuccess:
 		st.State = payments.StateSuccess
+	case domain.IsFinalSTKFailure(code):
+		st.State = payments.StateFailed
+	default:
+		p.log.WarnContext(ctx, "mpesa: stk query answered a result code that is not a known final result; treated as still pending",
+			"checkout_request_id", checkoutRequestID, "result_code", code, "result_desc", out.ResultDesc)
 	}
 	return st, nil
 }

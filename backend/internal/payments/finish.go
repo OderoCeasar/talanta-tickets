@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/domain"
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/store"
@@ -16,10 +19,13 @@ import (
 type Source int
 
 const (
-	// SourceCallback is the provider's callback: an unauthenticated HTTP request. It is
-	// believed only as far as it matches a payment we know and carries the right amount.
+	// SourceCallback is the provider's callback: an unauthenticated HTTP request. A FAILURE
+	// is taken from it (the worst a false one does is close a payment the fan can start
+	// again, and a later confirmed success still overrules it). A SUCCESS never is: money is
+	// only believed to have moved on the provider's own answer to our query.
 	SourceCallback Source = iota
-	// SourceQuery is the provider's answer to our own, authenticated status query.
+	// SourceQuery is the provider's answer to our own, authenticated status query. It is the
+	// only source a success is accepted from.
 	SourceQuery
 	// SourceInternal is a verdict of our own: the provider refused the request, or
 	// reconciliation gave up waiting.
@@ -45,14 +51,21 @@ type Result struct {
 	// ResultCode is the provider's code; nil for a verdict of our own.
 	ResultCode *int32
 	ResultDesc string
-	// AmountCents is what was paid, when the report says.
+	// AmountCents is what was paid, when the provider's own answer says (SourceQuery only).
+	// Nil means the provider names no amount, as Daraja's STK query does not: the payment is
+	// then paid in full at the amount we asked for.
 	AmountCents *int64
-	Receipt     string
+	// ClaimedAmountCents is the amount a callback body named. It is never money: it is only
+	// compared with what we asked for, and a difference raises an alert.
+	ClaimedAmountCents *int64
+	// Receipt is the M-Pesa receipt. From a callback body it is unauthenticated; it is kept
+	// for the organiser to look the payment up by, and decides nothing.
+	Receipt string
 	// Raw is the callback body, valid JSON, or nil.
 	Raw []byte
 	// Unresolved marks a timeout that happened without the provider ever giving a final
-	// answer (as opposed to the request never having been sent). Money may have moved, so
-	// the organiser is alerted.
+	// answer (as opposed to the request provably never having been sent). Money may have
+	// moved, so the organiser is alerted.
 	Unresolved bool
 }
 
@@ -60,8 +73,8 @@ type Result struct {
 type Action string
 
 const (
-	// ActionNone: the payment was already final, or the result could not be used. Nothing
-	// changed (apart from keeping the raw callback when the payment had none).
+	// ActionNone: the result changed nothing (the payment was already settled that way, or
+	// the report is one that a settled payment ignores).
 	ActionNone Action = "none"
 	// ActionSold: payment SUCCESS, booking PAID, hold CONVERTED, seats SOLD, tickets issued.
 	ActionSold Action = "sold"
@@ -70,8 +83,8 @@ const (
 	ActionRefund Action = "refund"
 	// ActionFailed: the payment ended FAILED or TIMEOUT.
 	ActionFailed Action = "failed"
-	// ActionUnverifiable: a success report with no amount from a source that is not
-	// believed on its own word. Nothing changed; the caller asks the provider.
+	// ActionUnverifiable: a success report from a source that is not believed on its own
+	// word. Nothing changed; the caller asks the provider.
 	ActionUnverifiable Action = "unverifiable"
 )
 
@@ -90,9 +103,10 @@ type Finished struct {
 }
 
 // ErrEventBusy is returned by Finish when the payment's event stayed locked by an organiser
-// (a publish, a cancel, an edit) for longer than Policy.EventLockWait. Nothing changed; the
-// payment is still live and reconciliation will finish it.
-var ErrEventBusy = errors.New("payments: the event is locked; the payment was left for reconciliation")
+// (a publish, a cancel, an edit) for longer than Policy.EventLockWait. Nothing changed. The
+// caller retries: a stored callback is retried by the drain job, a query result by the next
+// reconciliation run.
+var ErrEventBusy = errors.New("payments: the event is locked; the payment was not finished and will be tried again")
 
 // Why a successful payment bought nothing. These are stored as the refund's reason and shown
 // to the organiser.
@@ -102,26 +116,40 @@ const (
 	reasonSeatsResold    = "Paid after the hold expired; seats were resold"
 	reasonAlreadyPaid    = "Paid twice: the booking was already paid by another payment"
 	reasonBookingClosed  = "Paid after the booking was closed"
+	reasonNoTickets      = "Paid, but the tickets could not be issued"
 )
 
 // Finish records how a payment ended. It is the ONE function every report goes through: the
-// M-Pesa callback, a repeat of that callback, the mock provider, and reconciliation. It is
-// one database transaction (§8.3: money moves once).
+// M-Pesa callback (once the provider has confirmed it), a repeat of that callback, the mock
+// provider, and reconciliation. It is one database transaction (§8.3: money moves once).
+//
+// The rule it keeps: once there is evidence that money moved for a payment, the payment ends
+// in exactly one of (a) seats SOLD and tickets issued, or (b) a refund row and an organiser
+// alert. Never neither, never both.
 //
 // Locks, in the system's order: the event (shared, bounded wait), the booking's hold, the
 // booking, the payment. Then:
 //
-//  1. The payment's status, read under its lock, decides whether there is anything to do.
-//     domain.TransitionPayment refuses a second final state, so a repeated callback, and a
-//     callback and a reconciliation run that both carry the same result, change nothing the
-//     second time. (A TIMEOUT payment is not final in that sense: TIMEOUT is our verdict,
-//     and a late answer from M-Pesa still overrules it.)
-//  2. A failure: the payment becomes FAILED or TIMEOUT. The booking stays PENDING_PAYMENT
+//  1. A success is accepted only from the provider's own answer (SourceQuery). A success
+//     from a callback body is not applied at all (ActionUnverifiable): the caller asks the
+//     provider and comes back with its answer.
+//  2. The payment's status, read under its lock, decides whether there is anything to do.
+//     domain.TransitionPayment refuses a repeat, so a repeated callback, and a callback and a
+//     reconciliation run that both carry the same result, change nothing the second time. It
+//     ALLOWS a success for a payment that is TIMEOUT or FAILED: both can be recorded before
+//     M-Pesa's last word (TIMEOUT is our own verdict; FAILED can come from a callback body),
+//     and money that then turns out to have arrived must not be dropped. A failure reported
+//     after a SUCCESS is refused and ignored.
+//  3. A failure: the payment becomes FAILED or TIMEOUT. The booking stays PENDING_PAYMENT
 //     while its hold is there, so the fan can try again, and is closed if the hold is gone.
-//  3. A success with the wrong amount: the payment becomes FAILED (result code 0, which is
-//     what failure_reason "wrong_amount" is read from), a refund for the amount actually
-//     paid is queued, the booking becomes REFUND_REQUIRED and the organiser is alerted.
-//  4. A success with the right amount sells the seats if, and only if, the booking is still
+//  4. The amount. It is the one the provider's answer names, or, when it names none, the
+//     amount we asked for: an STK prompt cannot be paid in part or in excess. If it is not
+//     the booking's total, the payment is FAILED (result code 0, which is what
+//     failure_reason "wrong_amount" is read from), a refund for the amount the PROVIDER named
+//     is queued, the booking becomes REFUND_REQUIRED and the organiser is alerted. An amount
+//     named only by a callback body is never refunded; when it differs from what we asked
+//     for it raises an AMOUNT_MISMATCH alert and nothing else.
+//  5. A success with the right amount sells the seats if, and only if, the booking is still
 //     PENDING_PAYMENT, its event is not cancelled, and its hold's STORED status is ACTIVE.
 //     The stored status, not the effective one: a hold whose time has run out but which
 //     nobody has taken a seat from still has every seat, and the fan who paid for them gets
@@ -129,11 +157,13 @@ const (
 //     CONVERTED, and store.SellSeatsOfHold flips the seats where hold_id matches and the
 //     status is still HELD. If it reports as many sold as the booking has items, the
 //     tickets are issued at once and the transaction commits.
-//  5. Otherwise nothing is sold. If the seat statement came up short it sold none; the PAID
-//     and CONVERTED writes are undone with a savepoint. The payment is recorded SUCCESS, a
-//     refund is queued, the booking becomes REFUND_REQUIRED (a booking that is already PAID
-//     by another payment stays PAID and keeps its tickets) and the organiser is alerted.
-//     A seat is never sold twice to make the ledger come out right.
+//  6. Otherwise nothing is sold. If the seat statement came up short it sold none, and if
+//     the tickets could not be made for any reason that will not go away by trying again,
+//     the sale is undone: the PAID, CONVERTED and SOLD writes are rolled back to a savepoint.
+//     The payment is recorded SUCCESS, a refund is queued, the booking becomes
+//     REFUND_REQUIRED (a booking that is already PAID by another payment stays PAID and keeps
+//     its tickets) and the organiser is alerted. A seat is never sold twice to make the
+//     ledger come out right.
 //
 // The "you're going" SMS is sent after the commit, in the background.
 func (s *Service) Finish(ctx context.Context, paymentID int64, res Result) (Finished, error) {
@@ -211,7 +241,13 @@ func (s *Service) finishTx(ctx context.Context, tx pgx.Tx, paymentID int64, res 
 		PaymentStatus: domain.PaymentStatus(pay.Status), BookingStatus: domain.BookingStatus(b.Status),
 	}
 
-	// 1. Is there anything to do? The status was read under the row lock.
+	// 1. A success is only believed from the provider's own answer.
+	if res.Outcome == OutcomeSuccess && res.Source != SourceQuery {
+		out.Action, out.Reason = ActionUnverifiable, "a success is only accepted from the provider's own answer to a query"
+		return out, nil
+	}
+
+	// 2. Is there anything to do? The status was read under the row lock.
 	target := domain.PaymentSuccess
 	switch res.Outcome {
 	case OutcomeFailed:
@@ -220,43 +256,40 @@ func (s *Service) finishTx(ctx context.Context, tx pgx.Tx, paymentID int64, res 
 		target = domain.PaymentTimeout
 	}
 	if err := domain.TransitionPayment(out.PaymentStatus, target); err != nil {
-		return out, f.keepRaw(ctx)
+		return out, nil
 	}
 
+	// 3. A failure.
 	if res.Outcome != OutcomeSuccess {
 		return f.fail(ctx, out, target)
 	}
 
-	// A success report. First, can it be believed?
+	// A confirmed success. Money moved; from here the payment ends with tickets or a refund.
 	if res.Receipt != "" {
 		used, err := q.ReceiptBelongsToAnotherPayment(ctx, store.ReceiptBelongsToAnotherPaymentParams{MpesaReceipt: res.Receipt, ID: pay.ID})
 		if err != nil {
 			return Finished{}, fmt.Errorf("finish payment %d: check receipt: %w", paymentID, err)
 		}
 		if used {
-			// One receipt settles one payment. This is an old success replayed against a
-			// different payment; it is not applied, and reconciliation asks M-Pesa instead.
-			out.Action, out.Reason = ActionUnverifiable, "the M-Pesa receipt already belongs to another payment"
-			return out, nil
+			// One receipt names one payment. The provider confirmed this payment, so the
+			// money is real; the receipt, which came with a callback body, is not this
+			// payment's and is left off it.
+			s.log.ErrorContext(ctx, "the M-Pesa receipt already belongs to another payment; it was not recorded on this one",
+				"payment_id", pay.ID, "mpesa_receipt", res.Receipt)
+			f.res.Receipt = ""
 		}
 	}
-	paid := res.AmountCents
-	if paid == nil {
-		if res.Source != SourceQuery {
-			out.Action, out.Reason = ActionUnverifiable, "the success report carries no amount"
-			return out, f.keepRaw(ctx)
-		}
-		// Our own authenticated query says "paid" and (as Daraja's does) names no amount.
-		// An STK prompt can only be paid in full, so the amount is the one we asked for.
-		paid = &pay.AmountCents
+
+	// 4. The amount.
+	paid := pay.AmountCents
+	if res.AmountCents != nil {
+		paid = *res.AmountCents
+	}
+	if paid != b.TotalCents {
+		return f.wrongAmount(ctx, out, paid)
 	}
 
-	// 3. The amount.
-	if *paid != b.TotalCents {
-		return f.wrongAmount(ctx, out, *paid)
-	}
-
-	// 4. Sell, if the seats are still this booking's to sell.
+	// 5. Sell, if the seats are still this booking's to sell.
 	reason := f.whyNotSellable()
 	if reason == "" {
 		tickets, shortReason, err := f.sell(ctx)
@@ -266,17 +299,24 @@ func (s *Service) finishTx(ctx context.Context, tx pgx.Tx, paymentID int64, res 
 		if shortReason == "" {
 			out.Action, out.Tickets = ActionSold, tickets
 			out.PaymentStatus, out.BookingStatus = domain.PaymentSuccess, domain.BookingPaid
-			return out, nil
+			if err := f.resolveUnresolvedAlerts(ctx, resolutionSold); err != nil {
+				return Finished{}, err
+			}
+			return out, f.flagClaimedAmount(ctx)
 		}
 		reason = shortReason
 	}
 
-	// 5. The money is here and bought nothing.
+	// 6. The money is here and bought nothing.
 	if err := f.writePayment(ctx, domain.PaymentSuccess, res.ResultCode, res.ResultDesc); err != nil {
 		return Finished{}, err
 	}
 	out.PaymentStatus = domain.PaymentSuccess
-	return f.refund(ctx, out, *paid, reason, "REFUND_REQUIRED")
+	out, err = f.refund(ctx, out, paid, reason, "REFUND_REQUIRED")
+	if err != nil {
+		return Finished{}, err
+	}
+	return out, f.flagClaimedAmount(ctx)
 }
 
 // finishing carries what finishTx read under its locks.
@@ -291,15 +331,21 @@ type finishing struct {
 	pay     store.Payment
 }
 
-// keepRaw stores the callback body on a payment that has none, when nothing else is written.
-func (f *finishing) keepRaw(ctx context.Context) error {
-	if len(f.res.Raw) == 0 || len(f.pay.RawCallback) > 0 {
+// flagClaimedAmount raises an alert when a callback body named an amount other than the one
+// we asked M-Pesa to charge, for a payment the provider confirmed without naming an amount.
+// An STK prompt cannot be paid in part or in excess, so the body is forged or malformed: the
+// payment was treated as paid in full, no refund is queued for the body's figure, and a
+// person is asked to look at the statement.
+func (f *finishing) flagClaimedAmount(ctx context.Context) error {
+	claimed := f.res.ClaimedAmountCents
+	if claimed == nil || f.res.AmountCents != nil || *claimed == f.pay.AmountCents {
 		return nil
 	}
-	if _, err := f.q.StoreRawCallback(ctx, store.StoreRawCallbackParams{ID: f.pay.ID, RawCallback: f.res.Raw}); err != nil {
-		return fmt.Errorf("finish payment %d: keep raw callback: %w", f.pay.ID, err)
-	}
-	return nil
+	f.s.log.ErrorContext(ctx, "a payment callback named a different amount from the one requested; M-Pesa confirmed the payment and it was treated as paid in full",
+		"payment_id", f.pay.ID, "claimed_cents", *claimed, "requested_cents", f.pay.AmountCents)
+	return f.alert(ctx, "AMOUNT_MISMATCH", fmt.Sprintf(
+		"The M-Pesa callback for booking %s named KES %s, but KES %s was requested and M-Pesa confirmed the payment. It was treated as paid in full and no refund was queued for the callback's figure. Check the M-Pesa statement (receipt %s).",
+		f.booking.Reference, formatKES(*claimed), formatKES(f.pay.AmountCents), orDash(f.res.Receipt)))
 }
 
 // writePayment moves the payment to its final status. The move was asked of
@@ -347,35 +393,27 @@ func moveBooking(ctx context.Context, q *store.Queries, b store.Booking, to doma
 	return nil
 }
 
-// fail is step 2: the payment ends FAILED or TIMEOUT.
+// fail is step 3: the payment ends FAILED or TIMEOUT.
 func (f *finishing) fail(ctx context.Context, out Finished, to domain.PaymentStatus) (Finished, error) {
 	if err := f.writePayment(ctx, to, f.res.ResultCode, f.res.ResultDesc); err != nil {
 		return Finished{}, err
 	}
 	out.Action, out.PaymentStatus, out.Reason = ActionFailed, to, f.res.ResultDesc
-
-	// The booking stays payable while its hold is there. Judged by the hold's stored
-	// status: a hold that has only lapsed is closed, with its booking, by the sweeper or by
-	// whoever takes its last seat, both of which now find no live payment in the way.
-	if domain.BookingStatus(f.booking.Status) == domain.BookingPendingPayment {
-		closeAs := domain.BookingPendingPayment
-		switch {
-		case f.hold == nil, domain.HoldStatus(f.hold.Status) == domain.HoldExpired:
-			closeAs = domain.BookingExpired
-		case domain.HoldStatus(f.hold.Status) == domain.HoldReleased:
-			closeAs = domain.BookingCancelled
-		}
-		if closeAs != domain.BookingPendingPayment {
-			if err := moveBooking(ctx, f.q, f.booking, closeAs); err != nil {
-				return Finished{}, err
-			}
-			out.BookingStatus = closeAs
-		}
+	closed, err := f.closeBookingIfHoldGone(ctx)
+	if err != nil {
+		return Finished{}, err
+	}
+	if closed != "" {
+		out.BookingStatus = closed
 	}
 
 	if f.res.Outcome == OutcomeTimedOut && f.res.Unresolved {
 		msg := fmt.Sprintf("M-Pesa gave no final answer for a payment of KES %s on booking %s. It was closed as timed out; check the M-Pesa portal for the payment.",
 			formatKES(f.pay.AmountCents), f.booking.Reference)
+		if f.pay.CheckoutRequestID == nil {
+			msg = fmt.Sprintf("A payment request of KES %s from %s for booking %s may have reached M-Pesa, but we never learned its M-Pesa ID and cannot ask about it. It was closed as timed out. Check the M-Pesa statement for that amount from that phone; if the money is there, refund it.",
+				formatKES(f.pay.AmountCents), f.pay.PhoneE164, f.booking.Reference)
+		}
 		if err := f.alert(ctx, "PAYMENT_UNRESOLVED", msg); err != nil {
 			return Finished{}, err
 		}
@@ -383,8 +421,62 @@ func (f *finishing) fail(ctx context.Context, out Finished, to domain.PaymentSta
 	return out, nil
 }
 
-// wrongAmount is step 3.
+// closeBookingIfHoldGone closes a booking that is still awaiting payment when its hold is no
+// longer there to pay on, and returns the status it gave it ("" when it left it alone).
+//
+// The booking stays payable while its hold is there. Judged by the hold's stored status: a
+// hold that has only lapsed is closed, with its booking, by the sweeper or by whoever takes
+// its last seat, both of which now find no live payment in the way.
+func (f *finishing) closeBookingIfHoldGone(ctx context.Context) (domain.BookingStatus, error) {
+	if domain.BookingStatus(f.booking.Status) != domain.BookingPendingPayment {
+		return "", nil
+	}
+	closeAs := domain.BookingPendingPayment
+	switch {
+	case f.hold == nil, domain.HoldStatus(f.hold.Status) == domain.HoldExpired:
+		closeAs = domain.BookingExpired
+	case domain.HoldStatus(f.hold.Status) == domain.HoldReleased:
+		closeAs = domain.BookingCancelled
+	}
+	if closeAs == domain.BookingPendingPayment {
+		return "", nil
+	}
+	if err := moveBooking(ctx, f.q, f.booking, closeAs); err != nil {
+		return "", err
+	}
+	return closeAs, nil
+}
+
+// wrongAmount is step 4: the provider itself says the fan paid, and names an amount that is
+// not the booking's total.
 func (f *finishing) wrongAmount(ctx context.Context, out Finished, paid int64) (Finished, error) {
+	from := domain.PaymentStatus(f.pay.Status)
+
+	if paid <= 0 {
+		// "Paid", and nothing was paid. There is no money to give back, so there is no
+		// refund, and a booking is not moved to REFUND_REQUIRED with nothing to refund: this
+		// is a failed payment. It is odd enough for a person to look at.
+		desc := "M-Pesa reported a payment of KES 0.00; nothing was received."
+		if from != domain.PaymentFailed {
+			// Written without the callback's body and receipt: the row must not carry a
+			// "paid" it did not get (the body stays in the callback inbox).
+			if err := writePayment(ctx, f.q, f.pay, domain.PaymentFailed, nil, desc, "", nil); err != nil {
+				return Finished{}, err
+			}
+			closed, err := f.closeBookingIfHoldGone(ctx)
+			if err != nil {
+				return Finished{}, err
+			}
+			if closed != "" {
+				out.BookingStatus = closed
+			}
+		}
+		out.Action, out.PaymentStatus, out.Reason = ActionFailed, domain.PaymentFailed, desc
+		return out, f.alert(ctx, "AMOUNT_MISMATCH", fmt.Sprintf(
+			"M-Pesa reported booking %s as paid with an amount of KES 0.00 (receipt %s). Nothing was sold and no refund was queued. Check the M-Pesa statement.",
+			f.booking.Reference, orDash(f.res.Receipt)))
+	}
+
 	desc := fmt.Sprintf("Paid KES %s; the booking total is KES %s.", formatKES(paid), formatKES(f.booking.TotalCents))
 	zero := int32(domain.ResultSuccess)
 	code := f.res.ResultCode
@@ -392,7 +484,16 @@ func (f *finishing) wrongAmount(ctx context.Context, out Finished, paid int64) (
 		code = &zero
 	}
 	// FAILED with M-Pesa's success code: failure_reason reads that pair as "wrong_amount".
-	if err := f.writePayment(ctx, domain.PaymentFailed, code, desc); err != nil {
+	if from == domain.PaymentFailed {
+		// Already FAILED (on an earlier report). It stays FAILED; only its result changes.
+		arg := store.SetPaymentResultParams{ID: f.pay.ID, Status: string(from), ResultCode: code, ResultDesc: &desc, RawCallback: f.res.Raw}
+		if f.res.Receipt != "" {
+			arg.MpesaReceipt = &f.res.Receipt
+		}
+		if n, err := f.q.SetPaymentResult(ctx, arg); err != nil || n != 1 {
+			return Finished{}, fmt.Errorf("finish payment %d: rewrite result: %d rows: %w", f.pay.ID, n, err)
+		}
+	} else if err := f.writePayment(ctx, domain.PaymentFailed, code, desc); err != nil {
 		return Finished{}, err
 	}
 	out.PaymentStatus = domain.PaymentFailed
@@ -426,7 +527,35 @@ func (f *finishing) whyNotSellable() string {
 	return ""
 }
 
-// sell is step 4, under a savepoint. It returns how many tickets were issued, or a reason
+// isTransient reports whether err is the kind that may not happen again if the same work is
+// tried later: the request was cancelled or ran out of time, the connection to the database
+// broke, or the database refused for a reason that passes (a lock or serialisation failure,
+// no resources, a shutdown). Everything else (a rule of the ticket service, a token that
+// cannot be signed, a constraint the row breaks) is deterministic: trying again gives the
+// same error.
+func isTransient(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		if len(pgErr.Code) < 2 {
+			return true
+		}
+		switch pgErr.Code[:2] {
+		// Connection, transaction rollback (serialisation, deadlock), insufficient
+		// resources, operator intervention (query cancelled, shutdown), system error.
+		case "08", "40", "53", "57", "58":
+			return true
+		}
+		return pgErr.Code == "55P03" // lock_not_available
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr) || errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) ||
+		errors.Is(err, pgx.ErrTxClosed) || pgconn.SafeToRetry(err)
+}
+
+// sell is step 5, under a savepoint. It returns how many tickets were issued, or a reason
 // when nothing could be sold; in that case every write it made has been undone.
 func (f *finishing) sell(ctx context.Context) (tickets int, shortReason string, err error) {
 	items, err := f.q.CountBookingItems(ctx, f.booking.ID)
@@ -485,22 +614,33 @@ func (f *finishing) sell(ctx context.Context) (tickets int, shortReason string, 
 
 	// Immediately after the seat write: nothing that can wait may come between.
 	issued, err := f.s.tickets.IssueForBooking(ctx, sp, f.booking.ID)
+	if err == nil && len(issued) != n {
+		err = fmt.Errorf("issued %d tickets for %d seats", len(issued), n)
+	}
 	switch {
-	case errors.Is(err, ticketing.ErrSeatsNotSold), errors.Is(err, ticketing.ErrSeatAlreadyTicketed),
-		errors.Is(err, ticketing.ErrEventCancelled), errors.Is(err, ticketing.ErrBookingEmpty):
-		// The ticket rules refuse this sale (the seats sold are not exactly the booking's
-		// items, or one already carries a live ticket). Tickets cannot be given, so the
-		// sale is undone and the money goes back.
-		f.s.log.ErrorContext(ctx, "tickets were refused for a payment that sold its seats; the sale was undone and a refund queued",
+	case err == nil:
+	case isTransient(err):
+		// It may work next time: the whole transaction is given up and the caller retries.
+		return 0, "", undo(fmt.Errorf("finish payment %d: issue tickets: %w", f.pay.ID, err))
+	default:
+		// The tickets cannot be made, and trying again will give the same answer: the ticket
+		// rules refuse this sale, or a ticket cannot be signed (a stand code that does not
+		// fit a gate group, for one). Rolling the whole transaction back, as an unknown error
+		// used to, would leave the fan's money with us and the payment open until it timed
+		// out, every time. A sale without tickets is not a sale: it is undone, and the money
+		// goes back.
+		f.s.log.ErrorContext(ctx, "tickets could not be issued for a payment that sold its seats; the sale was undone and a refund queued",
 			"payment_id", f.pay.ID, "booking_id", f.booking.ID, "err", err)
 		if err := undo(nil); err != nil {
 			return 0, "", err
 		}
-		return 0, reasonSeatsResold, nil
-	case err != nil:
-		return 0, "", undo(fmt.Errorf("finish payment %d: issue tickets: %w", f.pay.ID, err))
-	case len(issued) != n:
-		return 0, "", undo(fmt.Errorf("finish payment %d: issued %d tickets for %d seats", f.pay.ID, len(issued), n))
+		if errors.Is(err, ticketing.ErrSeatsNotSold) || errors.Is(err, ticketing.ErrSeatAlreadyTicketed) {
+			return 0, reasonSeatsResold, nil
+		}
+		if errors.Is(err, ticketing.ErrEventCancelled) {
+			return 0, reasonEventCancelled, nil
+		}
+		return 0, reasonNoTickets, nil
 	}
 	if err := sp.Commit(ctx); err != nil {
 		return 0, "", fmt.Errorf("finish payment %d: release savepoint: %w", f.pay.ID, err)
@@ -508,18 +648,20 @@ func (f *finishing) sell(ctx context.Context) (tickets int, shortReason string, 
 	return n, "", nil
 }
 
-// refund is step 5 (and the tail of step 3): queue the money to go back, mark the booking
-// and tell the organiser. The payment's own status has been written by the caller.
+// refund is step 6 (and the tail of step 4): queue the money to go back, mark the booking
+// and tell the organiser. The payment's own status has been written by the caller. paid is
+// always above zero and always an amount the provider's own answer stands behind.
 func (f *finishing) refund(ctx context.Context, out Finished, paid int64, reason, alertKind string) (Finished, error) {
 	out.Action, out.Reason = ActionRefund, reason
-	if paid > 0 {
-		// ON CONFLICT (payment_id) DO NOTHING: one payment is queued once. Event cancel
-		// relies on the same key.
-		if _, err := f.q.QueueRefund(ctx, store.QueueRefundParams{
-			BookingID: f.booking.ID, PaymentID: f.pay.ID, AmountCents: paid, Reason: reason,
-		}); err != nil {
-			return Finished{}, fmt.Errorf("finish payment %d: queue refund: %w", f.pay.ID, err)
-		}
+	if paid <= 0 {
+		return Finished{}, fmt.Errorf("finish payment %d: refusing to queue a refund of %d cents", f.pay.ID, paid)
+	}
+	// ON CONFLICT (payment_id) DO NOTHING: one payment is queued once. Event cancel relies
+	// on the same key.
+	if _, err := f.q.QueueRefund(ctx, store.QueueRefundParams{
+		BookingID: f.booking.ID, PaymentID: f.pay.ID, AmountCents: paid, Reason: reason,
+	}); err != nil {
+		return Finished{}, fmt.Errorf("finish payment %d: queue refund: %w", f.pay.ID, err)
 	}
 
 	switch from := domain.BookingStatus(f.booking.Status); from {
@@ -543,13 +685,34 @@ func (f *finishing) refund(ctx context.Context, out Finished, paid int64, reason
 	if err := f.alert(ctx, alertKind, msg); err != nil {
 		return Finished{}, err
 	}
-	return out, nil
+	return out, f.resolveUnresolvedAlerts(ctx, resolutionRefundQueued)
+}
+
+// What the system writes on an alert it closes itself (organiser_alerts.resolution).
+const (
+	resolutionSold         = "Resolved automatically: the payment succeeded and the tickets were issued."
+	resolutionRefundQueued = "Resolved automatically: the payment was received and a refund is queued for it."
+	resolutionRefundPaid   = "Resolved automatically: the refund was marked as paid back."
+)
+
+// resolveUnresolvedAlerts closes the open PAYMENT_UNRESOLVED alerts about this payment. Such
+// an alert says "we do not know what became of this payment; check the M-Pesa portal". Once
+// the payment has ended in tickets or in a queued refund that is no longer true, and leaving
+// it open sends staff to look for a problem that is solved. It is closed in the transaction
+// that settles the payment.
+func (f *finishing) resolveUnresolvedAlerts(ctx context.Context, resolution string) error {
+	if _, err := f.q.ResolveAlertsOfPayment(ctx, store.ResolveAlertsOfPaymentParams{
+		PaymentID: f.pay.ID, Kinds: []string{"PAYMENT_UNRESOLVED"}, Resolution: resolution,
+	}); err != nil {
+		return fmt.Errorf("finish payment %d: resolve alerts: %w", f.pay.ID, err)
+	}
+	return nil
 }
 
 func (f *finishing) alert(ctx context.Context, kind, message string) error {
-	bookingID := f.booking.ID
+	bookingID, paymentID := f.booking.ID, f.pay.ID
 	if _, err := f.q.InsertAlert(ctx, store.InsertAlertParams{
-		EventID: f.booking.EventID, BookingID: &bookingID, Kind: kind, Message: message,
+		EventID: f.booking.EventID, BookingID: &bookingID, PaymentID: &paymentID, Kind: kind, Message: message,
 	}); err != nil {
 		return fmt.Errorf("finish payment %d: raise %s alert: %w", f.pay.ID, kind, err)
 	}

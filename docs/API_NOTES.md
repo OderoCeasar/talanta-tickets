@@ -492,11 +492,15 @@ the 16 random bytes in each UUID.
   `HOLD_ALREADY_BOOKED`; the same key for another hold is 422 `IDEMPOTENCY_KEY_REUSED`. Two
   requests arriving together for one hold make one booking, whatever keys they carry.
 - **Money.** `items[].unit_price_cents` is copied from the seat's category when the booking
-  is made and never changes. `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal,
-  rounded down to a cent: the same sum the hold showed. `total_cents` is what M-Pesa is
-  asked for. M-Pesa takes whole shillings: a booking whose total is not a multiple of 100
-  cents (only a fee setting can cause it) is refused with 409 `BOOKING_NOT_PAYABLE`, never
-  rounded. `BOOKING_FEE_BPS` should be chosen so that fees come out in whole shillings.
+  is made and never changes. `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal
+  **rounded to the nearest whole shilling** (a multiple of 100 cents; half a shilling rounds
+  up): the same sum the hold showed. So any fee rate gives a payable booking
+  (`BOOKING_FEE_BPS=250` on a KES 1,500 seat is KES 38.00, not 37.50). `total_cents` is what
+  M-Pesa is asked for. M-Pesa takes whole shillings: a booking whose total is not a multiple
+  of 100 cents is refused with 409 `BOOKING_NOT_PAYABLE`, never rounded. Only a category
+  **price** with cents in it can cause that now. Prices should be whole shillings; the API
+  does not refuse one that is not yet (the category handlers belong to the events work, see
+  `docs/STATUS.md`).
 - **`hold_expires_at`** is set while the booking is `PENDING_PAYMENT` and null afterwards.
   `latest_payment` is the newest attempt, of any status. `tickets` is empty until `PAID`.
 - **Owner only.** `GET /bookings/{reference}` and `GET /payments/{paymentId}` find a row
@@ -508,9 +512,21 @@ the 16 random bytes in each UUID.
   only; anything else is 400 on `phone`. The first payment pushes the hold's expiry out to
   6 minutes, once. Any payment needs 2 minutes left on the hold; with less it is 409
   `HOLD_EXPIRED` whose `details.hold_status` is `ACTIVE`. A booking with a live payment
-  answers 409 `PAYMENT_IN_PROGRESS` naming it. When M-Pesa does not take the request the
-  answer is 502 and the attempt is kept as a `FAILED` payment (`failure_reason: other`);
-  the fan can retry at once. 30 bookings-plus-payments a minute per user.
+  answers 409 `PAYMENT_IN_PROGRESS` naming it. 30 bookings-plus-payments a minute per user.
+  What M-Pesa does with the request has three answers:
+  - it accepts: **202**, payment `PENDING`;
+  - the request provably did not reach it, or it refused (no connection, a 4xx, Daraja's own
+    error): **502** `PAYMENT_PROVIDER_UNAVAILABLE`, the attempt is kept as a `FAILED`
+    payment (`failure_reason: other`) and the fan can retry at once;
+  - we cannot tell (it timed out after it was sent, the answer was unreadable): **202**,
+    payment `PENDING`, and `result_desc` is "We are checking with M-Pesa whether the
+    request went through. Do not pay again yet." The fan may or may not get a prompt. A
+    second payment is refused with `PAYMENT_IN_PROGRESS` until this one resolves (by its
+    callback, or `TIMEOUT` after 5 minutes), so the fan cannot pay twice. Clients should
+    show that text when `status` is `PENDING` and `result_desc` is not null.
+- **`Payment` no longer carries `checkout_request_id` or `merchant_request_id`.** They were
+  removed from the schema: the CheckoutRequestID is the key callbacks are matched by, and
+  no client used it for anything.
 - **How a payment ends** (the same table is in the contract under the STK operation):
 
   | What happened | `Payment.status` | `failure_reason` | `booking_status` |
@@ -523,49 +539,106 @@ the 16 random bytes in each UUID.
   | Paid twice (a second payment for a `PAID` booking) | `SUCCESS` | null | `PAID`: tickets kept, that payment refunded |
 
   So `status: SUCCESS` alone does not mean tickets: read `booking_status`. A `FAILED`
-  payment with `failure_reason: wrong_amount` has `result_code` 0 and an `mpesa_receipt`:
-  the money did arrive and is in the refund queue.
-- **Polling.** Stop when `status` is `SUCCESS`, `FAILED` or `TIMEOUT`. A `TIMEOUT` payment
-  can still become `SUCCESS` or `FAILED` if M-Pesa reports late, and the fan may start
-  another payment meanwhile; `GET /bookings/{reference}` always shows the truth, and is
-  what the app resumes from after being closed.
+  payment with `failure_reason: wrong_amount` has `result_code` 0: M-Pesa itself reported a
+  different amount, and that amount is in the refund queue. (Against real Daraja this cannot
+  happen: its query names no amount and a prompt cannot be paid in part or in excess. The
+  mock's `wrong_amount` outcome is the provider reporting a different amount.) One more row:
+  **paid, but the tickets could not be issued** is `SUCCESS` / `REFUND_REQUIRED`, refunded.
+- **Polling.** Stop when `status` is `SUCCESS`, `FAILED` or `TIMEOUT`. **Neither `FAILED`
+  nor `TIMEOUT` is always the last word**: if M-Pesa later confirms the money arrived, the
+  payment becomes `SUCCESS` (seats sold if the hold still has them all, otherwise a refund).
+  The fan may start another payment meanwhile; `GET /bookings/{reference}` always shows the
+  truth, and is what the app resumes from after being closed.
 - **Late money.** When a payment succeeds after its hold ran out: if nobody took a seat of
   the hold and no sweeper closed it, the seats are sold and the booking is `PAID` as if it
   had been on time. If any seat was taken by someone else, or the hold was closed, nothing
   is sold: payment `SUCCESS`, booking `REFUND_REQUIRED`, a refund for the amount paid, an
   organiser alert. The same when the event was cancelled meanwhile. No seat is ever sold
   twice to make the ledger come out right.
-- **The callback, `POST /v1/webhooks/mpesa/callback`.** Always 200
-  `{"ResultCode":0,"ResultDesc":"Accepted"}`, at once, for any body from any address. No
-  token is read (a stray `Authorization` header changes nothing). It is acted on only when
-  it comes from `MPESA_CALLBACK_ALLOWED_CIDRS`, is Daraja's envelope (at most 64 KiB),
-  names a `CheckoutRequestID` of a payment that is still open, and its `Amount` equals the
-  booking total. A success with no readable amount, or with a receipt that already belongs
-  to another payment, is not applied: the server asks Daraja instead. The body is stored
-  in `payments.raw_callback`. `Amount` is read as a decimal number of shillings (`1000`,
-  `1000.00`), never through a float.
-- **Reconciliation** (worker, every `RECONCILE_INTERVAL`, 30 s). A payment still live 60
-  seconds after it was made is asked about with STK query and settled exactly as a
-  callback would have settled it. After 5 minutes with no final answer it is `TIMEOUT` and
-  the organiser gets a `PAYMENT_UNRESOLVED` alert. A payment whose request never reached
-  M-Pesa (a crash) is closed as `TIMEOUT` after 60 seconds with no alert.
+- **The callback, `POST /v1/webhooks/mpesa/callback`.** 200
+  `{"ResultCode":0,"ResultDesc":"Accepted"}` for any body from any address; no token is read.
+  A callback is taken up only when it comes from `MPESA_CALLBACK_ALLOWED_CIDRS` and is
+  Daraja's envelope (at most 64 KiB; a `ResultCode` that does not fit 32 bits is not one).
+  Then:
+  - **It is written down before the 200 is sent** (`payment_callbacks`, the inbox). The work
+    runs after the answer and, if it cannot finish (the event is busy, Daraja cannot be
+    asked, the API restarts), the worker's drain job (`CALLBACK_DRAIN_INTERVAL`, 5 s) tries
+    again with a growing wait, for 7 days, then raises a `PAYMENT_UNRESOLVED` alert. If the
+    callback cannot be written down the answer is **503**, not "Accepted".
+  - **The body is a hint, never the authority.** A "paid" is confirmed with Daraja's
+    authenticated STK query before anything is sold or refunded; if the query cannot be
+    made the payment stays as it is and the callback waits. A failure is taken from the body
+    when its code is a documented final failure (1, 1001, 1019, 1025, 1032, 1037, 2001,
+    9999); any other non-zero code is checked with Daraja and, if Daraja has no final
+    answer, left to reconciliation.
+  - **`Amount` is never money.** A confirmed payment is paid in full at the amount we
+    requested. A body naming another amount raises an `AMOUNT_MISMATCH` alert ("no refund
+    was queued for the callback's figure") and changes nothing else. A forged
+    `Amount: 900000.00` no longer queues a refund of KES 900,000.
+  - **A success for a `FAILED` or `TIMEOUT` payment is applied** (money received after
+    all). A failure for a `SUCCESS` payment is ignored.
+  - **A "paid" for an ID no payment has** is stored (`unmatched_callbacks`), raises a
+    `PAYMENT_UNRESOLVED` alert naming the receipt, amount and phone, and is matched to a
+    payment that has no M-Pesa ID by phone + amount + time (started within 24 hours before
+    it arrived, exactly one candidate). The match alone decides nothing: the ID is written
+    on the payment only once Daraja confirms that ID was paid; then the normal path runs.
+    A failure for an unknown ID is logged and dropped.
+  - With `PAYMENT_PROVIDER=none` every callback is ignored (200, nothing stored).
+  The body is kept in the inbox, and in `payments.raw_callback` once its result has been
+  applied. `Amount` is read as a decimal number of shillings, never through a float.
+- **Reconciliation** (worker, every `RECONCILE_INTERVAL`, 30 s), in this order:
+  1. Live payments with **no M-Pesa ID** (no call to Daraja is needed, so a slow Daraja
+     cannot hold them up). Provably never sent: `TIMEOUT` at 60 seconds, no alert. Possibly
+     sent: left until 5 minutes in case the callback comes, then `TIMEOUT` **with** a
+     `PAYMENT_UNRESOLVED` alert naming the phone and amount to look for.
+  2. Live payments with an ID, 60 seconds old: asked about with STK query and settled as a
+     callback would have settled them. Only a code Daraja documents as a final failure
+     closes a payment; "still under processing" (4999) and unknown codes are "ask again".
+     After 5 minutes with no final answer: `TIMEOUT` and a `PAYMENT_UNRESOLVED` alert.
+  3. **`TIMEOUT` payments with an ID are asked about again**: every 5 minutes for 24 hours,
+     then daily until they are 7 days old. Daraja's last word reaches the same finishing
+     function with no callback at all.
+  A run stops starting Daraja calls after a minute; the rest waits for the next run.
 - **Release and the sweeper.** `DELETE /holds/{id}` is 409 `PAYMENT_IN_PROGRESS` while a
   payment is live. The sweeper frees a lapsed hold's seats but leaves a booking with a live
   payment `PENDING_PAYMENT`; when that payment fails the booking becomes `EXPIRED`, and if
   it succeeds it is refunded.
-- **Alerts** (`GET /admin/alerts`, newest first). `REFUND_REQUIRED`: a payment bought
-  nothing, or was a second payment for a paid booking. `AMOUNT_MISMATCH`: wrong amount.
-  `PAYMENT_UNRESOLVED`: no answer from M-Pesa in 5 minutes. `acknowledged=false` gives the
-  open ones; acknowledging twice keeps the first time.
-- **Refunds** (`GET /admin/refunds`, oldest first). One per payment that has to go back,
-  for the amount actually received; `phone` is the number that paid. Event cancel queues
-  one per successful payment the same way. `POST /admin/refunds/{id}/complete` records
-  that it was paid by hand: the refund is `DONE`; a `REFUND_REQUIRED` booking with no
-  refund left pending becomes `REFUNDED` and any ticket it still has is voided; a `PAID`
-  booking (duplicate payment) stays `PAID` with its tickets. **Seats are not touched**: a
-  `REFUND_REQUIRED` booking of a live event owns no sold seat, and a cancelled event's
-  sold seats stay `SOLD` (the event is off). There is no way to refund one paid booking of
-  a live event and put its seats back on sale.
+- **Alerts** (`GET /admin/alerts`, newest first). Each carries `event_title` as well as
+  `event_id`. `REFUND_REQUIRED`: a payment bought nothing, or was a second payment for a paid
+  booking. `AMOUNT_MISMATCH`: M-Pesa reported a wrong amount (refund queued), or a callback
+  named an amount other than the one requested (no refund queued; check the statement).
+  `PAYMENT_UNRESOLVED`: we do not know what became of some money (no answer in 5 minutes; a
+  request that may have reached M-Pesa under an ID we never learned; a payment M-Pesa
+  reports that matches no booking; a callback that could not be confirmed in 7 days).
+  `acknowledged=false` gives the open ones; acknowledging twice keeps the first time.
+  **The system closes an alert itself when what it asks for is done**, in the same
+  transaction, and says so in `resolution` (null for an open alert and for one a person
+  acknowledged):
+  - a `PAYMENT_UNRESOLVED` alert, when its payment later ends in tickets ("Resolved
+    automatically: the payment succeeded and the tickets were issued.") or in a queued
+    refund ("…a refund is queued for it.");
+  - a `REFUND_REQUIRED` or `AMOUNT_MISMATCH` alert, when the refund of its payment is marked
+    as paid back ("Resolved automatically: the refund was marked as paid back.").
+  An alert a person already acknowledged is never rewritten, and an alert with no payment
+  behind it (an unmatched callback that stays unmatched) is only ever closed by a person.
+  An unmatched callback's alert is filed under the event its phone last paid for, or the
+  newest event, because an alert must belong to an event; its message says it may not be
+  that event's.
+- **Refunds** (`GET /admin/refunds`, oldest first; `status`, `event_id` and
+  `booking_reference` filter it). One per payment that has to go back, for the amount M-Pesa
+  confirmed; `phone` is the number that paid; `booking_status` is the booking's status now.
+  Event cancel queues one per successful payment the same way.
+  `POST /admin/refunds/{id}/complete` records that it was paid by hand: the refund is
+  `DONE`; a `REFUND_REQUIRED` booking with no refund left pending becomes `REFUNDED` and any
+  ticket it still has is voided; a `PAID` booking (duplicate payment) stays `PAID` with its
+  tickets. It answers 200 every time; `already_completed` is `false` on the call that did
+  the work and `true` on a repeat (the field is only in this operation's answer). **Seats
+  are not touched**: a `REFUND_REQUIRED` booking of a live event owns no sold seat, and a
+  cancelled event's sold seats stay `SOLD` (the event is off). There is no way to refund one
+  paid booking of a live event and put its seats back on sale.
+- **Sales summary.** `refund_required_cents` is every refund of the event still pending,
+  whatever its booking's status (a second payment on a booking that stays `PAID` counts),
+  plus the total of a `REFUND_REQUIRED` booking with no refund row yet.
 - **Mock payments (development and test only).** `X-Mock-Outcome` on the STK call:
   `success`, `insufficient_funds`, `wrong_pin`, `user_cancel`, `timeout`, `no_callback`
   (the worker's reconciliation finds the success after a minute), `duplicate_callback`,
@@ -575,11 +648,24 @@ the 16 random bytes in each UUID.
   other number succeeds. The callback arrives after `MOCK_CALLBACK_DELAY` (2 s). In
   production the header is 403 `MOCK_NOT_ALLOWED` before anything else is read, and the
   mock provider cannot be configured.
-- **Contract changes made with this work** (descriptions unless said): `createBooking`,
+- **Contract changes made with the money-path review** (after the M7 work):
+  - `Payment`: **`checkout_request_id` and `merchant_request_id` removed** (generated
+    TypeScript type changes in mobile and admin).
+  - `Alert`: `event_title` (string) and `resolution` (string or null) added, both required.
+  - `Refund`: `booking_status` added (required); `already_completed` (boolean, optional,
+    only in the answer of `completeRefund`).
+  - `listRefunds`: optional query parameter `booking_reference`.
+  - `mpesaCallback`: a **503** answer (`MpesaCallbackNotStored`) when a real callback could
+    not be stored.
+  - `startMpesaStkPush`: no schema change; 202 now also covers "may have reached M-Pesa"
+    (`result_desc` set on a `PENDING` payment), 502 means "provably not sent or refused".
+  - Descriptions only: `fee_cents` (whole shillings), `AlertKind`, `Payment.failure_reason`,
+    `Payment.result_desc`, `Refund.amount_cents`, category prices, the outcome table.
+- **Contract changes made with the M7 work** (descriptions unless said): `createBooking`,
   `startMpesaStkPush` gained `EVENT_BUSY` in their 409 list and `completeRefund` gained a
   409 answer (`EVENT_BUSY`), the one change that adds a response to an operation;
   the STK operation documents the outcome table, the 2-minute rule, phone forms and the
   magic numbers; `Payment.status`, `Payment.failure_reason`, `PaymentStatus`,
   `PaymentFailureReason`, `BookingStatus`, `MockOutcome`, `AlertKind`, `HoldStateDetails`,
   `getPayment`, `mpesaCallback` and `completeRefund` say what the code does. No schema
-  gained, lost or renamed a field.
+  gained, lost or renamed a field in that work.

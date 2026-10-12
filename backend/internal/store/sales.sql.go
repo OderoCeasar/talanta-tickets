@@ -16,13 +16,11 @@ SELECT
                WHERE b.event_id = $1 AND b.status = 'PAID'), 0)::bigint AS revenue_cents,
     (SELECT count(*) FROM bookings b
       WHERE b.event_id = $1 AND b.status = 'REFUND_REQUIRED')::bigint AS refund_required_count,
-    COALESCE((SELECT sum(CASE
-                  WHEN EXISTS (SELECT 1 FROM refunds r WHERE r.booking_id = b.id)
-                  THEN COALESCE((SELECT sum(r.amount_cents) FROM refunds r
-                                  WHERE r.booking_id = b.id AND r.status = 'PENDING'), 0)
-                  ELSE b.total_cents END)
-               FROM bookings b
-               WHERE b.event_id = $1 AND b.status = 'REFUND_REQUIRED'), 0)::bigint AS refund_required_cents,
+    (COALESCE((SELECT sum(r.amount_cents) FROM refunds r JOIN bookings b ON b.id = r.booking_id
+                WHERE b.event_id = $1 AND r.status = 'PENDING'), 0)
+     + COALESCE((SELECT sum(b.total_cents) FROM bookings b
+                  WHERE b.event_id = $1 AND b.status = 'REFUND_REQUIRED'
+                    AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.booking_id = b.id)), 0))::bigint AS refund_required_cents,
     (SELECT count(*) FROM organiser_alerts a
       WHERE a.event_id = $1 AND a.acknowledged_at IS NULL)::bigint AS open_alert_count
 `
@@ -35,8 +33,9 @@ type GetEventSalesTotalsRow struct {
 }
 
 // Money figures of the sales dashboard. Revenue counts PAID bookings only. What is owed back
-// on a REFUND_REQUIRED booking is its refunds still PENDING; a refund that is DONE no longer
-// counts. Only a booking with no refund row at all (none queued yet) counts its whole total.
+// is every refund of the event still PENDING, whatever its booking's status: a second payment
+// for a booking that stays PAID is owed back too. A refund that is DONE no longer counts. A
+// REFUND_REQUIRED booking with no refund row at all (none queued yet) counts its whole total.
 func (q *Queries) GetEventSalesTotals(ctx context.Context, eventID int64) (GetEventSalesTotalsRow, error) {
 	row := q.db.QueryRow(ctx, getEventSalesTotals, eventID)
 	var i GetEventSalesTotalsRow
@@ -138,7 +137,7 @@ func (q *Queries) ListEventBookings(ctx context.Context, arg ListEventBookingsPa
 }
 
 const listLatestPaymentsForBookings = `-- name: ListLatestPaymentsForBookings :many
-SELECT DISTINCT ON (p.booking_id) p.id, p.booking_id, p.provider, p.amount_cents, p.phone_e164, p.status, p.merchant_request_id, p.checkout_request_id, p.mpesa_receipt, p.result_code, p.result_desc, p.raw_callback, p.created_at, p.completed_at, p.last_queried_at, p.query_attempts
+SELECT DISTINCT ON (p.booking_id) p.id, p.booking_id, p.provider, p.amount_cents, p.phone_e164, p.status, p.merchant_request_id, p.checkout_request_id, p.mpesa_receipt, p.result_code, p.result_desc, p.raw_callback, p.created_at, p.completed_at, p.last_queried_at, p.query_attempts, p.dispatch
 FROM payments p
 WHERE p.booking_id = ANY($1::bigint[])
 ORDER BY p.booking_id, p.created_at DESC, p.id DESC
@@ -170,6 +169,7 @@ func (q *Queries) ListLatestPaymentsForBookings(ctx context.Context, bookingIds 
 			&i.CompletedAt,
 			&i.LastQueriedAt,
 			&i.QueryAttempts,
+			&i.Dispatch,
 		); err != nil {
 			return nil, err
 		}

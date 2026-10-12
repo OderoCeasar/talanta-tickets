@@ -191,6 +191,36 @@ var ledgerInvariants = []invariant{
 		FROM payments p JOIN bookings b ON b.id = p.booking_id
 		WHERE b.event_id = $1 AND p.status = 'SUCCESS' AND b.status <> 'PAID'
 		  AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.payment_id = p.id)`},
+	// The governing rule of the money path: once there is evidence that money moved for a
+	// payment, it ends with tickets (SUCCESS, checked above) or with a refund row. A payment
+	// that is FAILED or TIMEOUT and shows any of these has dropped money on the floor unless
+	// a refund is queued for it:
+	//   - its result code is M-Pesa's success code (the wrong-amount case);
+	//   - the callback body stored on it says ResultCode 0;
+	//   - a row of the callback inbox says it was paid and was either put through the
+	//     finishing function (APPLIED) or given up on (ABANDONED). A row that M-Pesa's own
+	//     answer contradicted (REFUTED), one left to reconciliation (DEFERRED) and one still
+	//     waiting to be worked on (no verdict) are not evidence: the first two are M-Pesa
+	//     saying no money moved, the last is work in flight;
+	//   - an unmatched "paid" callback was tied to it after M-Pesa confirmed the callback.
+	{"a FAILED or TIMEOUT payment with evidence that it was paid has a refund", `
+		SELECT format('payment %s is %s with evidence that it was paid (%s) and has no refund', p.id, p.status, ev.what)
+		FROM payments p
+		JOIN bookings b ON b.id = p.booking_id
+		CROSS JOIN LATERAL (
+		    SELECT evidence.what FROM (
+		        SELECT 'its result code is 0' AS what WHERE p.result_code = 0
+		        UNION ALL
+		        SELECT 'its stored callback says ResultCode 0' WHERE p.raw_callback #>> '{Body,stkCallback,ResultCode}' = '0'
+		        UNION ALL
+		        SELECT format('callback inbox row %s, %s', c.id, c.verdict) FROM payment_callbacks c
+		         WHERE c.payment_id = p.id AND c.result_code = 0 AND c.verdict IN ('APPLIED', 'ABANDONED')
+		        UNION ALL
+		        SELECT format('unmatched callback %s was matched to it', u.id) FROM unmatched_callbacks u
+		         WHERE u.matched_payment_id = p.id
+		    ) evidence LIMIT 1) ev
+		WHERE b.event_id = $1 AND p.status IN ('FAILED', 'TIMEOUT')
+		  AND NOT EXISTS (SELECT 1 FROM refunds r WHERE r.payment_id = p.id)`},
 	{"a booking has at most one live payment", `
 		SELECT format('booking %s has %s live payments', p.booking_id, count(*))
 		FROM payments p JOIN bookings b ON b.id = p.booking_id

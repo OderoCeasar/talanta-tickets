@@ -61,6 +61,28 @@ type Policy struct {
 	ReconcileLease time.Duration
 	// ReconcileBatch is how many payments one run takes.
 	ReconcileBatch int
+	// ReconcileBudget bounds how long one run keeps starting calls to the provider. A slow
+	// M-Pesa then delays the payments it is slow about, not every other payment: what a run
+	// did not get to is left unclaimed for the next one.
+	ReconcileBudget time.Duration
+	// Requery is how often, and for how long, M-Pesa keeps being asked about a payment that
+	// was closed as TIMEOUT (see store.RequerySchedule).
+	Requery store.RequerySchedule
+	// CallbackLease is how long a stored callback one worker has taken is left alone by the
+	// others. It must cover a provider query and a finishing transaction.
+	CallbackLease time.Duration
+	// CallbackRetryBase and CallbackRetryMax bound the wait before a stored callback that
+	// could not be dealt with is tried again: it doubles from the base up to the maximum.
+	CallbackRetryBase, CallbackRetryMax time.Duration
+	// CallbackGiveUpAfter is when a stored callback that still cannot be dealt with is
+	// abandoned, with an alert.
+	CallbackGiveUpAfter time.Duration
+	// CallbackBatch is how many stored callbacks one drain run takes at a time.
+	CallbackBatch int
+	// UnmatchedWindow is how long before an unknown-ID callback arrived a payment may have
+	// been started and still be the one it is for. UnmatchedGiveUpAfter is when such a
+	// callback stops being retried.
+	UnmatchedWindow, UnmatchedGiveUpAfter time.Duration
 	// PhoneCountryCodes are the calling codes (digits, no plus) a payment may be sent to.
 	PhoneCountryCodes []string
 }
@@ -68,16 +90,28 @@ type Policy struct {
 // DefaultPolicy is what production runs.
 func DefaultPolicy() Policy {
 	return Policy{
-		HoldWindow:        6 * time.Minute,
-		MinHoldRemaining:  2 * time.Minute,
-		EventLockWait:     3 * time.Second,
-		InitiateTimeout:   30 * time.Second,
-		QueryTimeout:      15 * time.Second,
-		ReconcileAfter:    60 * time.Second,
-		GiveUpAfter:       5 * time.Minute,
-		ReconcileLease:    20 * time.Second,
-		ReconcileBatch:    100,
-		PhoneCountryCodes: []string{"254"},
+		HoldWindow:       6 * time.Minute,
+		MinHoldRemaining: 2 * time.Minute,
+		EventLockWait:    3 * time.Second,
+		InitiateTimeout:  30 * time.Second,
+		QueryTimeout:     15 * time.Second,
+		ReconcileAfter:   60 * time.Second,
+		GiveUpAfter:      5 * time.Minute,
+		ReconcileLease:   20 * time.Second,
+		ReconcileBatch:   100,
+		ReconcileBudget:  time.Minute,
+		// Every five minutes for a day, then daily for a week.
+		Requery: store.RequerySchedule{
+			Every: 5 * time.Minute, DenseFor: 24 * time.Hour, SparseEvery: 24 * time.Hour, Until: 7 * 24 * time.Hour,
+		},
+		CallbackLease:        time.Minute,
+		CallbackRetryBase:    5 * time.Second,
+		CallbackRetryMax:     5 * time.Minute,
+		CallbackGiveUpAfter:  7 * 24 * time.Hour,
+		CallbackBatch:        50,
+		UnmatchedWindow:      24 * time.Hour,
+		UnmatchedGiveUpAfter: 24 * time.Hour,
+		PhoneCountryCodes:    []string{"254"},
 	}
 }
 
@@ -91,10 +125,14 @@ type Config struct {
 	Background *Background
 	// Policy zero values are replaced by DefaultPolicy's.
 	Policy Policy
+	// Now is the clock that measures how long a reconciliation or drain run has been going
+	// (Policy.ReconcileBudget). Nil means time.Now. No rule about a payment reads it.
+	Now func() time.Time
 }
 
 // Service starts, finishes and reconciles payments. It is safe for concurrent use. Like the
-// hold service it keeps no clock: every time that matters is read from the database.
+// hold service it keeps no clock for its rules: every time that matters to a payment is read
+// from the database. (now only measures how long a background run has been working.)
 type Service struct {
 	db       DB
 	q        *store.Queries
@@ -103,6 +141,9 @@ type Service struct {
 	tickets  TicketIssuer
 	bg       *Background
 	policy   Policy
+	now      func() time.Time
+	// off is true when the provider takes no payments ("none"): callbacks are ignored.
+	off bool
 }
 
 // NewService checks its dependencies and builds the service.
@@ -144,6 +185,27 @@ func NewService(cfg Config) (*Service, error) {
 	if p.ReconcileBatch <= 0 {
 		p.ReconcileBatch = def.ReconcileBatch
 	}
+	setDuration(&p.ReconcileBudget, def.ReconcileBudget)
+	setDuration(&p.Requery.Every, def.Requery.Every)
+	setDuration(&p.Requery.DenseFor, def.Requery.DenseFor)
+	setDuration(&p.Requery.SparseEvery, def.Requery.SparseEvery)
+	setDuration(&p.Requery.Until, def.Requery.Until)
+	setDuration(&p.CallbackLease, def.CallbackLease)
+	setDuration(&p.CallbackRetryBase, def.CallbackRetryBase)
+	setDuration(&p.CallbackRetryMax, def.CallbackRetryMax)
+	setDuration(&p.CallbackGiveUpAfter, def.CallbackGiveUpAfter)
+	setDuration(&p.UnmatchedWindow, def.UnmatchedWindow)
+	setDuration(&p.UnmatchedGiveUpAfter, def.UnmatchedGiveUpAfter)
+	if p.CallbackBatch <= 0 {
+		p.CallbackBatch = def.CallbackBatch
+	}
+	if cfg.Now == nil {
+		cfg.Now = time.Now
+	}
+	off := false
+	if sw, ok := cfg.Provider.(Switch); ok {
+		off = !sw.TakesPayments()
+	}
 	if len(p.PhoneCountryCodes) == 0 {
 		p.PhoneCountryCodes = def.PhoneCountryCodes
 	}
@@ -155,7 +217,7 @@ func NewService(cfg Config) (*Service, error) {
 	}
 	return &Service{
 		db: cfg.DB, q: store.New(cfg.DB), log: cfg.Logger, provider: cfg.Provider,
-		tickets: cfg.Tickets, bg: cfg.Background, policy: p,
+		tickets: cfg.Tickets, bg: cfg.Background, policy: p, now: cfg.Now, off: off,
 	}, nil
 }
 
@@ -216,10 +278,17 @@ func (s *Service) load(ctx context.Context, paymentID int64) (Payment, error) {
 //  4. no payment of the booking may be live: PAYMENT_IN_PROGRESS;
 //  5. the payment row, INITIATED.
 //
-// Then, outside any transaction, the provider is asked. Accepted: the payment becomes
-// PENDING with the provider's IDs. Refused or unreachable: the payment becomes FAILED and the
-// answer is PAYMENT_PROVIDER_UNAVAILABLE; the booking stays payable for as long as its hold
-// lives.
+// Then, outside any transaction, the provider is asked. There are three answers:
+//
+//   - Accepted: the payment becomes PENDING with the provider's IDs.
+//   - Provably not sent (payments.NotSent: no connection, an explicit refusal): the payment
+//     becomes FAILED and the answer is PAYMENT_PROVIDER_UNAVAILABLE; the booking stays
+//     payable for as long as its hold lives.
+//   - Anything else is ambiguous: the request may be with M-Pesa. The payment stays live,
+//     PENDING with no provider ID, and is returned like an accepted one (its result_desc
+//     says we are checking). A second payment is refused with PAYMENT_IN_PROGRESS until it
+//     resolves: by the callback (matched by phone and amount, confirmed by a query), or by
+//     reconciliation closing it TIMEOUT with an alert.
 func (s *Service) Start(ctx context.Context, userID, bookingID int64, rawPhone string) (Payment, error) {
 	phone, ok := domain.NormalisePhone(rawPhone)
 	if !ok || !domain.PhoneHasCountryCode(phone, s.policy.PhoneCountryCodes) {
@@ -277,12 +346,32 @@ func (s *Service) Start(ctx context.Context, userID, bookingID int64, rawPhone s
 		PaymentID: pay.ID, Reference: pre.Reference, AmountCents: pay.AmountCents, Phone: phone,
 	})
 	if err == nil && init.CheckoutRequestID == "" {
+		// Accepted, so it is with M-Pesa; but there is nothing to find it by. Ambiguous.
 		err = errors.New("the provider accepted the request without a checkout request ID")
 	}
 	recordCtx, cancelRecord := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 	defer cancelRecord()
-	if err != nil {
+
+	switch {
+	case err == nil:
+		if rerr := s.recordAccepted(recordCtx, pay.ID, init); rerr != nil {
+			// M-Pesa has the request and the row does not have its IDs. The row stays live
+			// with no ID: the callback, which will carry an ID no payment has, is stored and
+			// matched to it by phone and amount, and if nothing comes reconciliation closes
+			// it with an alert. The IDs are logged so a person can find the payment.
+			s.log.ErrorContext(ctx, "M-Pesa accepted the request but its IDs could not be recorded; the payment stays live without them",
+				"payment_id", pay.ID, "booking_id", bookingID, "checkout_request_id", init.CheckoutRequestID,
+				"merchant_request_id", init.MerchantRequestID, "err", rerr)
+			return Payment{}, rerr
+		}
+		return s.load(recordCtx, pay.ID)
+
+	case IsNotSent(err):
+		// Proof that nothing reached M-Pesa: no money can move. FAILED, and the fan may retry.
 		s.log.WarnContext(ctx, "payment provider did not accept the request", "payment_id", pay.ID, "booking_id", bookingID, "err", err)
+		if _, merr := s.q.SetPaymentNotSent(recordCtx, pay.ID); merr != nil {
+			s.log.ErrorContext(ctx, "could not record that the request was never sent", "payment_id", pay.ID, "err", merr)
+		}
 		if _, ferr := s.Finish(recordCtx, pay.ID, Result{
 			Source: SourceInternal, Outcome: OutcomeFailed, ResultDesc: "M-Pesa did not accept the request.",
 		}); ferr != nil {
@@ -291,11 +380,49 @@ func (s *Service) Start(ctx context.Context, userID, bookingID int64, rawPhone s
 				"payment_id", pay.ID, "err", ferr)
 		}
 		return Payment{}, domain.PaymentProviderUnavailable(err)
+
+	default:
+		// The request may be with M-Pesa (it timed out after it was sent, the connection
+		// dropped mid-answer, the answer could not be read). The fan may be looking at a
+		// prompt, and may pay. Closing the payment here would throw that money away, and
+		// would let the fan start a second payment and pay twice. So it stays live.
+		s.log.ErrorContext(ctx, "the STK request may have reached M-Pesa but its answer was lost; the payment stays live without a provider ID",
+			"payment_id", pay.ID, "booking_id", bookingID, "err", err)
+		if rerr := s.recordUnknownID(recordCtx, pay.ID); rerr != nil {
+			// Still INITIATED, with nothing recorded about the send: reconciliation treats
+			// that exactly as it treats this case.
+			s.log.ErrorContext(ctx, "could not mark the payment as waiting on M-Pesa; it stays INITIATED and reconciliation will close it with an alert",
+				"payment_id", pay.ID, "err", rerr)
+			return Payment{}, rerr
+		}
+		return s.load(recordCtx, pay.ID)
 	}
-	if err := s.recordAccepted(recordCtx, pay.ID, init); err != nil {
-		return Payment{}, err
-	}
-	return s.load(recordCtx, pay.ID)
+}
+
+// recordUnknownID moves a payment INITIATED -> PENDING with no provider ID, marked as
+// possibly sent. It locks the payment row alone (store.LockPaymentAlone says why that is safe).
+func (s *Service) recordUnknownID(ctx context.Context, paymentID int64) error {
+	return store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
+		pay, err := store.LockPaymentAlone(ctx, tx, paymentID)
+		if err != nil {
+			return fmt.Errorf("lock payment %d: %w", paymentID, err)
+		}
+		from := domain.PaymentStatus(pay.Status)
+		if err := domain.TransitionPayment(from, domain.PaymentPending); err != nil {
+			// Closed, or already PENDING, by someone else while the provider was being asked.
+			return nil
+		}
+		n, err := store.New(tx).SetPaymentPendingUnknownID(ctx, store.SetPaymentPendingUnknownIDParams{
+			ID: paymentID, FromStatus: string(from), ResultDesc: domain.PaymentUnknownIDMessage,
+		})
+		if err != nil {
+			return fmt.Errorf("mark payment %d as waiting on M-Pesa: %w", paymentID, err)
+		}
+		if n != 1 {
+			return fmt.Errorf("mark payment %d as waiting on M-Pesa: changed under its row lock", paymentID)
+		}
+		return nil
+	})
 }
 
 func (s *Service) startTx(ctx context.Context, tx pgx.Tx, userID int64, pre store.Booking, phone string) (store.Payment, error) {

@@ -258,6 +258,12 @@ type envConfig struct {
 	provider func(m *mock.Provider) payments.Provider
 	// callbackAllowed is MPESA_CALLBACK_ALLOWED_CIDRS; empty allows every address.
 	callbackAllowed []netip.Prefix
+	// ticketIssuer wraps the ticket service the payment flow issues through (one that fails).
+	ticketIssuer func(real payments.TicketIssuer) payments.TicketIssuer
+	// paymentDB wraps the pool the payment service runs on (one that can be switched off).
+	paymentDB func(real payments.DB) payments.DB
+	// paymentNow is the clock that measures a reconciliation run's time budget; nil is time.Now.
+	paymentNow func() time.Time
 }
 
 type envOption func(*envConfig)
@@ -375,8 +381,16 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	if cfg.paymentPolicy.ReconcileLease == 0 {
 		cfg.paymentPolicy.ReconcileLease = -1
 	}
+	var issuer payments.TicketIssuer = e.tickets
+	if cfg.ticketIssuer != nil {
+		issuer = cfg.ticketIssuer(e.tickets)
+	}
+	var paymentDB payments.DB = db.Pool
+	if cfg.paymentDB != nil {
+		paymentDB = cfg.paymentDB(db.Pool)
+	}
 	e.payments, err = payments.NewService(payments.Config{
-		DB: db.Pool, Logger: logger, Provider: provider, Tickets: e.tickets, Policy: cfg.paymentPolicy,
+		DB: paymentDB, Logger: logger, Provider: provider, Tickets: issuer, Policy: cfg.paymentPolicy, Now: cfg.paymentNow,
 	})
 	require.NoError(t, err)
 	// The mock's callback goes through the same function the webhook uses, here on the
@@ -392,6 +406,11 @@ func newEnv(t *testing.T, opts ...envOption) *env {
 	// closed here. Tests in this package do not run in parallel.
 	t.Cleanup(func() {
 		exec(t, `UPDATE payments SET status = 'FAILED', completed_at = now(), result_desc = 'closed at the end of its test' WHERE status IN ('INITIATED', 'PENDING')`)
+		// The same goes for what the background jobs would still pick up: a TIMEOUT payment
+		// is asked about again for a week, and a stored callback is retried until dealt with.
+		exec(t, `UPDATE payments SET created_at = created_at - interval '30 days' WHERE status = 'TIMEOUT' AND created_at > now() - interval '8 days'`)
+		exec(t, `UPDATE payment_callbacks SET processed_at = now(), verdict = 'DEFERRED', last_error = 'closed at the end of its test' WHERE processed_at IS NULL`)
+		exec(t, `UPDATE unmatched_callbacks SET processed_at = now(), verdict = 'UNMATCHED', last_error = 'closed at the end of its test' WHERE processed_at IS NULL`)
 	})
 	e.router = httpapi.NewRouter(httpapi.Deps{
 		Payments:             e.payments,

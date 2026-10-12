@@ -9,9 +9,9 @@ import (
 // It is tied to the process's shutdown: Wait returns when everything started has finished.
 //
 // At most Limit pieces of work run at once. Work offered beyond that is refused, not queued:
-// the callers are a public endpoint and a notification, and both have a safety net
-// (reconciliation finishes any payment a dropped callback would have; the fan can open the
-// tickets in the app without the SMS).
+// the callers are a public endpoint and a notification, and both have a safety net (a
+// callback is written to the inbox before its work is offered here, and the worker's drain
+// job does whatever was refused; the fan can open the tickets in the app without the SMS).
 type Background struct {
 	wg  sync.WaitGroup
 	sem chan struct{}

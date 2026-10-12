@@ -2,6 +2,7 @@ package providers
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"testing"
@@ -19,8 +20,13 @@ func TestNoneRefusesEverything(t *testing.T) {
 	if mockProvider != nil {
 		t.Fatal("the none provider must not hand back a mock")
 	}
-	if _, err := p.Initiate(context.Background(), payments.PaymentRequest{AmountCents: 100}); err != ErrPaymentsDisabled {
-		t.Fatalf("Initiate err = %v, want ErrPaymentsDisabled", err)
+	// Refused, and marked as never sent: the attempt is closed FAILED, not left live.
+	if _, err := p.Initiate(context.Background(), payments.PaymentRequest{AmountCents: 100}); !errors.Is(err, ErrPaymentsDisabled) || !payments.IsNotSent(err) {
+		t.Fatalf("Initiate err = %v, want ErrPaymentsDisabled marked NotSent", err)
+	}
+	// The payment service ignores callbacks for a provider that takes no payments.
+	if sw, ok := p.(payments.Switch); !ok || sw.TakesPayments() {
+		t.Fatal("the none provider must report that it takes no payments")
 	}
 	// A query that "succeeded" would let reconciliation mark a payment paid.
 	if st, err := p.Query(context.Background(), "any"); err != ErrPaymentsDisabled || st.State == payments.StateSuccess {

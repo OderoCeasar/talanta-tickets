@@ -143,15 +143,21 @@ func (s *Server) createBooking(w http.ResponseWriter, r *http.Request) {
 	s.writeBooking(w, r, status, b)
 }
 
-// pathReference reads {reference}. Anything that is not shaped like a reference is a 400.
-func pathReference(r *http.Request) (string, error) {
-	ref := chi.URLParam(r, "reference")
+// validBookingReference reports whether s is shaped like a booking reference: TLT- and six
+// capital letters or digits.
+func validBookingReference(ref string) bool {
 	ok := len(ref) == 10 && ref[:4] == "TLT-"
 	for i := 4; ok && i < len(ref); i++ {
 		c := ref[i]
 		ok = (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
 	}
-	if !ok {
+	return ok
+}
+
+// pathReference reads {reference}. Anything that is not shaped like a reference is a 400.
+func pathReference(r *http.Request) (string, error) {
+	ref := chi.URLParam(r, "reference")
+	if !validBookingReference(ref) {
 		return "", domain.InvalidField("reference", "reference", "Must be a booking reference such as TLT-8H3K2M.")
 	}
 	return ref, nil

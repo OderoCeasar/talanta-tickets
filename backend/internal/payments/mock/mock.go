@@ -5,9 +5,18 @@
 // of the phone number (see MagicPhones). It delivers its "callback" by calling the same
 // function the real webhook calls, after a short delay.
 //
-// It keeps no state. Everything Query needs is written into the checkout request ID it hands
-// out (the outcome, the amount, the time), so a second process, such as the worker running
-// reconciliation, can answer for a payment the API process started.
+// Everything Query needs is written into the checkout request ID it hands out (the outcome,
+// the amount, the time), so a second process, such as the worker running reconciliation, can
+// answer for a payment the API process started. The one thing it remembers is which
+// callbacks it has delivered: a callback is only a hint to query the provider, so once the
+// mock has delivered one its Query must agree with it, whatever the clock says.
+//
+// Where it differs from Daraja on purpose: its Query names the amount paid, which Daraja's
+// STK query does not. That is what keeps the wrong_amount outcome honest. A real M-Pesa
+// prompt cannot be paid in part or in excess, so against Daraja a "wrong amount" can only be
+// a forged or malformed callback body and is never refunded; the mock's wrong_amount is the
+// PROVIDER saying a different amount was paid, and exercises the refund path with an amount
+// the provider stands behind.
 //
 // It is refused in production: New returns an error unless dev shortcuts are allowed, and
 // the configuration never selects it there.
@@ -90,6 +99,8 @@ type Provider struct {
 	cfg  Config
 	mu   sync.RWMutex
 	sink Sink
+	// delivered holds the checkout request IDs whose callback has been handed to the sink.
+	delivered map[string]bool
 }
 
 // New builds the mock provider, or refuses outside development and test.
@@ -112,7 +123,7 @@ func New(cfg Config) (*Provider, error) {
 	if cfg.After == nil {
 		cfg.After = func(d time.Duration, fn func()) { time.AfterFunc(d, fn) }
 	}
-	return &Provider{cfg: cfg}, nil
+	return &Provider{cfg: cfg, delivered: map[string]bool{}}, nil
 }
 
 // SetSink says where callbacks go. Without one the mock delivers nothing, which is what the
@@ -162,6 +173,7 @@ func parseID(id string) (request, bool) {
 
 // Initiate accepts the request and schedules the callback its outcome calls for.
 func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (payments.PaymentInit, error) {
+	// Every refusal below happens before anything is "sent": NotSent.
 	if req.AmountCents <= 0 || req.AmountCents%100 != 0 {
 		return payments.PaymentInit{}, payments.ErrAmountNotWholeShillings
 	}
@@ -173,11 +185,11 @@ func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (p
 		outcome = Success
 	}
 	if !ValidOutcome(outcome) {
-		return payments.PaymentInit{}, fmt.Errorf("mock payment provider: unknown outcome %q", outcome)
+		return payments.PaymentInit{}, payments.NotSent(fmt.Errorf("mock payment provider: unknown outcome %q", outcome))
 	}
 	nonce := make([]byte, 6)
 	if _, err := rand.Read(nonce); err != nil {
-		return payments.PaymentInit{}, fmt.Errorf("mock payment provider: %w", err)
+		return payments.PaymentInit{}, payments.NotSent(fmt.Errorf("mock payment provider: %w", err))
 	}
 	r := request{Outcome: outcome, AmountCents: req.AmountCents, CreatedAt: p.cfg.Now(), Nonce: hex.EncodeToString(nonce)}
 	init := payments.PaymentInit{CheckoutRequestID: r.id(), MerchantRequestID: "mock-" + r.Nonce}
@@ -187,26 +199,30 @@ func (p *Provider) Initiate(ctx context.Context, req payments.PaymentRequest) (p
 	switch outcome {
 	case NoCallback:
 	case LateCallback:
-		p.deliverAfter(p.cfg.LateDelay, r, init)
+		p.deliverAfter(p.cfg.LateDelay, r, init, req.Phone)
 	case DuplicateCallback:
-		p.deliverAfter(p.cfg.CallbackDelay, r, init)
-		p.deliverAfter(p.cfg.CallbackDelay, r, init)
+		p.deliverAfter(p.cfg.CallbackDelay, r, init, req.Phone)
+		p.deliverAfter(p.cfg.CallbackDelay, r, init, req.Phone)
 	default:
-		p.deliverAfter(p.cfg.CallbackDelay, r, init)
+		p.deliverAfter(p.cfg.CallbackDelay, r, init, req.Phone)
 	}
 	return init, nil
 }
 
-func (p *Provider) deliverAfter(d time.Duration, r request, init payments.PaymentInit) {
+func (p *Provider) deliverAfter(d time.Duration, r request, init payments.PaymentInit, phone string) {
 	p.cfg.After(d, func() {
-		p.mu.RLock()
+		p.mu.Lock()
 		sink := p.sink
-		p.mu.RUnlock()
+		if sink != nil {
+			// From now on Query answers with the outcome: the callback and the query agree.
+			p.delivered[init.CheckoutRequestID] = true
+		}
+		p.mu.Unlock()
 		if sink == nil {
 			return
 		}
 		// The delivery outlives the request that started the payment.
-		sink(context.Background(), p.callback(r, init))
+		sink(context.Background(), p.callback(r, init, phone))
 	})
 }
 
@@ -240,14 +256,18 @@ func (p *Provider) settlesAfter(r request) time.Duration {
 	return p.cfg.CallbackDelay
 }
 
-// Query answers from the checkout request ID alone: "pending" until the outcome's delay has
-// passed, then the outcome. An ID this provider did not issue is an error.
+// Query answers from the checkout request ID: "pending" until the outcome's delay has passed
+// or its callback has been delivered, then the outcome. An ID this provider did not issue is
+// an error.
 func (p *Provider) Query(_ context.Context, checkoutRequestID string) (payments.PaymentStatus, error) {
 	r, ok := parseID(checkoutRequestID)
 	if !ok {
 		return payments.PaymentStatus{}, fmt.Errorf("mock payment provider: %q is not one of my checkout request IDs", checkoutRequestID)
 	}
-	if p.cfg.Now().Sub(r.CreatedAt) < p.settlesAfter(r) {
+	p.mu.RLock()
+	delivered := p.delivered[checkoutRequestID]
+	p.mu.RUnlock()
+	if !delivered && p.cfg.Now().Sub(r.CreatedAt) < p.settlesAfter(r) {
 		return payments.PaymentStatus{State: payments.StatePending, ResultDesc: "The transaction is being processed"}, nil
 	}
 	return r.final(), nil
@@ -255,11 +275,14 @@ func (p *Provider) Query(_ context.Context, checkoutRequestID string) (payments.
 
 // callback builds the callback for a request, with a raw body in Daraja's envelope so that
 // payments.raw_callback looks in development as it will in production.
-func (p *Provider) callback(r request, init payments.PaymentInit) payments.Callback {
+func (p *Provider) callback(r request, init payments.PaymentInit, phone string) payments.Callback {
 	st := r.final()
 	cb := payments.Callback{
 		CheckoutRequestID: init.CheckoutRequestID, MerchantRequestID: init.MerchantRequestID,
 		ResultCode: st.ResultCode, ResultDesc: st.ResultDesc, AmountCents: st.AmountCents, Receipt: st.Receipt,
+	}
+	if st.State == payments.StateSuccess {
+		cb.Phone = phone
 	}
 	stk := map[string]any{
 		"MerchantRequestID": init.MerchantRequestID, "CheckoutRequestID": init.CheckoutRequestID,
@@ -270,6 +293,9 @@ func (p *Provider) callback(r request, init payments.PaymentInit) payments.Callb
 			{"Name": "Amount", "Value": json.Number(fmt.Sprintf("%d.%02d", *st.AmountCents/100, *st.AmountCents%100))},
 			{"Name": "MpesaReceiptNumber", "Value": st.Receipt},
 			{"Name": "TransactionDate", "Value": json.Number(p.cfg.Now().UTC().Add(3 * time.Hour).Format("20060102150405"))},
+			// Daraja sends the number as digits; a string keeps a test's odd phone from
+			// making the body unencodable.
+			{"Name": "PhoneNumber", "Value": strings.TrimPrefix(phone, "+")},
 		}}
 	}
 	raw, err := json.Marshal(map[string]any{"Body": map[string]any{"stkCallback": stk}, "mock": true})

@@ -73,6 +73,9 @@ type Payments struct {
 	// MockCallbackDelay and MockLateCallbackDelay are the mock provider's delays.
 	MockCallbackDelay     time.Duration
 	MockLateCallbackDelay time.Duration
+	// CallbackDrainInterval is how often the worker works through stored M-Pesa callbacks
+	// that have not been dealt with yet (CALLBACK_DRAIN_INTERVAL).
+	CallbackDrainInterval time.Duration
 }
 
 // LoadPayments reads the payment settings. Problems are recorded on the loader.
@@ -89,6 +92,7 @@ type Payments struct {
 //     production it must be said.
 //   - MPESA_CALLBACK_ALLOWED_CIDRS: read here, required by LoadAPI in production (the worker
 //     serves no callback).
+//   - CALLBACK_DRAIN_INTERVAL: how often the worker retries stored callbacks (default 5s).
 func LoadPayments(l *Loader, b Base) Payments {
 	p := Payments{
 		Provider: strings.ToLower(l.str("PAYMENT_PROVIDER", "")),
@@ -105,6 +109,7 @@ func LoadPayments(l *Loader, b Base) Payments {
 		CallbackAllowedCIDRs:  l.Prefixes("MPESA_CALLBACK_ALLOWED_CIDRS", ""),
 		MockCallbackDelay:     l.duration("MOCK_CALLBACK_DELAY", 2*time.Second),
 		MockLateCallbackDelay: l.duration("MOCK_LATE_CALLBACK_DELAY", 7*time.Minute),
+		CallbackDrainInterval: l.duration("CALLBACK_DRAIN_INTERVAL", 5*time.Second),
 	}
 	if p.Provider == "" {
 		switch {

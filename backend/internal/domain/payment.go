@@ -86,15 +86,20 @@ func (s PaymentStatus) IsLive() bool { return s == PaymentInitiated || s == Paym
 //   - TIMEOUT is our verdict ("we stopped waiting"), not M-Pesa's, so M-Pesa may still
 //     overrule it: a late result moves it to SUCCESS or FAILED. That is how money that
 //     arrived after we gave up is still recorded.
-//   - SUCCESS and FAILED are M-Pesa's verdicts and are final (SUCCESS -> REVERSED is the
-//     only move left). This is what makes a repeated callback harmless: the second one asks
-//     for SUCCESS -> SUCCESS and is refused.
+//   - FAILED has exactly one way out: SUCCESS, "money received after all". A failure can be
+//     recorded on the word of a callback, or of a query answer that later turns out not to
+//     have been final; if M-Pesa then confirms the payment was paid, that money must be
+//     recorded and end in tickets or a refund. Nothing else leaves FAILED: a second failure,
+//     or a timeout, for a FAILED payment is refused.
+//   - SUCCESS is final (SUCCESS -> REVERSED is the only move left): a failure reported after
+//     a success is ignored. This is what makes a repeated callback harmless: the second one
+//     asks for SUCCESS -> SUCCESS and is refused.
 var paymentMoves = map[PaymentStatus][]PaymentStatus{
 	PaymentInitiated: {PaymentPending, PaymentFailed, PaymentTimeout},
 	PaymentPending:   {PaymentSuccess, PaymentFailed, PaymentTimeout},
 	PaymentTimeout:   {PaymentSuccess, PaymentFailed},
 	PaymentSuccess:   {PaymentReversed},
-	PaymentFailed:    {},
+	PaymentFailed:    {PaymentSuccess},
 	PaymentReversed:  {},
 }
 
@@ -119,6 +124,41 @@ const (
 	ResultWrongPIN          = 2001
 )
 
+// finalSTKFailures are the STK push result codes that mean "this prompt is over and no money
+// moved". The list is the result-code table of Safaricom's Daraja documentation for M-Pesa
+// Express (developer.safaricom.co.ke, APIs > M-Pesa Express > "Result codes" / "STK push
+// error codes"), written down from that table; it could not be checked against a live
+// Daraja from here (docs/STATUS.md lists it under what needs real credentials).
+//
+//	1     the balance is insufficient for the transaction
+//	1001  unable to lock subscriber: another transaction is in progress for this customer
+//	1019  the transaction expired before the customer answered
+//	1025  an error occurred while sending the push request
+//	1032  the request was cancelled by the user
+//	1037  DS timeout: the customer's phone could not be reached
+//	2001  the initiator information is invalid: the customer entered a wrong PIN
+//	9999  an error occurred while sending the push request
+//
+// Deliberately not on it: 4999 ("the transaction is still under processing"), which is not
+// a result at all, and any code this list does not know. Those are "not final": the payment
+// stays open and M-Pesa is asked again. A code wrongly left off this list costs a slower
+// answer (the payment waits for reconciliation to time it out, with an alert); a code
+// wrongly put on it would close a payment the fan is about to pay for.
+var finalSTKFailures = map[int]bool{
+	ResultInsufficientFunds: true,
+	1001:                    true,
+	ResultExpired:           true,
+	1025:                    true,
+	ResultCancelledByUser:   true,
+	ResultTimeout:           true,
+	ResultWrongPIN:          true,
+	9999:                    true,
+}
+
+// IsFinalSTKFailure reports whether an STK result code is a known final failure. Zero
+// (success) and every code not on the documented list are not.
+func IsFinalSTKFailure(code int) bool { return finalSTKFailures[code] }
+
 // The contract's PaymentFailureReason values.
 const (
 	FailureInsufficientFunds = "insufficient_funds"
@@ -133,9 +173,9 @@ const (
 // stable value the contract calls failure_reason. Nil while the payment is live and when it
 // succeeded.
 //
-// A FAILED payment whose result code is 0 is the wrong-amount case: M-Pesa said "paid", the
-// amount was not the booking's total, so we refused it (and queued a refund). No other path
-// stores FAILED with a success code.
+// A FAILED payment whose result code is 0 is the wrong-amount case: M-Pesa itself said "paid"
+// and named an amount that was not the booking's total, so we refused it (and queued a
+// refund). No other path stores FAILED with a success code.
 func PaymentFailureReason(status string, resultCode *int32) *string {
 	if status != string(PaymentFailed) && status != string(PaymentTimeout) {
 		return nil
@@ -198,6 +238,10 @@ func HoldTooShort(holdID int64, status HoldStatus, expiresAt time.Time) *Error {
 func IdempotencyKeyReused() *Error {
 	return E(CodeIdempotencyKeyReused, "This checkout key was already used for different seats.")
 }
+
+// PaymentUnknownIDMessage is what a payment says (result_desc) while it is live with no
+// provider ID: the request may have reached M-Pesa, and we are finding out.
+const PaymentUnknownIDMessage = "We are checking with M-Pesa whether the request went through. Do not pay again yet."
 
 // PaymentProviderUnavailable builds the 502 for an STK request M-Pesa did not take.
 func PaymentProviderUnavailable(cause error) *Error {

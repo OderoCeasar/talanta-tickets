@@ -606,5 +606,91 @@ One line each: what was chosen and why. Newest at the bottom.
   tickets; money that bought nothing has a refund) and every payment test ends with it. A
   test proves each ledger rule fires on a deliberately corrupt state.
 - **No new Go dependency and no migration 000009 for M7 bookings and payments.**
+- **Money-path review: the rule.** Once there is any evidence that money moved for a
+  payment, the payment ends in exactly one of (a) seats `SOLD` and tickets issued, or (b) a
+  refund row and an organiser alert. Never neither, never both. Every item below serves it,
+  and the ledger checker has a rule for it (a `FAILED` or `TIMEOUT` payment with evidence
+  that it was paid must have a refund).
+- **`FAILED -> SUCCESS` is a legal payment move; it is the only way out of `FAILED`.** A
+  failure can be recorded on the word of a callback body. If M-Pesa then confirms the
+  payment was paid, the normal success path runs: seats sold if the hold still has them
+  all, otherwise refund and alert. `SUCCESS` stays final: a failure after it is ignored.
+  A wrong-amount result for a payment already `FAILED` keeps it `FAILED` and rewrites its
+  result (`SetPaymentResult`), since `FAILED -> FAILED` is not a move.
+- **A success is only ever accepted from the provider's own answer.** `Finish` refuses a
+  success whose source is a callback body (`ActionUnverifiable`). The callback path asks
+  the provider (STK query, outside any transaction) and hands `Finish` the query's answer;
+  the callback's receipt rides along as a label, its amount as a claim. If the query
+  cannot be made, nothing is applied and the stored callback waits. The cost is one Daraja
+  query per success callback; the gain is that a forged body from an allowed address (or
+  from anywhere, where the allowlist is empty) can neither sell seats nor queue a refund.
+- **The amount is the provider's, or the one we asked for.** Daraja's STK query names no
+  amount, and an STK prompt cannot be paid in part or in excess. So a confirmed payment is
+  paid in full at `payments.amount_cents`. An amount named only by a callback body is
+  never refunded; when it differs it raises `AMOUNT_MISMATCH` with no refund. The
+  wrong-amount refund path remains for a provider whose own answer names an amount, which
+  is how the mock's `wrong_amount` outcome exercises it: **the mock's Query reports the
+  amount paid and Daraja's does not**. A provider answer of zero is "nothing was paid": the
+  payment fails, the booking is not moved, nothing is refunded, an alert is raised.
+- **Which STK result codes are final failures is a closed list** in
+  `domain.IsFinalSTKFailure` (1, 1001, 1019, 1025, 1032, 1037, 2001, 9999), written down
+  from Daraja's M-Pesa Express result-code table and not checked against live Daraja. Both
+  the query mapping and the callback path use it. Everything else non-zero, 4999 ("still
+  under processing") included, is "not final". A code wrongly missing costs a slower answer
+  (TIMEOUT with an alert, then the slow re-query); a code wrongly present would close a
+  payment the fan is about to pay for. The list errs toward missing.
+- **`payments.dispatch` records whether the STK push can have reached M-Pesa.** `NOT_SENT`
+  (provably not), `AMBIGUOUS` (sent or possibly sent, answer lost), `ACCEPTED`, and
+  `UNKNOWN` (nothing recorded: the process died around the call). `Provider.Initiate`
+  errors are ambiguous unless marked `payments.NotSent`; the Daraja client marks an error
+  only when the HTTP trace shows nothing was written, or Daraja itself refused. An
+  ambiguous payment stays `PENDING` with no ID, which also blocks a second payment
+  (`payments_live_booking_idx`), so a fan cannot double-pay in the window. The fan's answer
+  is **202 with the payment `PENDING` and `result_desc` set**, not a 502: a 502 would invite
+  the retry the design is trying to prevent, and the app already polls a 202.
+- **A callback with an unknown ID is matched by phone + amount + time, and bound only after
+  the provider confirms the ID.** Daraja echoes nothing of ours back in an STK callback, so
+  there is no reference to match on. Phone and amount come from the body, so a match
+  decides nothing by itself: the provider is asked about the callback's CheckoutRequestID,
+  and only a "paid" from the provider writes that ID on the payment. More than one
+  candidate, or none, is left for a person, with an alert.
+- **Callbacks are stored before the webhook answers; two tables.** `payment_callbacks` is
+  the inbox (one row per payment and result code, re-armed by a repeat unless already
+  applied); `unmatched_callbacks` holds "paid" for unknown IDs. Both are claimed with `FOR
+  UPDATE SKIP LOCKED` and a lease, by the API's background runner (fast path) and by the
+  worker's drain job, which is what retries. The webhook answers 503 when it could not
+  store a real callback: "Accepted" for a report that was lost would be a lie. The claim
+  statements are outside the lock order by construction (the lock is gone before the
+  provider is asked or `Finish` begins).
+- **TIMEOUT payments are re-queried on a slow schedule** (5 minutes for a day, then daily
+  to 7 days, by the database clock; `payments.Policy.Requery`). FAILED payments are not:
+  failures are common, and a re-query of each for a week would be thousands of Daraja calls
+  per event for a case only a forged failure callback can produce; that case is still
+  recovered by the real success callback (`FAILED -> SUCCESS`).
+- **A ticket-issue error that will not go away undoes the sale and refunds.** Anything
+  that is not a cancellation, a deadline or a passing database condition
+  (`payments.isTransient`) is treated as deterministic: the savepoint is rolled back, the
+  payment is `SUCCESS`, the booking `REFUND_REQUIRED`. This is the "wrong ledger over a
+  stuck payment" choice: a transient error that is not recognised as one (and that left the
+  connection usable) refunds a fan who could have had tickets. The other way round, an
+  unsignable ticket rolled the whole transaction back on every attempt and kept the money.
+  `stands.code` now has the CHECK that makes the known cause impossible.
+- **The booking fee is rounded to whole shillings, half up** (`domain.BookingFeeCents`).
+  Rounding down to a cent made any fee with a fraction of a shilling unpayable. Prices are
+  not validated as whole shillings at the API: the category handlers are outside the
+  payments work; a price with cents in it still ends as `BOOKING_NOT_PAYABLE`.
+- **Alerts name their payment and are closed by the system when resolved.**
+  `organiser_alerts.payment_id` and `.resolution` (migration 000009). `Finish` closes the
+  open `PAYMENT_UNRESOLVED` alerts of a payment that ends in tickets or a queued refund;
+  completing a refund closes the open `REFUND_REQUIRED` and `AMOUNT_MISMATCH` alerts of its
+  payment. Both set `acknowledged_at` and a `resolution` note, in the same transaction; an
+  alert a person acknowledged is left alone. `organiser_alerts.event_id` stays NOT NULL: an
+  unmatched callback's alert is filed under a guessed event rather than change the `Alert`
+  contract to a nullable event.
+- **Migration 000009** adds `payments.dispatch`, `payment_callbacks`,
+  `unmatched_callbacks`, `organiser_alerts.payment_id` / `.resolution`, and the
+  `stands_code_check` constraint (`^[A-Z0-9]{1,10}$`: with `-LOWER`/`-UPPER` that is the 16
+  characters a signed ticket gives a gate group). It fails if a stand code already breaks
+  the rule; the seeded codes are N, S, E and W. No new Go dependency.
 - **Fonts are bundled, not fetched from Google at run time.** The app must render with no
   network, and the admin site makes no third-party requests.

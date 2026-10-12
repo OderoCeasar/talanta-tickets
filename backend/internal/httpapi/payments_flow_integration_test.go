@@ -49,7 +49,8 @@ var errProviderDown = errors.New("test: connection refused")
 
 func (f *flakyProvider) Initiate(ctx context.Context, req payments.PaymentRequest) (payments.PaymentInit, error) {
 	if f.down.Load() {
-		return payments.PaymentInit{}, errProviderDown
+		// The connection was refused: the request provably never left us.
+		return payments.PaymentInit{}, payments.NotSent(errProviderDown)
 	}
 	return f.Provider.Initiate(ctx, req)
 }
@@ -141,7 +142,7 @@ func TestCreateBooking_OverHTTP(t *testing.T) {
 	wantError(t, e.book("", holdID, newKey(t)), http.StatusUnauthorized, domain.CodeUnauthenticated)
 	wantError(t, e.book(e.staffToken(domain.RoleOrganiser), holdID, newKey(t)), http.StatusForbidden, domain.CodeForbidden)
 	_ = fanID
-	checkInventory(t, ev.ID)
+	ledger(t, ev.ID)
 }
 
 // A double-tapped Pay through the router: the same key on several requests at once makes one
@@ -183,7 +184,7 @@ func TestCreateBooking_DoubleTapOverHTTP(t *testing.T) {
 		require.Equal(t, 1, created, "round %d", round)
 		require.Equal(t, 1, queryInt(t, `SELECT count(*) FROM bookings WHERE hold_id = $1`, holdID))
 	}
-	checkInventory(t, ev.ID)
+	ledger(t, ev.ID)
 }
 
 func TestListMyBookings_PagingAndFilter(t *testing.T) {
@@ -517,7 +518,9 @@ func TestPayment_ProviderDown_502AndTheBookingStaysPayable(t *testing.T) {
 	lp := b["latest_payment"].(obj)
 	assert.Equal(t, "FAILED", lp["status"], "the attempt is recorded, and is not live")
 	assert.Equal(t, "other", lp["failure_reason"])
-	assert.Nil(t, lp["checkout_request_id"])
+	assert.NotContains(t, lp, "checkout_request_id")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payments WHERE booking_id = $1 AND status = 'FAILED' AND dispatch = 'NOT_SENT' AND checkout_request_id IS NULL`, c.BookingID))
+	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE booking_id = $1`, c.BookingID), "provably never sent: no alert")
 	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payments WHERE booking_id = $1 AND status IN ('INITIATED', 'PENDING')`, c.BookingID))
 	assert.NotContains(t, e.do("GET", "/bookings/"+c.Ref, nil, c.Token).Body.String(), "connection refused", "the provider's error text stays in the log")
 
@@ -530,22 +533,60 @@ func TestPayment_ProviderDown_502AndTheBookingStaysPayable(t *testing.T) {
 	assert.Equal(t, 2, ledger(t, ev.ID).Sold)
 }
 
-// M-Pesa takes whole shillings. A booking whose total is not a whole number of them is
-// refused, not rounded.
-func TestPayment_TotalThatIsNotWholeShillingsIsRefused(t *testing.T) {
-	e := newEnv(t, withHoldPolicy(func(p *booking.Policy) { p.BookingFeeBPS = 133 }))
+// The booking fee is rounded to whole shillings, so a fee rate that gives a fraction of a
+// shilling still makes a booking M-Pesa can take. Before, BOOKING_FEE_BPS=250 on a KES 1,500
+// seat made a fee of 37.50: the booking was created, the seats held, and every payment was
+// answered BOOKING_NOT_PAYABLE.
+func TestPayment_AFeeWithAFractionOfAShillingIsRoundedAndPayable(t *testing.T) {
+	e := newEnv(t, withHoldPolicy(func(p *booking.Policy) { p.BookingFeeBPS = 250 }))
 	ev, north, _ := e.ticketEvent()
+	exec(t, `UPDATE event_categories SET price_cents = 150000 WHERE event_id = $1 AND name = 'Regular'`, ev.ID)
+	fanID, token := e.newFan()
+
+	h := want(t, e.hold(token, ev.ID, north[10]), http.StatusCreated)
+	assert.EqualValues(t, 150_000, h["subtotal_cents"])
+	assert.EqualValues(t, 3_800, h["fee_cents"], "2.5% of 1,500.00 is 37.50: half a shilling rounds up")
+	assert.EqualValues(t, 153_800, h["total_cents"])
+	want(t, e.do("DELETE", fmt.Sprintf("/holds/%d", id64(h["id"])), nil, token), http.StatusNoContent)
+
+	c := e.checkoutAs(fanID, token, ev.ID, north[10])
+	require.EqualValues(t, 153_800, c.Total, "the booking charges what the hold showed")
+	assert.Equal(t, 3_800, queryInt(t, `SELECT fee_cents FROM bookings WHERE id = $1`, c.BookingID))
+	e.pay(c, mock.Success)
+	e.timers.fire(t, soon)
+	e.payments.Wait()
+	assert.Equal(t, "PAID", bookingStatus(t, c.BookingID))
+
+	// 1.33% of 2,000.00 is 26.60, which used to be charged as such and could not be paid.
+	e2 := newEnv(t, withHoldPolicy(func(p *booking.Policy) { p.BookingFeeBPS = 133 }))
+	exec(t, `UPDATE event_categories SET price_cents = 100000 WHERE event_id = $1 AND name = 'Regular'`, ev.ID)
+	c2 := e2.checkout(ev.ID, north[20:22]...)
+	require.EqualValues(t, 202_700, c2.Total, "26.60 rounds to 27.00")
+	e2.pay(c2, mock.Success)
+	e2.timers.fire(t, soon)
+	e2.payments.Wait()
+	assert.Equal(t, "PAID", bookingStatus(t, c2.BookingID))
+	assert.Equal(t, 3, ledger(t, ev.ID).Sold)
+}
+
+// M-Pesa takes whole shillings. A booking whose total is not a whole number of them (only a
+// category price with cents in it can do that now) is refused, not rounded.
+func TestPayment_TotalThatIsNotWholeShillingsIsRefused(t *testing.T) {
+	e := newEnv(t)
+	ev, north, _ := e.ticketEvent()
+	exec(t, `UPDATE event_categories SET price_cents = 101330 WHERE event_id = $1 AND name = 'Regular'`, ev.ID)
 	c := e.checkout(ev.ID, north[10:12]...)
-	require.EqualValues(t, 202_660, c.Total, "1.33% of 2,000.00 is 26.60")
+	require.EqualValues(t, 202_660, c.Total)
 
 	d := holdErr(t, e.stk(c.Token, c.BookingID, payPhone, mock.Success), http.StatusConflict, domain.CodeBookingNotPayable)
 	assert.Equal(t, "PENDING_PAYMENT", d["booking_status"])
 	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM payments WHERE booking_id = $1`, c.BookingID))
 	assert.Zero(t, e.timers.waiting())
 
-	// Both providers refuse such an amount themselves as well.
+	// Both providers refuse such an amount themselves as well, before sending anything.
 	_, err := e.mock.Initiate(context.Background(), payments.PaymentRequest{AmountCents: 202_660, Phone: payPhone})
 	require.ErrorIs(t, err, payments.ErrAmountNotWholeShillings)
+	assert.True(t, payments.IsNotSent(err))
 	ledger(t, ev.ID)
 }
 
@@ -828,10 +869,11 @@ func TestPayment_SecondSuccessForAPaidBooking_IsRefundedAndTicketsKept(t *testin
 	require.Equal(t, "PAID", bookingStatus(t, c.BookingID))
 	ticketsBefore := queryText(t, `SELECT string_agg(id::text || ':' || status, ',' ORDER BY id) FROM tickets WHERE booking_id = $1`, c.BookingID)
 
-	// The first payment's callback, late.
+	// The first payment's callback, late; M-Pesa itself confirms it was paid.
+	e.fanHasPaid()
 	amount := c.Total
 	fin, err := e.payments.HandleCallback(context.Background(), payments.Callback{
-		CheckoutRequestID: first["checkout_request_id"].(string), ResultCode: 0, ResultDesc: "ok",
+		CheckoutRequestID: checkoutIDOf(t, firstID), ResultCode: 0, ResultDesc: "ok",
 		AmountCents: &amount, Receipt: newReceipt(t), Raw: []byte(`{"Body":{"stkCallback":{}}}`),
 	})
 	require.NoError(t, err)
@@ -848,6 +890,14 @@ func TestPayment_SecondSuccessForAPaidBooking_IsRefundedAndTicketsKept(t *testin
 	assert.Equal(t, 0, queryInt(t, `SELECT count(*) FROM refunds WHERE payment_id = $1`, second))
 	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE booking_id = $1 AND kind = 'REFUND_REQUIRED'`, c.BookingID))
 	assert.Equal(t, 1, e.sms.count(c.Phone), "no second SMS")
+	// The TIMEOUT alert of the first payment is closed by the system: the payment resolved.
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE payment_id = $1 AND kind = 'PAYMENT_UNRESOLVED'
+		AND acknowledged_at IS NOT NULL AND resolution LIKE '%refund is queued%'`, firstID))
+	// The dashboard counts the money owed back although the booking is PAID, not REFUND_REQUIRED.
+	sales := want(t, e.do("GET", fmt.Sprintf("/admin/events/%d/sales", ev.ID), nil, ev.Token), http.StatusOK)
+	assert.EqualValues(t, c.Total, sales["refund_required_cents"], "a pending refund for a second payment on a PAID booking is owed back too")
+	assert.EqualValues(t, 0, sales["refund_required_count"], "the booking itself is not owed a refund")
+	assert.EqualValues(t, c.Total, sales["revenue_cents"])
 
 	// Completing that refund leaves the booking PAID with valid tickets.
 	organiser := e.staffToken(domain.RoleOrganiser)
@@ -861,14 +911,18 @@ func TestPayment_SecondSuccessForAPaidBooking_IsRefundedAndTicketsKept(t *testin
 }
 
 // The webhook answers 200 at once even when the payment's event is locked by an organiser
-// and the work cannot be done: the payment is left for reconciliation, which finishes it.
+// and the work cannot be done. The callback has been WRITTEN DOWN before the answer, so the
+// work is not lost with the goroutine that could not do it: the worker's drain job applies
+// it. (Before, the callback lived only in memory, and the log line said reconciliation
+// would finish the payment, which is not true of every payment.)
 func TestWebhook_Answers200AtOnceEvenWhenTheEventIsBusy(t *testing.T) {
 	e := newEnv(t, withPaymentPolicy(func(p *payments.Policy) { p.EventLockWait = 300 * time.Millisecond }))
 	ev, north, _ := e.ticketEvent()
 	c := e.checkout(ev.ID, north[10:12]...)
 	p := e.pay(c, mock.NoCallback)
 	pid := id64(p["id"])
-	body := stkCallback(p["checkout_request_id"].(string), 0, "ok", paidItems(c.Total/100, newReceipt(t))...)
+	e.fanHasPaid()
+	body := stkCallback(checkoutIDOf(t, pid), 0, "ok", paidItems(c.Total/100, newReceipt(t))...)
 
 	// An organiser's edit (or a cancel, or a publish) has the event.
 	ctx := context.Background()
@@ -884,19 +938,23 @@ func TestWebhook_Answers200AtOnceEvenWhenTheEventIsBusy(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.JSONEq(t, `{"ResultCode":0,"ResultDesc":"Accepted"}`, rec.Body.String())
 	assert.Less(t, answered, 250*time.Millisecond, "the answer does not wait for the event's lock (the work waits 300 ms for it)")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1 AND result_code = 0`, pid),
+		"the callback was stored before the 200 was sent")
 
 	e.payments.Wait()
 	assert.Equal(t, "PENDING", paymentStatus(t, pid), "nothing was applied while the event was locked")
-	assert.Contains(t, e.logs.String(), "reconciliation will finish the payment")
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1 AND processed_at IS NULL AND attempts = 1
+		AND next_attempt_at > now() AND last_error LIKE '%event is locked%'`, pid), "it is still there, due again after a wait")
+	assert.Contains(t, e.logs.String(), "the drain job will try it again")
 	require.NoError(t, organiser.Rollback(ctx))
 
-	// Reconciliation picks it up.
-	agePayment(t, pid, 2*time.Minute)
-	e.mockClock.Advance(time.Minute)
-	res, err := e.payments.Reconcile(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, 1, res.Sold)
+	// The drain job picks it up. No reconciliation run is involved.
+	res := e.drain()
+	assert.Equal(t, 1, res.Done)
+	assert.Equal(t, "SUCCESS", paymentStatus(t, pid))
 	assert.Equal(t, "PAID", bookingStatus(t, c.BookingID))
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM payment_callbacks WHERE payment_id = $1 AND verdict = 'APPLIED'`, pid))
+	assert.Zero(t, e.drain().Claimed, "nothing is left to drain")
 
 	// Fast on the ordinary path too, and for every kind of body.
 	for _, b := range []any{body, `{"Body":{"stkCallback":{"CheckoutRequestID":"ws_CO_unknown","ResultCode":1032,"ResultDesc":"cancelled","MerchantRequestID":"m"}}}`, `garbage`} {

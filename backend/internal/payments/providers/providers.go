@@ -62,8 +62,12 @@ var ErrPaymentsDisabled = errors.New("payments are switched off: no payment prov
 type disabled struct{}
 
 func (disabled) Initiate(context.Context, payments.PaymentRequest) (payments.PaymentInit, error) {
-	return payments.PaymentInit{}, ErrPaymentsDisabled
+	// Nothing was sent anywhere: the attempt is closed as FAILED at once.
+	return payments.PaymentInit{}, payments.NotSent(ErrPaymentsDisabled)
 }
+
+// TakesPayments is false: the payment service ignores every callback while payments are off.
+func (disabled) TakesPayments() bool { return false }
 
 func (disabled) Query(context.Context, string) (payments.PaymentStatus, error) {
 	return payments.PaymentStatus{}, ErrPaymentsDisabled

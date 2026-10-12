@@ -163,7 +163,11 @@ func run() error {
 		logger.Warn("payments use the MOCK provider: no money moves. X-Mock-Outcome chooses what a payment does", "app_env", cfg.AppEnv)
 		// The mock's "callback" goes where the real one goes after the webhook has parsed
 		// it, on the same background runner.
-		mockProvider.SetSink(func(ctx context.Context, cb payments.Callback) { paymentService.HandleCallbackAsync(ctx, cb) })
+		mockProvider.SetSink(func(ctx context.Context, cb payments.Callback) {
+			if err := paymentService.HandleCallbackAsync(ctx, cb); err != nil {
+				logger.ErrorContext(ctx, "mock payment callback could not be stored", "checkout_request_id", cb.CheckoutRequestID, "err", err)
+			}
+		})
 	} else if cfg.Payments.Provider == config.ProviderNone {
 		logger.Warn("payments are OFF: no provider is configured, so every attempt to pay is answered 'not available'. Set the MPESA_* variables to take payments")
 	} else {

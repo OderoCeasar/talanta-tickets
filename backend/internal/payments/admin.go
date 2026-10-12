@@ -75,11 +75,13 @@ func (s *Service) AckAlert(ctx context.Context, alertID int64) (store.AlertView,
 type RefundFilter struct {
 	Status  *string
 	EventID *int64
+	// BookingReference narrows the list to one booking's refunds.
+	BookingReference *string
 }
 
 // ListRefunds returns one page of the refund queue, oldest first.
 func (s *Service) ListRefunds(ctx context.Context, f RefundFilter, limit int, after *Cursor) ([]store.RefundView, *Cursor, error) {
-	arg := store.ListRefundViewsParams{Status: f.Status, EventID: f.EventID, PageLimit: int32(limit) + 1}
+	arg := store.ListRefundViewsParams{Status: f.Status, EventID: f.EventID, BookingReference: f.BookingReference, PageLimit: int32(limit) + 1}
 	if after != nil {
 		if !after.valid() {
 			return nil, nil, errBadCursor
@@ -104,7 +106,11 @@ func (s *Service) ListRefunds(ctx context.Context, f RefundFilter, limit int, af
 }
 
 // CompleteRefund records that a refund was paid back by hand in the M-Pesa portal. It moves
-// no money. Safe to repeat: a refund that is already DONE is returned as it is.
+// no money. Safe to repeat: a refund that is already DONE is returned as it is, and the
+// second value says so (true: this call changed nothing).
+//
+// The open REFUND_REQUIRED and AMOUNT_MISMATCH alerts about the refunded payment are closed
+// in the same transaction, with a note saying the system did it: what they ask for is done.
 //
 // When it was the booking's last pending refund and the booking is REFUND_REQUIRED, the
 // booking becomes REFUNDED and any ticket it still has is voided, in the same transaction.
@@ -122,7 +128,8 @@ func (s *Service) ListRefunds(ctx context.Context, f RefundFilter, limit int, af
 //
 // Lock order: the event (shared, bounded: EVENT_BUSY), the booking's hold, the booking, the
 // refund.
-func (s *Service) CompleteRefund(ctx context.Context, refundID int64) (store.RefundView, error) {
+func (s *Service) CompleteRefund(ctx context.Context, refundID int64) (store.RefundView, bool, error) {
+	alreadyDone := false
 	err := store.InTxRaw(ctx, s.db, func(tx pgx.Tx) error {
 		q := store.New(tx)
 		scope, err := q.GetRefundScope(ctx, refundID)
@@ -153,10 +160,16 @@ func (s *Service) CompleteRefund(ctx context.Context, refundID int64) (store.Ref
 			return fmt.Errorf("complete refund %d: lock refund: %w", refundID, err)
 		}
 		if r.Status == "DONE" {
+			alreadyDone = true
 			return nil
 		}
 		if n, err := q.CompleteRefund(ctx, refundID); err != nil || n != 1 {
 			return fmt.Errorf("complete refund %d: %d rows: %w", refundID, n, err)
+		}
+		if _, err := q.ResolveAlertsOfPayment(ctx, store.ResolveAlertsOfPaymentParams{
+			PaymentID: r.PaymentID, Kinds: []string{"REFUND_REQUIRED", "AMOUNT_MISMATCH"}, Resolution: resolutionRefundPaid,
+		}); err != nil {
+			return fmt.Errorf("complete refund %d: resolve alerts: %w", refundID, err)
 		}
 
 		if domain.BookingStatus(b.Status) != domain.BookingRefundRequired {
@@ -178,12 +191,14 @@ func (s *Service) CompleteRefund(ctx context.Context, refundID int64) (store.Ref
 		return nil
 	})
 	if err != nil {
-		return store.RefundView{}, err
+		return store.RefundView{}, false, err
 	}
 	v, err := s.q.GetRefundView(ctx, refundID)
 	if err != nil {
-		return store.RefundView{}, fmt.Errorf("get refund %d: %w", refundID, err)
+		return store.RefundView{}, false, fmt.Errorf("get refund %d: %w", refundID, err)
 	}
-	s.log.InfoContext(ctx, "refund marked as paid", "refund_id", refundID, "booking_id", v.Refund.BookingID)
-	return v, nil
+	if !alreadyDone {
+		s.log.InfoContext(ctx, "refund marked as paid", "refund_id", refundID, "booking_id", v.Refund.BookingID)
+	}
+	return v, alreadyDone, nil
 }

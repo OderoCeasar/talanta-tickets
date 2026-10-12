@@ -48,6 +48,9 @@ func TestTransitionPayment(t *testing.T) {
 		// TIMEOUT is our verdict; a late answer from M-Pesa overrules it.
 		PaymentTimeout: {PaymentSuccess, PaymentFailed},
 		PaymentSuccess: {PaymentReversed},
+		// Money received after all: a failure taken from a callback, or from an answer that
+		// was not final, is overruled by a confirmed success. Nothing else leaves FAILED.
+		PaymentFailed: {PaymentSuccess},
 	}
 	for _, from := range all {
 		for _, to := range all {
@@ -60,10 +63,24 @@ func TestTransitionPayment(t *testing.T) {
 	}
 	// What makes a repeated callback harmless.
 	assert.Error(t, TransitionPayment(PaymentSuccess, PaymentSuccess))
-	assert.Error(t, TransitionPayment(PaymentFailed, PaymentSuccess))
-	assert.Error(t, TransitionPayment(PaymentSuccess, PaymentFailed))
+	assert.Error(t, TransitionPayment(PaymentSuccess, PaymentFailed), "a failure reported after a success is ignored")
+	assert.Error(t, TransitionPayment(PaymentFailed, PaymentFailed))
+	assert.Error(t, TransitionPayment(PaymentFailed, PaymentTimeout))
+	assert.NoError(t, TransitionPayment(PaymentFailed, PaymentSuccess))
+	assert.NoError(t, TransitionPayment(PaymentTimeout, PaymentSuccess))
 	assert.True(t, PaymentInitiated.IsLive() && PaymentPending.IsLive())
 	assert.False(t, PaymentTimeout.IsLive() || PaymentSuccess.IsLive() || PaymentFailed.IsLive())
+}
+
+// Only the codes Daraja documents as final failures close a payment. Success, "still under
+// processing" and anything unknown do not.
+func TestIsFinalSTKFailure(t *testing.T) {
+	for _, code := range []int{1, 1001, 1019, 1025, 1032, 1037, 2001, 9999} {
+		assert.True(t, IsFinalSTKFailure(code), "%d", code)
+	}
+	for _, code := range []int{0, 4999, 17, 26, 500, -1, 1036, 2002} {
+		assert.False(t, IsFinalSTKFailure(code), "%d", code)
+	}
 }
 
 func TestPaymentFailureReason_EveryCase(t *testing.T) {

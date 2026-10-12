@@ -88,9 +88,58 @@ func (q *Queries) FinishPayment(ctx context.Context, arg FinishPaymentParams) (i
 	return result.RowsAffected(), nil
 }
 
+const finishPaymentCallback = `-- name: FinishPaymentCallback :execrows
+UPDATE payment_callbacks
+SET processed_at = clock_timestamp(), verdict = $1::text, last_error = $2
+WHERE id = $3 AND processed_at IS NULL
+`
+
+type FinishPaymentCallbackParams struct {
+	Verdict   string
+	LastError *string
+	ID        int64
+}
+
+// The inbox row has been dealt with; verdict says how.
+func (q *Queries) FinishPaymentCallback(ctx context.Context, arg FinishPaymentCallbackParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishPaymentCallback, arg.Verdict, arg.LastError, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const finishUnmatchedCallback = `-- name: FinishUnmatchedCallback :execrows
+UPDATE unmatched_callbacks
+SET processed_at = clock_timestamp(), verdict = $1::text,
+    matched_payment_id = $2, last_error = $3
+WHERE id = $4 AND processed_at IS NULL
+`
+
+type FinishUnmatchedCallbackParams struct {
+	Verdict          string
+	MatchedPaymentID *int64
+	LastError        *string
+	ID               int64
+}
+
+func (q *Queries) FinishUnmatchedCallback(ctx context.Context, arg FinishUnmatchedCallbackParams) (int64, error) {
+	result, err := q.db.Exec(ctx, finishUnmatchedCallback,
+		arg.Verdict,
+		arg.MatchedPaymentID,
+		arg.LastError,
+		arg.ID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const getAlertView = `-- name: GetAlertView :one
-SELECT a.id, a.event_id, a.booking_id, a.kind, a.message, a.created_at, a.acknowledged_at, b.reference AS booking_reference
+SELECT a.id, a.event_id, a.booking_id, a.kind, a.message, a.created_at, a.acknowledged_at, a.payment_id, a.resolution, b.reference AS booking_reference, e.title AS event_title
 FROM organiser_alerts a
+JOIN events e ON e.id = a.event_id
 LEFT JOIN bookings b ON b.id = a.booking_id
 WHERE a.id = $1
 `
@@ -98,6 +147,7 @@ WHERE a.id = $1
 type GetAlertViewRow struct {
 	OrganiserAlert   OrganiserAlert
 	BookingReference *string
+	EventTitle       string
 }
 
 func (q *Queries) GetAlertView(ctx context.Context, id int64) (GetAlertViewRow, error) {
@@ -111,13 +161,16 @@ func (q *Queries) GetAlertView(ctx context.Context, id int64) (GetAlertViewRow, 
 		&i.OrganiserAlert.Message,
 		&i.OrganiserAlert.CreatedAt,
 		&i.OrganiserAlert.AcknowledgedAt,
+		&i.OrganiserAlert.PaymentID,
+		&i.OrganiserAlert.Resolution,
 		&i.BookingReference,
+		&i.EventTitle,
 	)
 	return i, err
 }
 
 const getLivePaymentOfBooking = `-- name: GetLivePaymentOfBooking :one
-SELECT id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts FROM payments
+SELECT id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts, dispatch FROM payments
 WHERE booking_id = $1 AND status IN ('INITIATED', 'PENDING')
 ORDER BY id DESC
 LIMIT 1
@@ -143,12 +196,13 @@ func (q *Queries) GetLivePaymentOfBooking(ctx context.Context, bookingID int64) 
 		&i.CompletedAt,
 		&i.LastQueriedAt,
 		&i.QueryAttempts,
+		&i.Dispatch,
 	)
 	return i, err
 }
 
 const getPaymentByID = `-- name: GetPaymentByID :one
-SELECT id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts FROM payments WHERE id = $1
+SELECT id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts, dispatch FROM payments WHERE id = $1
 `
 
 func (q *Queries) GetPaymentByID(ctx context.Context, id int64) (Payment, error) {
@@ -171,12 +225,13 @@ func (q *Queries) GetPaymentByID(ctx context.Context, id int64) (Payment, error)
 		&i.CompletedAt,
 		&i.LastQueriedAt,
 		&i.QueryAttempts,
+		&i.Dispatch,
 	)
 	return i, err
 }
 
 const getPaymentForUser = `-- name: GetPaymentForUser :one
-SELECT p.id, p.booking_id, p.provider, p.amount_cents, p.phone_e164, p.status, p.merchant_request_id, p.checkout_request_id, p.mpesa_receipt, p.result_code, p.result_desc, p.raw_callback, p.created_at, p.completed_at, p.last_queried_at, p.query_attempts, b.id, b.reference, b.event_id, b.user_id, b.hold_id, b.status, b.subtotal_cents, b.fee_cents, b.total_cents, b.idempotency_key, b.created_at, b.paid_at, b.web_token, b.updated_at
+SELECT p.id, p.booking_id, p.provider, p.amount_cents, p.phone_e164, p.status, p.merchant_request_id, p.checkout_request_id, p.mpesa_receipt, p.result_code, p.result_desc, p.raw_callback, p.created_at, p.completed_at, p.last_queried_at, p.query_attempts, p.dispatch, b.id, b.reference, b.event_id, b.user_id, b.hold_id, b.status, b.subtotal_cents, b.fee_cents, b.total_cents, b.idempotency_key, b.created_at, b.paid_at, b.web_token, b.updated_at
 FROM payments p
 JOIN bookings b ON b.id = p.booking_id
 WHERE p.id = $1 AND b.user_id = $2
@@ -213,6 +268,7 @@ func (q *Queries) GetPaymentForUser(ctx context.Context, arg GetPaymentForUserPa
 		&i.Payment.CompletedAt,
 		&i.Payment.LastQueriedAt,
 		&i.Payment.QueryAttempts,
+		&i.Payment.Dispatch,
 		&i.Booking.ID,
 		&i.Booking.Reference,
 		&i.Booking.EventID,
@@ -303,7 +359,7 @@ func (q *Queries) GetRefundScope(ctx context.Context, id int64) (GetRefundScopeR
 }
 
 const getRefundView = `-- name: GetRefundView :one
-SELECT r.id, r.booking_id, r.payment_id, r.amount_cents, r.reason, r.status, r.created_at, r.completed_at, b.reference AS booking_reference, b.event_id,
+SELECT r.id, r.booking_id, r.payment_id, r.amount_cents, r.reason, r.status, r.created_at, r.completed_at, b.reference AS booking_reference, b.event_id, b.status AS booking_status,
        p.phone_e164 AS payment_phone, p.mpesa_receipt
 FROM refunds r
 JOIN bookings b ON b.id = r.booking_id
@@ -315,6 +371,7 @@ type GetRefundViewRow struct {
 	Refund           Refund
 	BookingReference string
 	EventID          int64
+	BookingStatus    string
 	PaymentPhone     string
 	MpesaReceipt     *string
 }
@@ -333,29 +390,56 @@ func (q *Queries) GetRefundView(ctx context.Context, id int64) (GetRefundViewRow
 		&i.Refund.CompletedAt,
 		&i.BookingReference,
 		&i.EventID,
+		&i.BookingStatus,
 		&i.PaymentPhone,
 		&i.MpesaReceipt,
 	)
 	return i, err
 }
 
+const guessEventForUnmatchedCallback = `-- name: GuessEventForUnmatchedCallback :one
+SELECT x.event_id::bigint AS event_id FROM (
+    SELECT b.event_id, 1 AS priority, p.created_at AS at
+    FROM payments p JOIN bookings b ON b.id = p.booking_id
+    WHERE p.phone_e164 = $1::text
+    UNION ALL
+    SELECT e.id, 2, e.created_at FROM events e
+) x
+ORDER BY x.priority, x.at DESC
+LIMIT 1
+`
+
+// organiser_alerts needs an event. An unmatched callback has none, so its alert is filed
+// under the event of the newest payment from the same phone, or failing that the newest
+// event. No row when there is no event at all.
+func (q *Queries) GuessEventForUnmatchedCallback(ctx context.Context, phoneE164 string) (int64, error) {
+	row := q.db.QueryRow(ctx, guessEventForUnmatchedCallback, phoneE164)
+	var event_id int64
+	err := row.Scan(&event_id)
+	return event_id, err
+}
+
 const insertAlert = `-- name: InsertAlert :one
-INSERT INTO organiser_alerts (event_id, booking_id, kind, message)
-VALUES ($1, $2, $3, $4)
-RETURNING id, event_id, booking_id, kind, message, created_at, acknowledged_at
+INSERT INTO organiser_alerts (event_id, booking_id, payment_id, kind, message)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, event_id, booking_id, kind, message, created_at, acknowledged_at, payment_id, resolution
 `
 
 type InsertAlertParams struct {
 	EventID   int64
 	BookingID *int64
+	PaymentID *int64
 	Kind      string
 	Message   string
 }
 
+// payment_id ties the alert to the payment it is about, so the system can close it when that
+// payment resolves (ResolveAlertsOfPayment).
 func (q *Queries) InsertAlert(ctx context.Context, arg InsertAlertParams) (OrganiserAlert, error) {
 	row := q.db.QueryRow(ctx, insertAlert,
 		arg.EventID,
 		arg.BookingID,
+		arg.PaymentID,
 		arg.Kind,
 		arg.Message,
 	)
@@ -368,6 +452,8 @@ func (q *Queries) InsertAlert(ctx context.Context, arg InsertAlertParams) (Organ
 		&i.Message,
 		&i.CreatedAt,
 		&i.AcknowledgedAt,
+		&i.PaymentID,
+		&i.Resolution,
 	)
 	return i, err
 }
@@ -376,7 +462,7 @@ const insertPayment = `-- name: InsertPayment :one
 
 INSERT INTO payments (booking_id, provider, amount_cents, phone_e164, status)
 VALUES ($1, 'MPESA', $2, $3, 'INITIATED')
-RETURNING id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts
+RETURNING id, booking_id, provider, amount_cents, phone_e164, status, merchant_request_id, checkout_request_id, mpesa_receipt, result_code, result_desc, raw_callback, created_at, completed_at, last_queried_at, query_attempts, dispatch
 `
 
 type InsertPaymentParams struct {
@@ -410,13 +496,15 @@ func (q *Queries) InsertPayment(ctx context.Context, arg InsertPaymentParams) (P
 		&i.CompletedAt,
 		&i.LastQueriedAt,
 		&i.QueryAttempts,
+		&i.Dispatch,
 	)
 	return i, err
 }
 
 const listAlertViews = `-- name: ListAlertViews :many
-SELECT a.id, a.event_id, a.booking_id, a.kind, a.message, a.created_at, a.acknowledged_at, b.reference AS booking_reference
+SELECT a.id, a.event_id, a.booking_id, a.kind, a.message, a.created_at, a.acknowledged_at, a.payment_id, a.resolution, b.reference AS booking_reference, e.title AS event_title
 FROM organiser_alerts a
+JOIN events e ON e.id = a.event_id
 LEFT JOIN bookings b ON b.id = a.booking_id
 WHERE ($1::bigint IS NULL OR a.event_id = $1::bigint)
   AND ($2::boolean IS NULL
@@ -439,6 +527,7 @@ type ListAlertViewsParams struct {
 type ListAlertViewsRow struct {
 	OrganiserAlert   OrganiserAlert
 	BookingReference *string
+	EventTitle       string
 }
 
 // The organiser's alerts, newest first, keyset-paged on (created_at, id).
@@ -466,7 +555,10 @@ func (q *Queries) ListAlertViews(ctx context.Context, arg ListAlertViewsParams) 
 			&i.OrganiserAlert.Message,
 			&i.OrganiserAlert.CreatedAt,
 			&i.OrganiserAlert.AcknowledgedAt,
+			&i.OrganiserAlert.PaymentID,
+			&i.OrganiserAlert.Resolution,
 			&i.BookingReference,
+			&i.EventTitle,
 		); err != nil {
 			return nil, err
 		}
@@ -478,33 +570,92 @@ func (q *Queries) ListAlertViews(ctx context.Context, arg ListAlertViewsParams) 
 	return items, nil
 }
 
+const listIDLessPaymentCandidates = `-- name: ListIDLessPaymentCandidates :many
+SELECT p.id AS payment_id, p.booking_id, b.event_id
+FROM payments p
+JOIN bookings b ON b.id = p.booking_id
+WHERE p.checkout_request_id IS NULL
+  AND p.dispatch IN ('UNKNOWN', 'AMBIGUOUS')
+  AND p.status IN ('INITIATED', 'PENDING', 'TIMEOUT')
+  AND p.phone_e164 = $1
+  AND p.amount_cents = $2
+  AND p.created_at <= $3::timestamptz
+  AND p.created_at >= $3::timestamptz - make_interval(secs => $4::float8)
+ORDER BY p.created_at DESC, p.id DESC
+LIMIT 2
+`
+
+type ListIDLessPaymentCandidatesParams struct {
+	PhoneE164     string
+	AmountCents   int64
+	ReceivedAt    time.Time
+	WindowSeconds float64
+}
+
+type ListIDLessPaymentCandidatesRow struct {
+	PaymentID int64
+	BookingID int64
+	EventID   int64
+}
+
+// Payments an unknown-ID "paid" callback could belong to: no provider ID on the row, not
+// provably unsent, not already settled, the same phone and the same amount, and started no
+// more than window_seconds before the callback arrived. The caller acts only on exactly one.
+func (q *Queries) ListIDLessPaymentCandidates(ctx context.Context, arg ListIDLessPaymentCandidatesParams) ([]ListIDLessPaymentCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listIDLessPaymentCandidates,
+		arg.PhoneE164,
+		arg.AmountCents,
+		arg.ReceivedAt,
+		arg.WindowSeconds,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListIDLessPaymentCandidatesRow{}
+	for rows.Next() {
+		var i ListIDLessPaymentCandidatesRow
+		if err := rows.Scan(&i.PaymentID, &i.BookingID, &i.EventID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listRefundViews = `-- name: ListRefundViews :many
-SELECT r.id, r.booking_id, r.payment_id, r.amount_cents, r.reason, r.status, r.created_at, r.completed_at, b.reference AS booking_reference, b.event_id,
+SELECT r.id, r.booking_id, r.payment_id, r.amount_cents, r.reason, r.status, r.created_at, r.completed_at, b.reference AS booking_reference, b.event_id, b.status AS booking_status,
        p.phone_e164 AS payment_phone, p.mpesa_receipt
 FROM refunds r
 JOIN bookings b ON b.id = r.booking_id
 JOIN payments p ON p.id = r.payment_id
 WHERE ($1::text IS NULL OR r.status = $1::text)
   AND ($2::bigint IS NULL OR b.event_id = $2::bigint)
-  AND (NOT $3::boolean
-       OR (r.created_at, r.id) > ($4::timestamptz, $5::bigint))
+  AND ($3::text IS NULL OR b.reference = $3::text)
+  AND (NOT $4::boolean
+       OR (r.created_at, r.id) > ($5::timestamptz, $6::bigint))
 ORDER BY r.created_at, r.id
-LIMIT $6
+LIMIT $7
 `
 
 type ListRefundViewsParams struct {
-	Status          *string
-	EventID         *int64
-	HasCursor       bool
-	CursorCreatedAt time.Time
-	CursorID        int64
-	PageLimit       int32
+	Status           *string
+	EventID          *int64
+	BookingReference *string
+	HasCursor        bool
+	CursorCreatedAt  time.Time
+	CursorID         int64
+	PageLimit        int32
 }
 
 type ListRefundViewsRow struct {
 	Refund           Refund
 	BookingReference string
 	EventID          int64
+	BookingStatus    string
 	PaymentPhone     string
 	MpesaReceipt     *string
 }
@@ -515,6 +666,7 @@ func (q *Queries) ListRefundViews(ctx context.Context, arg ListRefundViewsParams
 	rows, err := q.db.Query(ctx, listRefundViews,
 		arg.Status,
 		arg.EventID,
+		arg.BookingReference,
 		arg.HasCursor,
 		arg.CursorCreatedAt,
 		arg.CursorID,
@@ -538,6 +690,7 @@ func (q *Queries) ListRefundViews(ctx context.Context, arg ListRefundViewsParams
 			&i.Refund.CompletedAt,
 			&i.BookingReference,
 			&i.EventID,
+			&i.BookingStatus,
 			&i.PaymentPhone,
 			&i.MpesaReceipt,
 		); err != nil {
@@ -599,10 +752,113 @@ func (q *Queries) ReceiptBelongsToAnotherPayment(ctx context.Context, arg Receip
 	return used, err
 }
 
+const resolveAlertsOfPayment = `-- name: ResolveAlertsOfPayment :execrows
+UPDATE organiser_alerts
+SET acknowledged_at = clock_timestamp(), resolution = $1::text
+WHERE payment_id = $2::bigint
+  AND kind = ANY($3::text[])
+  AND acknowledged_at IS NULL
+`
+
+type ResolveAlertsOfPaymentParams struct {
+	Resolution string
+	PaymentID  int64
+	Kinds      []string
+}
+
+// Closes the open alerts of the given kinds about one payment, with a note saying the system
+// did it and why. An alert a person already acknowledged is left as it is.
+func (q *Queries) ResolveAlertsOfPayment(ctx context.Context, arg ResolveAlertsOfPaymentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, resolveAlertsOfPayment, arg.Resolution, arg.PaymentID, arg.Kinds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const retryPaymentCallback = `-- name: RetryPaymentCallback :execrows
+UPDATE payment_callbacks
+SET next_attempt_at = clock_timestamp() + make_interval(secs => $1::float8),
+    last_error = $2
+WHERE id = $3 AND processed_at IS NULL
+`
+
+type RetryPaymentCallbackParams struct {
+	DelaySeconds float64
+	LastError    *string
+	ID           int64
+}
+
+// The inbox row could not be dealt with now (the event was busy, the database or M-Pesa did
+// not answer): it becomes due again after delay_seconds, by the database clock.
+func (q *Queries) RetryPaymentCallback(ctx context.Context, arg RetryPaymentCallbackParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryPaymentCallback, arg.DelaySeconds, arg.LastError, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const retryUnmatchedCallback = `-- name: RetryUnmatchedCallback :execrows
+UPDATE unmatched_callbacks
+SET next_attempt_at = clock_timestamp() + make_interval(secs => $1::float8),
+    last_error = $2
+WHERE id = $3 AND processed_at IS NULL
+`
+
+type RetryUnmatchedCallbackParams struct {
+	DelaySeconds float64
+	LastError    *string
+	ID           int64
+}
+
+func (q *Queries) RetryUnmatchedCallback(ctx context.Context, arg RetryUnmatchedCallbackParams) (int64, error) {
+	result, err := q.db.Exec(ctx, retryUnmatchedCallback, arg.DelaySeconds, arg.LastError, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setAlertPayment = `-- name: SetAlertPayment :execrows
+UPDATE organiser_alerts SET payment_id = $1::bigint, booking_id = COALESCE(booking_id, $2::bigint)
+WHERE id = $3 AND payment_id IS NULL
+`
+
+type SetAlertPaymentParams struct {
+	PaymentID int64
+	BookingID int64
+	ID        int64
+}
+
+// Ties an alert raised for an unmatched callback to the payment the callback turned out to
+// be for.
+func (q *Queries) SetAlertPayment(ctx context.Context, arg SetAlertPaymentParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setAlertPayment, arg.PaymentID, arg.BookingID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setPaymentNotSent = `-- name: SetPaymentNotSent :execrows
+UPDATE payments SET dispatch = 'NOT_SENT' WHERE id = $1 AND checkout_request_id IS NULL
+`
+
+// Records that the STK push provably never left us, so the payment may be closed without an
+// alert even if marking it FAILED does not go through.
+func (q *Queries) SetPaymentNotSent(ctx context.Context, id int64) (int64, error) {
+	result, err := q.db.Exec(ctx, setPaymentNotSent, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setPaymentPending = `-- name: SetPaymentPending :execrows
 UPDATE payments
 SET status = 'PENDING', checkout_request_id = $1::text,
-    merchant_request_id = $2
+    merchant_request_id = $2, dispatch = 'ACCEPTED'
 WHERE id = $3 AND status = $4
 `
 
@@ -628,9 +884,34 @@ func (q *Queries) SetPaymentPending(ctx context.Context, arg SetPaymentPendingPa
 	return result.RowsAffected(), nil
 }
 
+const setPaymentPendingUnknownID = `-- name: SetPaymentPendingUnknownID :execrows
+UPDATE payments
+SET status = 'PENDING', dispatch = 'AMBIGUOUS', result_desc = $1::text
+WHERE id = $2 AND status = $3 AND checkout_request_id IS NULL
+`
+
+type SetPaymentPendingUnknownIDParams struct {
+	ResultDesc string
+	ID         int64
+	FromStatus string
+}
+
+// The STK push may have reached M-Pesa but its answer was lost: the payment stays live,
+// PENDING, with no provider ID, marked AMBIGUOUS. While it is live no second payment can start
+// for the booking, so the fan cannot pay twice inside the window. The caller holds the row
+// lock and has asked domain.TransitionPayment with the status it read.
+func (q *Queries) SetPaymentPendingUnknownID(ctx context.Context, arg SetPaymentPendingUnknownIDParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setPaymentPendingUnknownID, arg.ResultDesc, arg.ID, arg.FromStatus)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const setPaymentProviderIDs = `-- name: SetPaymentProviderIDs :execrows
 UPDATE payments
-SET checkout_request_id = $1::text, merchant_request_id = $2
+SET checkout_request_id = $1::text,
+    merchant_request_id = COALESCE($2, merchant_request_id), dispatch = 'ACCEPTED'
 WHERE id = $3 AND checkout_request_id IS NULL
 `
 
@@ -650,22 +931,144 @@ func (q *Queries) SetPaymentProviderIDs(ctx context.Context, arg SetPaymentProvi
 	return result.RowsAffected(), nil
 }
 
-const storeRawCallback = `-- name: StoreRawCallback :execrows
-UPDATE payments SET raw_callback = $1::jsonb
-WHERE id = $2 AND raw_callback IS NULL
+const setPaymentResult = `-- name: SetPaymentResult :execrows
+UPDATE payments
+SET result_code = $1,
+    result_desc = $2,
+    mpesa_receipt = COALESCE($3, mpesa_receipt),
+    raw_callback = COALESCE($4::jsonb, raw_callback)
+WHERE id = $5 AND status = $6
 `
 
-type StoreRawCallbackParams struct {
-	RawCallback json.RawMessage
-	ID          int64
+type SetPaymentResultParams struct {
+	ResultCode   *int32
+	ResultDesc   *string
+	MpesaReceipt *string
+	RawCallback  []byte
+	ID           int64
+	Status       string
 }
 
-// Keeps a callback body that changed nothing (a repeat, or one that could not be verified)
-// when the payment has none stored yet, for dispute resolution.
-func (q *Queries) StoreRawCallback(ctx context.Context, arg StoreRawCallbackParams) (int64, error) {
-	result, err := q.db.Exec(ctx, storeRawCallback, arg.RawCallback, arg.ID)
+// Rewrites the result of a payment that keeps its status: a FAILED payment that M-Pesa later
+// confirms was paid, for an amount that is not the booking's, stays FAILED but now carries
+// the success code and receipt its refund is read with. The caller holds the row lock.
+func (q *Queries) SetPaymentResult(ctx context.Context, arg SetPaymentResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setPaymentResult,
+		arg.ResultCode,
+		arg.ResultDesc,
+		arg.MpesaReceipt,
+		arg.RawCallback,
+		arg.ID,
+		arg.Status,
+	)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setUnmatchedCallbackAlert = `-- name: SetUnmatchedCallbackAlert :execrows
+UPDATE unmatched_callbacks SET alert_id = $1::bigint WHERE id = $2 AND alert_id IS NULL
+`
+
+type SetUnmatchedCallbackAlertParams struct {
+	AlertID int64
+	ID      int64
+}
+
+// Remembers the alert raised for an unmatched callback, so it is raised once.
+func (q *Queries) SetUnmatchedCallbackAlert(ctx context.Context, arg SetUnmatchedCallbackAlertParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setUnmatchedCallbackAlert, arg.AlertID, arg.ID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const upsertPaymentCallback = `-- name: UpsertPaymentCallback :one
+INSERT INTO payment_callbacks (payment_id, checkout_request_id, merchant_request_id, result_code, result_desc,
+                               amount_cents, mpesa_receipt, phone_e164, raw)
+VALUES ($1, $2, $3, $4,
+        $5, $6, $7, $8, $9::jsonb)
+ON CONFLICT ON CONSTRAINT payment_callbacks_payment_result_key DO UPDATE
+SET result_desc = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.result_desc ELSE EXCLUDED.result_desc END,
+    amount_cents = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.amount_cents ELSE EXCLUDED.amount_cents END,
+    mpesa_receipt = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.mpesa_receipt ELSE EXCLUDED.mpesa_receipt END,
+    phone_e164 = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.phone_e164 ELSE EXCLUDED.phone_e164 END,
+    raw = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.raw ELSE EXCLUDED.raw END,
+    next_attempt_at = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.next_attempt_at
+                           ELSE LEAST(payment_callbacks.next_attempt_at, clock_timestamp()) END,
+    processed_at = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.processed_at END,
+    verdict = CASE WHEN payment_callbacks.verdict = 'APPLIED' THEN payment_callbacks.verdict END
+RETURNING id
+`
+
+type UpsertPaymentCallbackParams struct {
+	PaymentID         int64
+	CheckoutRequestID string
+	MerchantRequestID *string
+	ResultCode        int32
+	ResultDesc        *string
+	AmountCents       *int64
+	MpesaReceipt      *string
+	PhoneE164         *string
+	Raw               json.RawMessage
+}
+
+// The callback inbox: written by the webhook before it answers. One row per (payment,
+// result). A repeat of a result that was not applied replaces the stored body and makes the
+// row due again; a repeat of one that was applied changes nothing.
+func (q *Queries) UpsertPaymentCallback(ctx context.Context, arg UpsertPaymentCallbackParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertPaymentCallback,
+		arg.PaymentID,
+		arg.CheckoutRequestID,
+		arg.MerchantRequestID,
+		arg.ResultCode,
+		arg.ResultDesc,
+		arg.AmountCents,
+		arg.MpesaReceipt,
+		arg.PhoneE164,
+		arg.Raw,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
+}
+
+const upsertUnmatchedCallback = `-- name: UpsertUnmatchedCallback :one
+INSERT INTO unmatched_callbacks (checkout_request_id, merchant_request_id, result_code, result_desc,
+                                 amount_cents, mpesa_receipt, phone_e164, raw)
+VALUES ($1, $2, $3,
+        $4, $5, $6, $7, $8::jsonb)
+ON CONFLICT ON CONSTRAINT unmatched_callbacks_checkout_request_id_key DO UPDATE
+SET attempts = unmatched_callbacks.attempts
+RETURNING id
+`
+
+type UpsertUnmatchedCallbackParams struct {
+	CheckoutRequestID string
+	MerchantRequestID *string
+	ResultCode        int32
+	ResultDesc        *string
+	AmountCents       *int64
+	MpesaReceipt      *string
+	PhoneE164         *string
+	Raw               json.RawMessage
+}
+
+// A "paid" callback whose CheckoutRequestID no payment has. Kept once per ID.
+func (q *Queries) UpsertUnmatchedCallback(ctx context.Context, arg UpsertUnmatchedCallbackParams) (int64, error) {
+	row := q.db.QueryRow(ctx, upsertUnmatchedCallback,
+		arg.CheckoutRequestID,
+		arg.MerchantRequestID,
+		arg.ResultCode,
+		arg.ResultDesc,
+		arg.AmountCents,
+		arg.MpesaReceipt,
+		arg.PhoneE164,
+		arg.Raw,
+	)
+	var id int64
+	err := row.Scan(&id)
+	return id, err
 }

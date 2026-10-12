@@ -168,6 +168,26 @@ func TestLedgerRulesEachFireOnACorruptState(t *testing.T) {
 			[]string{`UPDATE bookings SET status = 'EXPIRED' WHERE id = $1`}, [][]any{{s.PaidBooking}}},
 		{"money that bought nothing is queued for refund",
 			[]string{`UPDATE bookings SET status = 'REFUND_REQUIRED' WHERE id = $1`}, [][]any{{s.PaidBooking}}},
+		// Money received and dropped, in each of the four ways the ledger can know of it.
+		{"a FAILED or TIMEOUT payment with evidence that it was paid has a refund",
+			[]string{`INSERT INTO payments (booking_id, amount_cents, phone_e164, status, result_code) VALUES ($1, 200000, '+254711000001', 'FAILED', 0)`},
+			[][]any{{s.LiveBooking}}},
+		{"a FAILED or TIMEOUT payment with evidence that it was paid has a refund",
+			[]string{`INSERT INTO payments (booking_id, amount_cents, phone_e164, status, result_code, raw_callback)
+			          VALUES ($1, 200000, '+254711000001', 'FAILED', 1032, '{"Body":{"stkCallback":{"CheckoutRequestID":"ws_CO_x","ResultCode":0}}}')`},
+			[][]any{{s.LiveBooking}}},
+		{"a FAILED or TIMEOUT payment with evidence that it was paid has a refund",
+			[]string{`WITH p AS (INSERT INTO payments (booking_id, amount_cents, phone_e164, status, checkout_request_id)
+			                     VALUES ($1, 200000, '+254711000001', 'FAILED', 'ws_CO_dropped') RETURNING id)
+			          INSERT INTO payment_callbacks (payment_id, checkout_request_id, result_code, raw, processed_at, verdict)
+			          SELECT id, 'ws_CO_dropped', 0, '{}', now(), 'APPLIED' FROM p`},
+			[][]any{{s.LiveBooking}}},
+		{"a FAILED or TIMEOUT payment with evidence that it was paid has a refund",
+			[]string{`WITH p AS (INSERT INTO payments (booking_id, amount_cents, phone_e164, status)
+			                     VALUES ($1, 200000, '+254711000001', 'TIMEOUT') RETURNING id)
+			          INSERT INTO unmatched_callbacks (checkout_request_id, result_code, raw, processed_at, verdict, matched_payment_id)
+			          SELECT 'ws_CO_never_learned', 0, '{}', now(), 'MATCHED', id FROM p`},
+			[][]any{{s.LiveBooking}}},
 		{"a booking has at most one live payment",
 			[]string{`DROP INDEX payments_live_booking_idx`,
 				`INSERT INTO payments (booking_id, amount_cents, phone_e164, status) VALUES ($1, 200000, '+254711000001', 'PENDING'), ($1, 200000, '+254711000001', 'INITIATED')`},
@@ -205,6 +225,33 @@ func TestLedgerRulesEachFireOnACorruptState(t *testing.T) {
 			}
 		})
 	}
+	// The same rule stays quiet for what is not evidence of money: a callback M-Pesa's own
+	// answer contradicted, one still waiting to be worked on, a plain failure, and a payment
+	// whose refund IS queued.
+	t.Run("the dropped-money rule does not fire without evidence, or with a refund", func(t *testing.T) {
+		tx, err := db.Pool.Begin(ctx)
+		require.NoError(t, err)
+		defer func() { _ = tx.Rollback(ctx) }()
+		for _, sql := range []string{
+			`WITH p AS (INSERT INTO payments (booking_id, amount_cents, phone_e164, status, result_code, checkout_request_id)
+			             VALUES ($1, 200000, '+254711000001', 'FAILED', 1032, 'ws_CO_refuted') RETURNING id)
+			  INSERT INTO payment_callbacks (payment_id, checkout_request_id, result_code, raw, processed_at, verdict)
+			  SELECT id, 'ws_CO_refuted', 0, '{}', now(), 'REFUTED' FROM p`,
+			`WITH p AS (INSERT INTO payments (booking_id, amount_cents, phone_e164, status, checkout_request_id)
+			             VALUES ($1, 200000, '+254711000001', 'TIMEOUT', 'ws_CO_waiting') RETURNING id)
+			  INSERT INTO payment_callbacks (payment_id, checkout_request_id, result_code, raw) SELECT id, 'ws_CO_waiting', 0, '{}' FROM p`,
+			`WITH p AS (INSERT INTO payments (booking_id, amount_cents, phone_e164, status, result_code, checkout_request_id)
+			             VALUES ($1, 200000, '+254711000001', 'FAILED', 0, 'ws_CO_refunded') RETURNING id)
+			  INSERT INTO refunds (booking_id, payment_id, amount_cents, reason) SELECT $1, id, 200100, 'wrong amount' FROM p`,
+		} {
+			_, err := tx.Exec(ctx, sql, s.LiveBooking)
+			require.NoError(t, err, sql)
+		}
+		found, err := testinvariants.LedgerViolations(ctx, tx, s.EventID)
+		require.NoError(t, err)
+		assert.Empty(t, found)
+	})
+
 	for _, name := range testinvariants.LedgerRuleNames() {
 		assert.True(t, proven[name], "ledger rule %q has no corrupt state that proves it fires", name)
 	}

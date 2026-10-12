@@ -131,6 +131,8 @@ func TestAdmin_AlertsAndRefunds(t *testing.T) {
 	require.Len(t, items(alerts), 2)
 	newest, oldest := items(alerts)[0].(obj), items(alerts)[1].(obj)
 	assert.Equal(t, "AMOUNT_MISMATCH", newest["kind"], "newest first")
+	assert.Equal(t, queryText(t, `SELECT title FROM events WHERE id = $1`, ev.ID), newest["event_title"], "the page need not look the title up")
+	assert.Nil(t, newest["resolution"], "open: nobody and nothing has closed it")
 	assert.Equal(t, w.Ref, newest["booking_reference"])
 	assert.EqualValues(t, w.BookingID, newest["booking_id"])
 	assert.EqualValues(t, ev.ID, newest["event_id"])
@@ -156,6 +158,7 @@ func TestAdmin_AlertsAndRefunds(t *testing.T) {
 	alertID := id64(oldest["id"])
 	acked := want(t, e.do("POST", fmt.Sprintf("/admin/alerts/%d/ack", alertID), nil, organiser), http.StatusOK)
 	require.NotNil(t, acked["acknowledged_at"])
+	assert.Nil(t, acked["resolution"], "acknowledged by a person: no resolution note")
 	assert.Equal(t, oldest["message"], acked["message"])
 	exec(t, `UPDATE organiser_alerts SET acknowledged_at = acknowledged_at - interval '1 hour' WHERE id = $1`, alertID)
 	first := queryText(t, `SELECT acknowledged_at::text FROM organiser_alerts WHERE id = $1`, alertID)
@@ -195,6 +198,15 @@ func TestAdmin_AlertsAndRefunds(t *testing.T) {
 	assert.Equal(t, "Paid after the hold ended; the seats were no longer reserved", ra["reason"])
 	assert.Equal(t, "PENDING", ra["status"])
 	assert.Nil(t, ra["completed_at"])
+	assert.Equal(t, "REFUND_REQUIRED", ra["booking_status"], "what completing it will do depends on this")
+	assert.NotContains(t, ra, "already_completed", "only the answer of completeRefund carries it")
+	// One booking's refunds, so an alert can link to its refund.
+	byRef := want(t, e.do("GET", "/admin/refunds?booking_reference="+w.Ref, nil, organiser), http.StatusOK)
+	require.Len(t, items(byRef), 1)
+	assert.Equal(t, rw["id"], items(byRef)[0].(obj)["id"])
+	assert.Empty(t, items(want(t, e.do("GET", "/admin/refunds?booking_reference=TLT-ZZZZZ9", nil, organiser), http.StatusOK)))
+	assert.Empty(t, items(want(t, e.do("GET", fmt.Sprintf("/admin/refunds?booking_reference=%s&event_id=%d", w.Ref, other.ID), nil, organiser), http.StatusOK)))
+	wantFields(t, e.do("GET", "/admin/refunds?booking_reference=nope", nil, organiser, contracttest.LenientRequest()), "booking_reference")
 	assert.EqualValues(t, w.Total+100, rw["amount_cents"])
 	rp1 := want(t, e.do("GET", fmt.Sprintf("/admin/refunds?event_id=%d&limit=1", ev.ID), nil, organiser), http.StatusOK)
 	require.NotNil(t, rp1["next_cursor"])
@@ -211,12 +223,37 @@ func TestAdmin_AlertsAndRefunds(t *testing.T) {
 	done := want(t, e.do("POST", fmt.Sprintf("/admin/refunds/%d/complete", refundID), nil, organiser), http.StatusOK)
 	assert.Equal(t, "DONE", done["status"])
 	require.NotNil(t, done["completed_at"])
+	assert.Equal(t, false, done["already_completed"], "this call did the work")
+	assert.Equal(t, "REFUNDED", done["booking_status"])
 	assert.Equal(t, "REFUNDED", bookingStatus(t, a.BookingID), "its only refund is paid")
 	assert.Equal(t, "REFUNDED", e.getBooking(a.Token, a.Ref)["status"])
 	assert.Equal(t, "REFUND_REQUIRED", bookingStatus(t, w.BookingID), "the other booking is still owed")
-	// Safe to repeat: the same answer, the same completion time.
+	// Safe to repeat: still 200, the same refund, the same completion time; only
+	// already_completed tells the repeat from the call that did the work.
 	again := want(t, e.do("POST", fmt.Sprintf("/admin/refunds/%d/complete", refundID), nil, admin), http.StatusOK)
+	assert.Equal(t, true, again["already_completed"])
+	again["already_completed"] = false
 	assert.Equal(t, done, again)
+	// The REFUND_REQUIRED alert of that payment was acknowledged by a person earlier; the
+	// system does not rewrite that.
+	assert.Equal(t, 1, queryInt(t, `SELECT count(*) FROM organiser_alerts WHERE id = $1 AND resolution IS NULL`, alertID))
+
+	// Completing the other refund closes ITS alert, which nobody had acknowledged, with a
+	// note that the system did it. Then the test puts the refund back for what follows.
+	wDone := want(t, e.do("POST", fmt.Sprintf("/admin/refunds/%d/complete", id64(rw["id"])), nil, organiser), http.StatusOK)
+	assert.Equal(t, false, wDone["already_completed"])
+	closed := want(t, e.do("GET", fmt.Sprintf("/admin/alerts?event_id=%d&acknowledged=true", ev.ID), nil, organiser), http.StatusOK)
+	require.Len(t, items(closed), 2)
+	var byKind = map[string]obj{}
+	for _, it := range items(closed) {
+		byKind[it.(obj)["kind"].(string)] = it.(obj)
+	}
+	assert.Equal(t, "Resolved automatically: the refund was marked as paid back.", byKind["AMOUNT_MISMATCH"]["resolution"])
+	assert.NotNil(t, byKind["AMOUNT_MISMATCH"]["acknowledged_at"])
+	assert.Nil(t, byKind["REFUND_REQUIRED"]["resolution"])
+	assert.EqualValues(t, 0, e.sales(ev)["open_alert_count"])
+	exec(t, `UPDATE refunds SET status = 'PENDING', completed_at = NULL WHERE id = $1`, id64(rw["id"]))
+	exec(t, `UPDATE bookings SET status = 'REFUND_REQUIRED' WHERE id = $1`, w.BookingID)
 
 	// The sales summary stops counting a booking once its refund is done.
 	s = e.sales(ev)

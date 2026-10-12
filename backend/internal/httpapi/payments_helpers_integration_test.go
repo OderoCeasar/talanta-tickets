@@ -39,6 +39,14 @@ func withProvider(fn func(m *mock.Provider) payments.Provider) envOption {
 	return func(c *envConfig) { c.provider = fn }
 }
 
+func withTicketIssuer(fn func(real payments.TicketIssuer) payments.TicketIssuer) envOption {
+	return func(c *envConfig) { c.ticketIssuer = fn }
+}
+
+func withPaymentClock(now func() time.Time) envOption {
+	return func(c *envConfig) { c.paymentNow = now }
+}
+
 func withCallbackAllowlist(cidrs ...string) envOption {
 	return func(c *envConfig) {
 		for _, s := range cidrs {
@@ -194,8 +202,32 @@ func (e *env) pay(c checkout, outcome string) obj {
 	e.t.Helper()
 	p := want(e.t, e.stk(c.Token, c.BookingID, payPhone, outcome), http.StatusAccepted)
 	require.Equal(e.t, "PENDING", p["status"])
-	require.NotNil(e.t, p["checkout_request_id"])
+	require.NotContains(e.t, p, "checkout_request_id", "Daraja's request IDs are not sent to clients")
+	require.NotContains(e.t, p, "merchant_request_id")
+	require.NotEmpty(e.t, checkoutIDOf(e.t, id64(p["id"])), "the ID is on the row all the same")
 	return p
+}
+
+// checkoutIDOf reads a payment's CheckoutRequestID from the table: the API does not send it.
+func checkoutIDOf(t testing.TB, paymentID int64) string {
+	t.Helper()
+	return queryText(t, `SELECT COALESCE(checkout_request_id, '') FROM payments WHERE id = $1`, paymentID)
+}
+
+// fanHasPaid moves the mock provider's clock past its callback delay: from now on its own
+// answer to a status query is the payment's outcome. A hand-posted "paid" callback is only
+// a hint to ask the provider, so tests that post one say first that the provider agrees.
+func (e *env) fanHasPaid() { e.mockClock.Advance(time.Minute) }
+
+// drain makes every stored callback due and runs the worker's drain job once.
+func (e *env) drain() payments.DrainResult {
+	e.t.Helper()
+	exec(e.t, `UPDATE payment_callbacks SET next_attempt_at = now() WHERE processed_at IS NULL`)
+	exec(e.t, `UPDATE unmatched_callbacks SET next_attempt_at = now() WHERE processed_at IS NULL`)
+	res, err := e.payments.DrainCallbacks(context.Background())
+	require.NoError(e.t, err)
+	e.payments.Wait()
+	return res
 }
 
 func (e *env) getPayment(token string, id int64) obj {

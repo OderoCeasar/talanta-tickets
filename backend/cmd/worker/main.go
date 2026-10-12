@@ -1,4 +1,5 @@
-// Command worker runs the background jobs: the hold expiry sweeper and payment reconciliation.
+// Command worker runs the background jobs: the hold expiry sweeper, payment reconciliation
+// and the drain of stored M-Pesa callbacks.
 // It is a separate process so a slow job never competes with request handling.
 package main
 
@@ -108,12 +109,34 @@ func jobs(cfg config.Worker, db store.DBTX, holds sweeper, pay reconciler, logge
 		authCleanupJob(db, logger),
 		holdSweeperJob(cfg, holds, logger),
 		reconcileJob(cfg, pay, logger),
+		callbackDrainJob(cfg, pay, logger),
 	}
 }
 
 // reconciler is the part of the payment service the worker runs.
 type reconciler interface {
 	Reconcile(ctx context.Context) (payments.ReconcileResult, error)
+	DrainCallbacks(ctx context.Context) (payments.DrainResult, error)
+}
+
+// callbackDrainJob works through M-Pesa callbacks the webhook stored and nobody has dealt
+// with yet (see payments.Service.DrainCallbacks), every CALLBACK_DRAIN_INTERVAL. The API works
+// on a callback the moment it has stored it; this job is what makes that work survive a busy
+// event, a failed query to M-Pesa, a full queue and a restart.
+func callbackDrainJob(cfg config.Worker, pay reconciler, logger *slog.Logger) worker.Job {
+	return worker.Job{
+		Name:     "payment-callback-drain",
+		Interval: cfg.Payments.CallbackDrainInterval,
+		Timeout:  5 * time.Minute,
+		Run: func(ctx context.Context) error {
+			n, err := pay.DrainCallbacks(ctx)
+			if n.Claimed > 0 {
+				logger.InfoContext(ctx, "payment callback drain", "job", "payment-callback-drain",
+					"claimed", n.Claimed, "done", n.Done, "retry", n.Retry)
+			}
+			return err
+		},
+	}
 }
 
 // reconcileJob settles payments whose callback never came (see payments.Service.Reconcile),
@@ -126,10 +149,10 @@ func reconcileJob(cfg config.Worker, pay reconciler, logger *slog.Logger) worker
 		Timeout: 5 * time.Minute,
 		Run: func(ctx context.Context) error {
 			n, err := pay.Reconcile(ctx)
-			if n.Claimed > 0 {
+			if n.Claimed > 0 || n.Requeried > 0 {
 				logger.InfoContext(ctx, "payment reconciliation", "job", "payment-reconciliation",
-					"claimed", n.Claimed, "sold", n.Sold, "refunds", n.Refunds, "failed", n.Failed,
-					"timed_out", n.TimedOut, "still_pending", n.Pending, "errors", n.Errors)
+					"claimed", n.Claimed, "requeried", n.Requeried, "sold", n.Sold, "refunds", n.Refunds, "failed", n.Failed,
+					"timed_out", n.TimedOut, "still_pending", n.Pending, "errors", n.Errors, "out_of_time", n.OutOfTime)
 			}
 			return err
 		},

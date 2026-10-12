@@ -1,9 +1,11 @@
 package httpapi
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/netip"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 
@@ -103,36 +105,54 @@ func callbackAllowed(allowed []netip.Prefix, ip netip.Addr) bool {
 	return false
 }
 
-// mpesaCallback is Daraja's STK result callback. It ALWAYS answers 200
-// { "ResultCode": 0, "ResultDesc": "Accepted" }, at once, whatever was sent and wherever it
-// came from: Daraja must not retry, and a prober must learn nothing from the answer.
+// callbackStoreTimeout bounds the one thing the webhook waits for: writing the callback down.
+const callbackStoreTimeout = 5 * time.Second
+
+// mpesaCallback is Daraja's STK result callback. It answers 200
+// { "ResultCode": 0, "ResultDesc": "Accepted" } whatever was sent and wherever it came from:
+// Daraja must not retry a body we will never accept, and a prober must learn nothing from the
+// answer.
 //
 // The body is never trusted alone. Here it is only checked for where it came from (the
 // address the router resolved, against MPESA_CALLBACK_ALLOWED_CIDRS) and for being Daraja's
-// envelope. The payment service then matches it to a payment we know, requires that payment
-// to be still open and checks the amount, on a background goroutine so this handler never
-// waits on the database.
+// envelope. A callback that passes is WRITTEN DOWN before the answer is sent (the callback
+// inbox), so it cannot be lost to a busy event, a full queue or a restart; the real work
+// (asking Daraja to confirm it, then selling or refunding) runs afterwards in the background
+// and is retried by the worker until it is done.
+//
+// The one answer that is not 200 is 503, when the callback is a real one and could not be
+// written down: saying "Accepted" then would be a lie that loses the report.
 func (s *Server) mpesaCallback(w http.ResponseWriter, r *http.Request) {
-	defer writeJSON(w, http.StatusOK, mpesaCallbackAck{ResultCode: 0, ResultDesc: "Accepted"})
+	accepted := func() { writeJSON(w, http.StatusOK, mpesaCallbackAck{ResultCode: 0, ResultDesc: "Accepted"}) }
 	log := LoggerFrom(r.Context())
 
 	ip := ClientIP(r.Context())
 	if !callbackAllowed(s.callbackAllowed, ip) {
 		log.WarnContext(r.Context(), "mpesa callback ignored: source address is not in MPESA_CALLBACK_ALLOWED_CIDRS", "client_ip", ip.String())
+		accepted()
 		return
 	}
 	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxCallbackBody))
 	if err != nil {
 		log.WarnContext(r.Context(), "mpesa callback ignored: body unreadable or too large", "err", err)
+		accepted()
 		return
 	}
 	cb, err := mpesa.ParseCallback(raw)
 	if err != nil {
 		log.WarnContext(r.Context(), "mpesa callback ignored: not an STK callback", "bytes", len(raw))
+		accepted()
 		return
 	}
-	if !s.payments.HandleCallbackAsync(r.Context(), cb) {
-		log.ErrorContext(r.Context(), "mpesa callback not processed now: too much callback work in flight; reconciliation will finish the payment",
-			"checkout_request_id", cb.CheckoutRequestID)
+	// Stored even if Daraja hangs up while we write.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), callbackStoreTimeout)
+	defer cancel()
+	if err := s.payments.HandleCallbackAsync(ctx, cb); err != nil {
+		log.ErrorContext(r.Context(), "mpesa callback could NOT be stored; answering 503 so it is not taken as accepted",
+			"checkout_request_id", cb.CheckoutRequestID, "result_code", cb.ResultCode, "err", err)
+		w.Header().Set("Retry-After", "5")
+		writeJSON(w, http.StatusServiceUnavailable, mpesaCallbackAck{ResultCode: 1, ResultDesc: "Temporarily unavailable"})
+		return
 	}
+	accepted()
 }

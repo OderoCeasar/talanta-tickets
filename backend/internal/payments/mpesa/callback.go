@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"math"
 	"strings"
 
 	"github.com/OderoCeasar/talanta-tickets/backend/internal/payments"
@@ -19,7 +20,10 @@ var ErrBadCallback = errors.New("mpesa: not an STK callback")
 //
 // Unknown fields are accepted. The amount is read from the JSON number's own digits into
 // cents with no float in between; an amount that is missing, negative, or has more than two
-// decimals is left nil, which the payment flow treats as "cannot be verified".
+// decimals is left nil. (The amount is only ever a claim: see payments.Finish.)
+//
+// ResultCode must fit a 32-bit integer, which is what it is stored as. A larger number is
+// not a callback: 4294967296 cut down to 32 bits is 0, which is "success".
 func ParseCallback(raw []byte) (payments.Callback, error) {
 	var env struct {
 		Body struct {
@@ -44,7 +48,7 @@ func ParseCallback(raw []byte) (payments.Callback, error) {
 	}
 	c := env.Body.Callback
 	code, err := c.ResultCode.Int64()
-	if err != nil || c.CheckoutRequestID == "" {
+	if err != nil || code < math.MinInt32 || code > math.MaxInt32 || c.CheckoutRequestID == "" {
 		return payments.Callback{}, ErrBadCallback
 	}
 	cb := payments.Callback{
@@ -63,9 +67,26 @@ func ParseCallback(raw []byte) (payments.Callback, error) {
 			if json.Unmarshal(item.Value, &receipt) == nil {
 				cb.Receipt = strings.TrimSpace(receipt)
 			}
+		case "PhoneNumber":
+			cb.Phone = msisdnToE164(strings.Trim(value, `"`))
 		}
 	}
 	return cb, nil
+}
+
+// msisdnToE164 turns Daraja's 254712345678 into +254712345678. Anything that is not 9 to 15
+// digits (a masked number, for one) gives "": the callback then names no phone we can use.
+func msisdnToE164(s string) string {
+	s = strings.TrimPrefix(s, "+")
+	if len(s) < 9 || len(s) > 15 {
+		return ""
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return ""
+		}
+	}
+	return "+" + s
 }
 
 // shillingsToCents reads a decimal number of shillings ("1000", "1000.0", "1000.50") into
