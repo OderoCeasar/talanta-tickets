@@ -23,7 +23,11 @@ const SessionContext = createContext<SessionValue | null>(null);
 async function forgetUser(): Promise<void> {
   await tokenStore.clearTokens();
   await clearUserStorage();
-  queryClient.clear();
+  // Everything private goes. The public reads (events, seat maps) stay mounted on the screens
+  // behind, so they are reset instead: they load again with no token, and a seat map loses
+  // the "held by you" seats it was showing.
+  queryClient.removeQueries({ predicate: (query) => query.queryKey[0] !== "events" });
+  void queryClient.resetQueries({ queryKey: ["events"] });
   useBookingFlow.getState().reset();
 }
 

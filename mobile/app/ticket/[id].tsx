@@ -13,7 +13,8 @@ import { formatPhone } from "../../src/lib/phone";
 import { formatClock, formatDate, formatTime } from "../../src/lib/time";
 import { useNow } from "../../src/lib/useNow";
 import { useSession } from "../../src/session";
-import { palette, radius, space, type } from "../../src/theme";
+import { standTitle } from "../../src/lib/labels";
+import { font, palette, radius, space, type } from "../../src/theme";
 import { Banner, ErrorState, Icon, Loading, Screen } from "../../src/ui";
 
 type Ticket = Schemas["Ticket"];
@@ -153,7 +154,7 @@ export default function TicketScreen() {
         </View>
 
         <View style={styles.grid}>
-          <Cell label="Stand" value={l.stand_name} wide />
+          <Cell label="Stand" value={standTitle(l.stand_name, l.tier)} wide />
           <Cell label="Block" value={l.block_code} />
           <Cell label="Row" value={l.row_label} />
           <Cell label="Seat" value={String(l.seat_number)} testID="ticket-seat" />
@@ -183,21 +184,21 @@ const styles = StyleSheet.create({
   ticket: { backgroundColor: palette.white, borderRadius: radius.lg, overflow: "hidden", borderWidth: StyleSheet.hairlineWidth, borderColor: palette.grey300 },
   head: { backgroundColor: palette.emeraldInk, padding: space.lg, gap: 2 },
   headOver: { ...type.overline, color: palette.champagne },
-  headTitle: { fontSize: 22, lineHeight: 28, fontWeight: "800", color: palette.white },
-  headMeta: { fontSize: 15, color: palette.champagne300 },
+  headTitle: { ...type.display, fontSize: 22, lineHeight: 28 },
+  headMeta: { ...type.muted, color: palette.champagne300 },
   live: { flexDirection: "row", alignItems: "center", gap: space.sm, backgroundColor: palette.champagne, paddingHorizontal: space.lg, paddingVertical: space.sm, overflow: "hidden", flexWrap: "wrap" },
   sweep: { position: "absolute", left: 0, top: 0, bottom: 0, width: 90, backgroundColor: palette.champagne300, opacity: 0.9, transform: [{ skewX: "-20deg" }] },
   liveDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: palette.emeraldInk },
-  liveText: { fontSize: 12, fontWeight: "700", letterSpacing: 1, color: palette.emeraldInk },
-  liveClock: { fontSize: 20, fontWeight: "800", color: palette.emeraldInk, fontVariant: ["tabular-nums"], marginLeft: "auto" },
+  liveText: { fontFamily: font.bodySemiBold, fontSize: 12, letterSpacing: 1, color: palette.emeraldInk },
+  liveClock: { ...type.clock, fontSize: 20, lineHeight: 26, marginLeft: "auto" },
   qrWrap: { alignItems: "center", padding: space.xl, gap: space.sm },
   qr: { padding: space.sm, backgroundColor: palette.white },
   qrOff: { opacity: 0.25 },
   gate: { flexDirection: "row", alignItems: "center", gap: space.md, backgroundColor: palette.emeraldInk, marginHorizontal: space.lg, borderRadius: radius.md, padding: space.md },
-  gateOver: { fontSize: 11, fontWeight: "700", letterSpacing: 1, color: palette.champagne300 },
-  gateValue: { fontSize: 22, fontWeight: "800", color: palette.white },
+  gateOver: { fontFamily: font.bodySemiBold, fontSize: 11, letterSpacing: 1, color: palette.champagne300 },
+  gateValue: { ...type.price, fontSize: 22, lineHeight: 28, color: palette.white },
   grid: { flexDirection: "row", flexWrap: "wrap", padding: space.lg, rowGap: space.md },
   cell: { width: "33.33%", gap: 2, paddingRight: space.sm },
   cellWide: { width: "100%" },
-  cellValue: { fontSize: 18, fontWeight: "700", color: palette.grey900 },
+  cellValue: { fontFamily: font.headingBold, fontSize: 18, lineHeight: 24, color: palette.grey900 },
 });

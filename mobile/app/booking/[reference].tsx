@@ -4,12 +4,13 @@ import { BackHandler, StyleSheet, Text, View } from "react-native";
 
 import { useBooking } from "../../src/api/queries";
 import { TicketRow } from "../../src/features/tickets/TicketRow";
+import { paymentOutcome } from "../../src/lib/errors";
 import { formatKes } from "../../src/lib/money";
 import { formatDateTime } from "../../src/lib/time";
 import { palette, space, type } from "../../src/theme";
 import { Banner, Button, Card, ErrorState, Icon, Loading, Screen } from "../../src/ui";
 
-/** Shown once a booking is paid: the tickets, and what was paid. */
+/** One booking as the server has it now: the tickets once paid, otherwise what became of the payment. */
 export default function BookingScreen() {
   const { reference } = useLocalSearchParams<{ reference: string }>();
   const booking = useBooking(reference);
@@ -31,6 +32,11 @@ export default function BookingScreen() {
 
   const b = booking.data;
   const paid = b.status === "PAID";
+  // Not paid: say what the server says about the latest payment now. A payment M-Pesa never
+  // answered can still settle after this screen was first opened (the booking is re-read
+  // while that is possible), so the words here change with it.
+  const refund = b.status === "REFUND_REQUIRED" || b.status === "REFUNDED";
+  const outcome = !paid && b.latest_payment ? paymentOutcome({ status: b.latest_payment.status, failure_reason: b.latest_payment.failure_reason, booking_status: b.status }) : null;
 
   return (
     <Screen footer={<Button title="Go to my tickets" onPress={done} testID="go-to-tickets" />}>
@@ -46,20 +52,20 @@ export default function BookingScreen() {
           <Text style={styles.heroBody}>{formatDateTime(b.event.kickoff_at)}</Text>
         </View>
       ) : (
-        <Banner tone={b.status === "REFUND_REQUIRED" || b.status === "REFUNDED" ? "error" : "warning"} title={`Booking ${b.reference}`}>
-          {b.status === "PENDING_PAYMENT"
-            ? "This booking has not been paid for yet."
-            : b.status === "REFUND_REQUIRED"
-              ? "We received your payment but could not give you the seats. Your money will be refunded."
-              : b.status === "REFUNDED"
-                ? "This booking was refunded."
+        <Banner tone={refund ? "error" : "warning"} title={b.status === "REFUNDED" ? "This booking was refunded" : (outcome?.title ?? `Booking ${b.reference}`)} testID="booking-not-paid">
+          {b.status === "REFUNDED"
+            ? "We received your payment but could not give you these seats. The money has been sent back to your M-Pesa."
+            : outcome
+              ? `${outcome.body}${!refund && !outcome.unsettled ? " No tickets were issued for this booking." : ""}`
+              : b.status === "PENDING_PAYMENT"
+                ? "This booking has not been paid for yet."
                 : "This booking was not completed and no tickets were issued."}
         </Banner>
       )}
 
       <Card>
         <Row label="Booking reference" value={b.reference} testID="booking-reference" />
-        <Row label="Paid" value={formatKes(b.total_cents)} />
+        <Row label={paid ? "Paid" : "Total"} value={formatKes(b.total_cents)} />
         {b.fee_cents > 0 ? <Row label="Includes booking fee" value={formatKes(b.fee_cents)} /> : null}
         {b.latest_payment?.mpesa_receipt ? <Row label="M-Pesa receipt" value={b.latest_payment.mpesa_receipt} /> : null}
         {b.paid_at ? <Row label="Paid at" value={formatDateTime(b.paid_at)} /> : null}
@@ -97,8 +103,8 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   hero: { backgroundColor: palette.emeraldInk, borderRadius: 16, padding: space.xl, alignItems: "center", gap: space.xs },
   tick: { width: 60, height: 60, borderRadius: 30, backgroundColor: palette.champagne, alignItems: "center", justifyContent: "center", marginBottom: space.sm },
-  heroTitle: { fontSize: 26, fontWeight: "800", color: palette.white },
-  heroBody: { fontSize: 16, color: palette.champagne, textAlign: "center" },
+  heroTitle: { ...type.display },
+  heroBody: { ...type.body, color: palette.champagne, textAlign: "center" },
   row: { flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: 3 },
   list: { gap: space.sm },
 });

@@ -3,6 +3,7 @@ import { router, useFocusEffect } from "expo-router";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { isLivePayment, keys, useBooking, useMyHolds } from "../../api/queries";
+import { paymentOutcome } from "../../lib/errors";
 import { clearStoredCheckout, readStoredCheckout, type StoredCheckout } from "../../api/storage";
 import { formatCountdown, remainingMs } from "../../lib/countdown";
 import { useAppActive } from "../../lib/useAppActive";
@@ -61,16 +62,23 @@ export function ResumeBanner() {
     router.push({ pathname: "/checkout/[holdId]", params: { holdId: String(holdId) } });
   }, [holdId, livePayment]);
 
-  // A stored pointer to a booking that ended without tickets and without a refund owed has
-  // nothing left to say.
-  const ended = booking.data && !hold && ["EXPIRED", "CANCELLED", "FAILED"].includes(booking.data.status);
+  // A payment M-Pesa never answered (TIMEOUT) can still turn into tickets or a refund after
+  // the hold is gone. While that is possible the pointer is kept and the booking re-read.
+  const lastPayment = booking.data?.latest_payment ?? null;
+  const unsettled = booking.data && lastPayment ? paymentOutcome({ status: lastPayment.status, failure_reason: lastPayment.failure_reason, booking_status: booking.data.status }).unsettled : false;
+  // A stored pointer to a booking that ended without tickets, without a refund owed and with
+  // nothing still to hear from M-Pesa has nothing left to say.
+  const ended = booking.data && !hold && !unsettled && ["EXPIRED", "CANCELLED", "FAILED"].includes(booking.data.status);
   useEffect(() => {
     if (ended) void clearStoredCheckout().then(() => setStored(null));
   }, [ended]);
 
   if (!isFan) return null;
 
-  if (hold && left > 0) {
+  // A hold whose booking already took a payment that must be refunded is not "seats waiting
+  // to be paid for", even while the server still lists it.
+  const refundOnHold = booking.data?.status === "REFUND_REQUIRED" || booking.data?.status === "REFUNDED";
+  if (hold && left > 0 && !refundOnHold) {
     const n = hold.seats.length;
     return (
       <Banner
@@ -85,7 +93,7 @@ export function ResumeBanner() {
     );
   }
 
-  if (stored && booking.data && !hold) {
+  if (booking.data && (refundOnHold || (stored && !hold))) {
     const b = booking.data;
     const dismiss = () => {
       void clearStoredCheckout().then(() => setStored(null));
@@ -111,6 +119,13 @@ export function ResumeBanner() {
       return (
         <Banner tone="error" testID="resume-refund" title={b.status === "REFUNDED" ? "Your money was refunded" : "A refund is on its way"} action="OK" onAction={dismiss}>
           {`We received your payment for booking ${b.reference} but could not give you the seats. ${b.status === "REFUNDED" ? "The money has been sent back." : "You do not need to do anything; the money will be sent back to your M-Pesa."}`}
+        </Banner>
+      );
+    }
+    if (unsettled) {
+      return (
+        <Banner tone="warning" testID="resume-unsettled" title="We are waiting to hear from M-Pesa" action="OK" onAction={dismiss}>
+          {`M-Pesa has not told us what happened to your payment for booking ${b.reference}. If money left your account you will get your tickets or a refund. This updates by itself.`}
         </Banner>
       );
     }

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import {
-  applyDelta, buildGeometry, mergePoll, pickRenderer, planToLocal, seatAt, seatLabel, seatStatuses, SVG_SEAT_LIMIT, T_ID, T_STATUS, T_X, T_Y,
+  applyDelta, buildGeometry, joinSeatLabel, mergePoll, pickRenderer, planToLocal, seatAt, seatLabel, seatStatuses, SVG_SEAT_LIMIT, T_ID, T_STATUS, T_X, T_Y,
   type BlockSeatsDelta, type BlockSeatsFull,
 } from "../model";
 import { curvedBlock, straightBlock, tinyBlock } from "./fixtures";
@@ -238,5 +238,17 @@ describe("mergePoll", () => {
 
   it("leaves an empty cache empty on a delta (there is nothing to patch)", () => {
     expect(mergePoll(undefined, { kind: "delta", marker: "m2", poll_interval_seconds: 5, changes: [] })).toBeUndefined();
+  });
+});
+
+describe("joinSeatLabel", () => {
+  it("writes lettered rows as the server does", () => {
+    expect(joinSeatLabel("C", 14)).toBe("C14");
+    expect(joinSeatLabel("AA", 3)).toBe("AA3");
+  });
+
+  it("puts a dash between a numbered row and the seat, so row 12 seat 14 is not 1214", () => {
+    expect(joinSeatLabel("12", 14)).toBe("12-14");
+    expect(joinSeatLabel("1", 1)).toBe("1-1");
   });
 });

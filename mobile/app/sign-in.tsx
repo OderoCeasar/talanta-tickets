@@ -163,8 +163,8 @@ const styles = StyleSheet.create({
   link: { textDecorationLine: "underline", color: palette.warning },
   dev: { backgroundColor: palette.warningBg, borderColor: palette.warningBorder, borderWidth: 1, borderStyle: "dashed", borderRadius: radius.md, padding: space.md, gap: 4 },
   devLabel: { ...type.overline, color: palette.warning },
-  devCode: { fontFamily: "monospace", fontWeight: "700", letterSpacing: 2 },
+  devCode: { ...type.mono, letterSpacing: 2 },
   devButton: { alignSelf: "flex-start", minHeight: 36, justifyContent: "center" },
-  codeInput: { fontSize: 26, letterSpacing: 8, fontFamily: "monospace", textAlign: "center" },
+  codeInput: { ...type.mono, fontSize: 26, letterSpacing: 8, textAlign: "center" },
   footnote: { textAlign: "center" },
 });

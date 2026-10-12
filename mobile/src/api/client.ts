@@ -1,6 +1,7 @@
-import { ApiError, createApiClient, type components } from "@talanta/shared";
+import { createApiClient, type components } from "@talanta/shared";
 import { QueryClient } from "@tanstack/react-query";
 
+import { shouldRetryQuery } from "../lib/errors";
 import { API_BASE_URL } from "./config";
 import { tokenStore } from "./tokens";
 
@@ -31,11 +32,7 @@ export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
       staleTime: 15_000,
-      // A wrong request stays wrong: only connection trouble and server faults are retried.
-      retry: (failureCount, error) => {
-        if (error instanceof ApiError && error.status !== 0 && error.status < 500) return false;
-        return failureCount < 2;
-      },
+      retry: shouldRetryQuery,
       retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
     },
     mutations: { retry: false },
