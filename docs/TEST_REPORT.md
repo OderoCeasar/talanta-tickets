@@ -16,8 +16,9 @@ come first. Dated 2026-10-12, on the code of branch `backend/gate`.
   installable build was made.
 - **The second load test of the QA brief was not run**: many users across many blocks,
   reading the seat map and booking, for a few minutes.
-- **Gate scanning in the app** has unit tests for its verification and queue logic; see
-  `docs/STATUS.md` for whether its emulator run was done.
+- **Gate scanning in the app was run with typed-in codes, not the camera.** The emulator has
+  no camera feed. The journey passed on a 27-ticket manifest; a full-stadium manifest was
+  measured off the device only.
 - **Cross-process and long-running behaviour is thin.** Rate limits and the mock's state
   were tested in one process; no test ran the sweeper or reconciliation for more than a few
   seconds of load, or with two API instances.
@@ -160,4 +161,5 @@ the per-address sign-in limit. It refuses to run against anything but a local da
 | Admin invites a person, who sets a password and signs in | organiser site in a real browser | Passed, 11 steps |
 | Admin acknowledges an alert and marks a refund as paid back | organiser site in a real browser | Passed |
 | Gate staff download the manifest, scan a ticket, scan it again, upload | backend engineer, with curl | `ADMITTED`, then `DUPLICATE`; wrong gate and a tampered token refused |
+| Gate staff scan with the network off in the app, then reconnect | the app on the emulator, typed-in codes | Valid ticket green; repeat, changed character, wrong stand and wrong event all red; 14 scans uploaded and matched in the database |
 | Fan holds seats and does nothing: the seats become free again | integration tests only | Passed (not run by hand) |
