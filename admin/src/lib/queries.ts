@@ -38,6 +38,12 @@ export const keys = {
   readiness: (eventId: number) => ["events", eventId, "readiness"] as const,
   sales: (eventId: number) => ["events", eventId, "sales"] as const,
   refundBookings: (eventId: number) => ["events", eventId, "refund-bookings"] as const,
+  alerts: ["alerts"] as const,
+  alertList: (acknowledged: boolean, eventId: number | null) => ["alerts", "list", acknowledged, eventId] as const,
+  openAlertCount: (eventId: number | null) => ["alerts", "open-count", eventId] as const,
+  refunds: ["refunds"] as const,
+  refundList: (status: Schemas["RefundStatus"], eventId: number | null) => ["refunds", "list", status, eventId] as const,
+  pendingRefundCount: ["refunds", "pending-count"] as const,
   publish: (eventId: number) => ["publish", eventId] as const,
   cancel: (eventId: number) => ["cancel", eventId] as const,
 };
@@ -184,4 +190,67 @@ export const STATUS_HINTS: Record<EventStatus, string> = {
 
 export function isPublished(status: EventStatus): boolean {
   return status === "PUBLISHED" || status === "ON_SALE" || status === "SOLD_OUT";
+}
+
+/** How often the lists staff act on (alerts, the refund queue) and their badges re-check the server. */
+const ATTENTION_REFRESH_MS = 30_000;
+/** The largest page the API gives. A badge counts one page and shows "100+" when there is more. */
+const COUNT_PAGE = 100;
+
+/** One page of alerts, newest first: the open ones (`acknowledged` false) or the acknowledged ones. */
+export function useAlerts(acknowledged: boolean, eventId: number | null, enabled = true) {
+  return useInfiniteQuery({
+    queryKey: keys.alertList(acknowledged, eventId),
+    queryFn: ({ pageParam }) =>
+      unwrap(api.GET("/admin/alerts", { params: { query: { acknowledged, event_id: eventId ?? undefined, limit: 20, cursor: pageParam } } })),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    enabled,
+    staleTime: 0,
+    refetchInterval: ATTENTION_REFRESH_MS,
+    refetchOnWindowFocus: true,
+  });
+}
+
+/**
+ * How many alerts nobody has acknowledged: everywhere, or for one event. `more` is true when
+ * the server has further pages, so the true number is above `count`.
+ */
+export function useOpenAlertCount(eventId: number | null = null, enabled = true) {
+  return useQuery({
+    queryKey: keys.openAlertCount(eventId),
+    queryFn: () =>
+      unwrap(api.GET("/admin/alerts", { params: { query: { acknowledged: false, event_id: eventId ?? undefined, limit: COUNT_PAGE } } })),
+    select: (page) => ({ count: page.items.length, more: page.next_cursor !== null }),
+    enabled,
+    staleTime: 0,
+    refetchInterval: ATTENTION_REFRESH_MS,
+    refetchOnWindowFocus: true,
+  });
+}
+
+/** One page of the refund queue, oldest first. */
+export function useRefunds(status: Schemas["RefundStatus"], eventId: number | null) {
+  return useInfiniteQuery({
+    queryKey: keys.refundList(status, eventId),
+    queryFn: ({ pageParam }) =>
+      unwrap(api.GET("/admin/refunds", { params: { query: { status, event_id: eventId ?? undefined, limit: 20, cursor: pageParam } } })),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (last) => last.next_cursor ?? undefined,
+    staleTime: 0,
+    refetchInterval: ATTENTION_REFRESH_MS,
+    refetchOnWindowFocus: true,
+  });
+}
+
+/** How many refunds are waiting to be paid back, across all events. */
+export function usePendingRefundCount() {
+  return useQuery({
+    queryKey: keys.pendingRefundCount,
+    queryFn: () => unwrap(api.GET("/admin/refunds", { params: { query: { status: "PENDING", limit: COUNT_PAGE } } })),
+    select: (page) => ({ count: page.items.length, more: page.next_cursor !== null }),
+    staleTime: 0,
+    refetchInterval: ATTENTION_REFRESH_MS,
+    refetchOnWindowFocus: true,
+  });
 }

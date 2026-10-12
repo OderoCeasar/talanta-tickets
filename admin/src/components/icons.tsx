@@ -129,6 +129,22 @@ export const ShieldIcon = () => (
   </Icon>
 );
 
+export const BellIcon = () => (
+  <Icon>
+    <path d="M6.5 16.5v-5a5.5 5.5 0 0 1 11 0v5l1.5 2h-14l1.5-2Z" />
+    <path d="M10 20.5a2.2 2.2 0 0 0 4 0" />
+  </Icon>
+);
+
+/** Money going back: a coin with an arrow turning round it. */
+export const RefundIcon = () => (
+  <Icon>
+    <path d="M4.5 12a7.5 7.5 0 1 0 2.4-5.5" />
+    <path d="M4.5 4.5v3.2h3.2" />
+    <path d="M12 8.5v7M14 10.2c-.4-.6-1.1-.9-2-.9-1.2 0-2 .6-2 1.4 0 2 4 .9 4 2.8 0 .8-.8 1.4-2 1.4-.9 0-1.7-.4-2.1-1" />
+  </Icon>
+);
+
 /** The brand mark: a stadium bowl seen from above. */
 export function BrandMark() {
   return (

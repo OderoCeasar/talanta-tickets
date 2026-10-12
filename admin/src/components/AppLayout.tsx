@@ -1,14 +1,18 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
+import { badgeText, countPhrase } from "../lib/attention";
 import { initials, roleLabel } from "../lib/format";
+import { useOpenAlertCount, usePendingRefundCount } from "../lib/queries";
 import { useCurrentUser, useSession } from "../lib/session";
 import {
+  BellIcon,
   BrandMark,
   CalendarIcon,
   ChartIcon,
   CloseIcon,
   HomeIcon,
   MenuIcon,
+  RefundIcon,
   SignOutIcon,
   StadiumIcon,
   TeamIcon,
@@ -20,6 +24,8 @@ interface NavItem {
   label: string;
   icon: ReactNode;
   adminOnly?: boolean;
+  /** Which count of things waiting for staff to show next to the label. */
+  count?: "alerts" | "refunds";
 }
 
 const NAV: NavItem[] = [
@@ -27,6 +33,8 @@ const NAV: NavItem[] = [
   { to: "/events", label: "Events", icon: <CalendarIcon /> },
   { to: "/layout", label: "Venue layout", icon: <StadiumIcon /> },
   { to: "/sales", label: "Sales", icon: <ChartIcon /> },
+  { to: "/alerts", label: "Alerts", icon: <BellIcon />, count: "alerts" },
+  { to: "/refunds", label: "Refunds", icon: <RefundIcon />, count: "refunds" },
   { to: "/team", label: "Team", icon: <TeamIcon />, adminOnly: true },
 ];
 
@@ -48,6 +56,13 @@ export function AppLayout() {
   }
 
   const items = NAV.filter((item) => !item.adminOnly || user.role === "ADMIN");
+  const openAlerts = useOpenAlertCount().data;
+  const pendingRefunds = usePendingRefundCount().data;
+  const counts = {
+    alerts: openAlerts && { ...openAlerts, words: countPhrase(openAlerts.count, openAlerts.more, "open alert", "open alerts") },
+    refunds: pendingRefunds && { ...pendingRefunds, words: countPhrase(pendingRefunds.count, pendingRefunds.more, "refund waiting", "refunds waiting") },
+  };
+  const waiting = (openAlerts?.count ?? 0) + (pendingRefunds?.count ?? 0);
   const displayName = user.name?.trim() || user.email || "Signed in";
 
   return (
@@ -70,17 +85,34 @@ export function AppLayout() {
           >
             {menuOpen ? <CloseIcon /> : <MenuIcon />}
             {menuOpen ? "Close" : "Menu"}
+            {/* On a phone the menu is shut, so the button itself has to say something is waiting. */}
+            {!menuOpen && waiting > 0 && (
+              <>
+                <span className="menudot" aria-hidden="true" />
+                <span className="visually-hidden">, alerts or refunds are waiting</span>
+              </>
+            )}
           </button>
         </div>
 
         <div className="sidebar__panel" id="site-menu" data-open={menuOpen}>
           <nav className="nav" aria-label="Main">
-            {items.map((item) => (
-              <NavLink key={item.to} to={item.to} end={item.to === "/"} className="nav__link">
-                {item.icon}
-                {item.label}
-              </NavLink>
-            ))}
+            {items.map((item) => {
+              const count = item.count ? counts[item.count] : undefined;
+              const badge = count ? badgeText(count.count, count.more) : null;
+              return (
+                <NavLink key={item.to} to={item.to} end={item.to === "/"} className="nav__link">
+                  {item.icon}
+                  {item.label}
+                  {badge && count && (
+                    <span className="badge nav__badge" data-testid={`nav-${item.count}-badge`}>
+                      <span aria-hidden="true">{badge}</span>
+                      <span className="visually-hidden">, {count.words}</span>
+                    </span>
+                  )}
+                </NavLink>
+              );
+            })}
           </nav>
 
           <div className="sidebar__user">

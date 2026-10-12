@@ -5,12 +5,14 @@ import { Button, Spinner, StateBlock } from "./components/ui";
 import { useCurrentUser, useSession } from "./lib/session";
 import { AcceptInvitePage } from "./pages/AcceptInvitePage";
 import { AccountPage } from "./pages/AccountPage";
+import { AlertsPage } from "./pages/AlertsPage";
 import { LoginPage } from "./pages/LoginPage";
 import { EventsPage } from "./pages/EventsPage";
 import { EventCreatePage, EventDetailsTab, EventPage } from "./pages/event/EventPage";
 import { PaintingTab } from "./pages/event/PaintingTab";
 import { PricingTab } from "./pages/event/PricingTab";
 import { PublishTab } from "./pages/event/PublishTab";
+import { RefundsPage } from "./pages/RefundsPage";
 import { SalesPage, SalesTab } from "./pages/SalesPage";
 import { ForbiddenPage, HomePage, NotFoundPage } from "./pages/SimplePages";
 import { VenuePage } from "./pages/VenuePage";
@@ -80,6 +82,8 @@ export function App() {
         </Route>
         <Route path="layout" element={<VenuePage />} />
         <Route path="sales" element={<SalesPage />} />
+        <Route path="alerts" element={<AlertsPage />} />
+        <Route path="refunds" element={<RefundsPage />} />
         <Route
           path="team"
           element={

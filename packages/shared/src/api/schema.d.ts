@@ -652,7 +652,14 @@ export interface paths {
          *     copied onto the booking here and never change afterwards.
          *
          *     `Idempotency-Key` is required. The app makes one key per checkout. Sending the same
-         *     key again returns the same booking with **200** instead of 201 and creates nothing.
+         *     key again returns the same booking with **200** instead of 201 and creates nothing,
+         *     also after the hold has ended. One hold has at most one live booking: a second key
+         *     for the same hold answers `HOLD_ALREADY_BOOKED`, however close together the two
+         *     requests arrive.
+         *
+         *     `fee_cents` is `BOOKING_FEE_BPS` basis points of the subtotal, the same sum the hold
+         *     showed as an estimate. `reference` is `TLT-` and six characters from
+         *     `ABCDEFGHJKMNPQRSTUVWXYZ23456789` (no 0, O, 1, I or L).
          */
         post: operations["createBooking"];
         delete?: never;
@@ -700,10 +707,28 @@ export interface paths {
          *
          *     Starting the first payment pushes the hold's expiry out once so at least 6 minutes
          *     remain; re-read the booking for the new `hold_expires_at`. After a failed payment
-         *     the fan may retry for as long as the hold is alive.
+         *     the fan may retry for as long as the hold has at least 2 minutes left (a hold is
+         *     extended only once, so a late retry can find too little: `HOLD_EXPIRED`).
+         *
+         *     `phone` may be written the Kenyan ways (`07…`, `2547…`); it is stored and returned
+         *     as E.164. Only Kenyan (`+254`) numbers are accepted.
+         *
+         *     How a payment ends, as `GET /payments/{paymentId}` shows it:
+         *
+         *     | What happened | `status` | `failure_reason` | `booking_status` |
+         *     |---|---|---|---|
+         *     | Paid, seats sold, tickets issued | `SUCCESS` | null | `PAID` |
+         *     | Insufficient funds, wrong PIN, cancelled, prompt timed out | `FAILED` | that reason | `PENDING_PAYMENT` while the hold lives, else `EXPIRED` |
+         *     | No answer from M-Pesa within 5 minutes | `TIMEOUT` | `timeout` | as above |
+         *     | Paid the wrong amount | `FAILED` | `wrong_amount` | `REFUND_REQUIRED` |
+         *     | Paid, but the seats were gone (hold ended and seats resold, event cancelled) | `SUCCESS` | null | `REFUND_REQUIRED` |
+         *     | Paid a second time for a booking another payment already paid | `SUCCESS` | null | `PAID` (tickets kept; this payment is refunded) |
          *
          *     **Dev only:** `X-Mock-Outcome` chooses what the mock provider does. Sending the
-         *     header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`.
+         *     header when `APP_ENV=production` is refused with 403 `MOCK_NOT_ALLOWED`. A value
+         *     that is not one of the outcomes is 400 on `X-Mock-Outcome`. Without the header the
+         *     mock succeeds, except for the phone numbers `+254700000101` to `+254700000108`,
+         *     which play the outcomes in the order of the `MockOutcome` enum after `success`.
          */
         post: operations["startMpesaStkPush"];
         delete?: never;
@@ -724,7 +749,12 @@ export interface paths {
          * @description **Role:** FAN, owner only. `failure_reason` is the stable value to switch on;
          *     `result_desc` is the provider's own wording. `booking_status` is included so one
          *     poll tells the app both that the money arrived and whether tickets were issued
-         *     (`PAID`) or the seats were lost and a refund is owed (`REFUND_REQUIRED`).
+         *     (`PAID`) or the seats were lost and a refund is owed (`REFUND_REQUIRED`). The table
+         *     under `POST /payments/mpesa/stk` lists every combination.
+         *
+         *     Stop polling when `status` is `SUCCESS`, `FAILED` or `TIMEOUT`. A `TIMEOUT` can still
+         *     change afterwards, to `SUCCESS` or `FAILED`, if M-Pesa reports late; the booking
+         *     (`GET /bookings/{reference}`) always shows the truth.
          */
         get: operations["getPayment"];
         put?: never;
@@ -750,9 +780,14 @@ export interface paths {
          *     source IP is checked against an allowlist from config.
          *
          *     The body is never trusted alone. The server finds the payment by
-         *     `CheckoutRequestID`, checks it is still pending and that the `Amount` equals the
+         *     `CheckoutRequestID`, checks it is still open and that the `Amount` equals the
          *     booking total. An unknown ID, a repeat, a forged body or a disallowed IP all get
-         *     the same answer and change nothing.
+         *     the same answer and change nothing. A "paid" with no readable `Amount` is not
+         *     applied: the server asks Daraja (STK query) and acts on that answer. A receipt
+         *     number already recorded on another payment is treated the same way. The body is
+         *     limited to 64 KiB and is kept with the payment.
+         *
+         *     The work is done after the answer is sent, so the answer is immediate.
          *
          *     Always answers 200 `{ "ResultCode": 0, "ResultDesc": "Accepted" }`, even for a body
          *     that cannot be parsed, so Daraja does not retry and nothing is revealed to a
@@ -819,7 +854,10 @@ export interface paths {
          * @description **Role:** public. An HTML page showing every ticket of one booking with its QR, for
          *     fans without the app. The token is 64 random hex characters, unrelated to the
          *     booking reference; whoever has the link has the tickets. Sent `no-store` and
-         *     `noindex`. Unknown tokens get an HTML 404.
+         *     `noindex`. Unknown tokens get an HTML 404, and so does the link of a booking that
+         *     has no tickets (it was never paid). A ticket that is `VALID` is shown with its QR
+         *     code; a `USED` or `VOID` one is shown as such, without a code. No access token is
+         *     read: an `Authorization` header is ignored. Every answer of this page is HTML.
          */
         get: operations["getWebTicket"];
         put?: never;
@@ -1422,8 +1460,10 @@ export interface paths {
         /**
          * Record that a refund was paid
          * @description **Role:** ORGANISER, ADMIN. No request body. Marks the refund `DONE`; when a
-         *     booking has no refund left pending it becomes `REFUNDED`. This records the fact,
-         *     it does not move money. Safe to repeat.
+         *     `REFUND_REQUIRED` booking has no refund left pending it becomes `REFUNDED` and any
+         *     ticket it still has is voided. A booking that is `PAID` (the refund was for a second,
+         *     duplicate payment) stays `PAID` and keeps its tickets. Seats are not touched: see
+         *     `docs/API_NOTES.md`. This records the fact, it does not move money. Safe to repeat.
          */
         post: operations["completeRefund"];
         delete?: never;
@@ -1674,18 +1714,31 @@ export interface components {
          * @description `REFUND_REQUIRED` means money arrived but the seats could not be given (the hold
          *     had lapsed and they were resold, or the amount was wrong), or the event was
          *     cancelled after the booking was paid. No valid tickets exist; a refund is queued.
+         *     It becomes `REFUNDED` when every refund is recorded as paid.
+         *
+         *     `EXPIRED`: the hold ran out before a payment succeeded. `CANCELLED`: the fan
+         *     released the hold, or the event was cancelled before payment. Either can still
+         *     become `REFUND_REQUIRED` if M-Pesa reports a payment afterwards. `FAILED` is
+         *     reserved; nothing sets it today. A `PAID` booking only ever changes to
+         *     `REFUND_REQUIRED`, and only when its event is cancelled.
          * @enum {string}
          */
         BookingStatus: "PENDING_PAYMENT" | "PAID" | "FAILED" | "EXPIRED" | "CANCELLED" | "REFUND_REQUIRED" | "REFUNDED";
         /**
-         * @description `INITIATED` and `PENDING` are live; the rest are final.
+         * @description `INITIATED` and `PENDING` are live. `SUCCESS` and `FAILED` are M-Pesa's verdicts and
+         *     final. `TIMEOUT` is ours (no answer in 5 minutes): the fan may start another
+         *     payment, and if M-Pesa reports afterwards it still becomes `SUCCESS` or `FAILED`.
+         *     `SUCCESS` means the money arrived, not that tickets exist: read `booking_status`.
+         *     `REVERSED` is reserved.
          * @enum {string}
          */
         PaymentStatus: "INITIATED" | "PENDING" | "SUCCESS" | "FAILED" | "TIMEOUT" | "REVERSED";
         /** @enum {string} */
         PaymentProvider: "MPESA";
         /**
-         * @description Why a payment did not succeed, in a form the app can switch on.
+         * @description Why a payment did not succeed, in a form the app can switch on. `wrong_amount`: M-Pesa
+         *     reported a payment of a different amount from the booking total; the payment is
+         *     `FAILED`, the booking `REFUND_REQUIRED`, and what was paid is queued for refund.
          * @enum {string}
          */
         PaymentFailureReason: "insufficient_funds" | "wrong_pin" | "cancelled" | "timeout" | "wrong_amount" | "other";
@@ -1695,8 +1748,12 @@ export interface components {
          *     - `timeout` - the fan never answers the prompt; the callback reports a timeout.
          *     - `no_callback` - no callback at all; reconciliation finds the (successful) result.
          *     - `duplicate_callback` - the success callback is delivered twice.
-         *     - `late_callback` - the success callback arrives after the hold has expired.
-         *     - `wrong_amount` - the callback reports a different amount from the booking total.
+         *     - `late_callback` - the success callback arrives late (after `MOCK_LATE_CALLBACK_DELAY`,
+         *       7 minutes by default): after the payment has been marked `TIMEOUT` and the hold
+         *       has expired. The payment then becomes `SUCCESS`; the booking is `PAID` if the hold
+         *       still had every seat, otherwise `REFUND_REQUIRED`.
+         *     - `wrong_amount` - the callback reports one shilling more than the booking total:
+         *       payment `FAILED` with `failure_reason: wrong_amount`, booking `REFUND_REQUIRED`.
          * @enum {string}
          */
         MockOutcome: "success" | "insufficient_funds" | "wrong_pin" | "user_cancel" | "timeout" | "no_callback" | "duplicate_callback" | "late_callback" | "wrong_amount";
@@ -1706,7 +1763,14 @@ export interface components {
         ScanResult: "ADMITTED" | "DUPLICATE" | "INVALID" | "WRONG_EVENT" | "WRONG_GATE";
         /** @enum {string} */
         RefundStatus: "PENDING" | "DONE";
-        /** @enum {string} */
+        /**
+         * @description - `REFUND_REQUIRED` - a payment arrived and bought nothing (seats resold, hold gone,
+         *       event cancelled, or the booking was already paid). A refund is in the queue.
+         *     - `AMOUNT_MISMATCH` - a payment of the wrong amount. A refund is in the queue.
+         *     - `PAYMENT_UNRESOLVED` - M-Pesa gave no final answer for a payment within 5 minutes
+         *       and it was closed as `TIMEOUT`. Check the M-Pesa portal; nothing is queued.
+         * @enum {string}
+         */
         AlertKind: "REFUND_REQUIRED" | "AMOUNT_MISMATCH" | "PAYMENT_UNRESOLVED";
         /**
          * @description Which end of a row seat 1 is at, looking from the pitch along the block's local x axis.
@@ -1775,7 +1839,7 @@ export interface components {
             /** @description Seats still available in the category, together or not. */
             available: number;
         };
-        /** @description For `HOLD_EXPIRED`, `HOLD_NOT_ACTIVE`. */
+        /** @description For `HOLD_EXPIRED`, `HOLD_NOT_ACTIVE`. `hold_status` is `EXPIRED` for a hold that ran out; a payment refused because the hold has too little time left carries `ACTIVE` and the real `expires_at`. */
         HoldStateDetails: {
             hold_id: components["schemas"]["Id"];
             hold_status: components["schemas"]["HoldStatus"];
@@ -2585,7 +2649,7 @@ export interface components {
             checkout_request_id: string | null;
             /** @description M-Pesa receipt number, once paid. */
             mpesa_receipt: string | null;
-            /** @description Null while live and on success. Set for `FAILED` and `TIMEOUT`. */
+            /** @description Null while live and on success. Set for `FAILED` and `TIMEOUT`. `wrong_amount` is a `FAILED` payment whose `result_code` is 0: M-Pesa took the money, we refused it, `booking_status` is `REFUND_REQUIRED`. */
             failure_reason: components["schemas"]["PaymentFailureReason"] | null;
             /** @description The provider's raw result code. */
             result_code: number | null;
@@ -2634,7 +2698,7 @@ export interface components {
             category_name: string;
             holder_name: string | null;
             holder_phone: components["schemas"]["Phone"] | null;
-            /** @description The signed string to draw as a QR code. Layout in `docs/TICKET_FORMAT.md`. */
+            /** @description The signed string to draw as a QR code, always 160 characters. Layout in `docs/TICKET_FORMAT.md`. */
             qr_token: string;
             /** Format: date-time */
             issued_at: string;
@@ -3168,6 +3232,7 @@ export interface components {
              *     names its key by ID. A token whose key ID is not here is invalid.
              */
             keys: {
+                /** @description The letter `k` and the key number a token carries (`k1` to `k65535`). */
                 key_id: string;
                 /** @enum {string} */
                 algorithm: "Ed25519";
@@ -4602,6 +4667,7 @@ export interface operations {
              * @description - `HOLD_EXPIRED` - the 10 minutes ran out.
              *     - `HOLD_NOT_ACTIVE` - the hold was released or already paid for.
              *     - `HOLD_ALREADY_BOOKED` - the hold already has a booking made with a different key; `details.booking_reference` names it.
+             *     - `EVENT_BUSY` - an organiser's publish, cancel or edit has the event locked; nothing was created, send the same request (same key) again.
              */
             409: {
                 headers: {
@@ -4707,8 +4773,9 @@ export interface operations {
             };
             /**
              * @description - `BOOKING_NOT_PAYABLE` - the booking is not `PENDING_PAYMENT`; `details.booking_status` says what it is.
-             *     - `HOLD_EXPIRED` - the seats are no longer held; start again from the map.
+             *     - `HOLD_EXPIRED` - the seats are no longer held, or the hold has under 2 minutes left (then `details.hold_status` is still `ACTIVE`); start again from the map.
              *     - `PAYMENT_IN_PROGRESS` - a payment for this booking is still `INITIATED` or `PENDING`; `details.payment_id` names it.
+             *     - `EVENT_BUSY` - an organiser's publish, cancel or edit has the event locked; nothing was started, send the request again.
              */
             409: {
                 headers: {
@@ -4732,7 +4799,7 @@ export interface operations {
             };
             429: components["responses"]["TooManyRequests"];
             500: components["responses"]["Internal"];
-            /** @description `PAYMENT_PROVIDER_UNAVAILABLE` - M-Pesa did not accept the request. No payment is left live; the fan may retry. */
+            /** @description `PAYMENT_PROVIDER_UNAVAILABLE` - M-Pesa did not accept the request. The attempt is kept as a `FAILED` payment (the booking shows it as `latest_payment`); no payment is left live and the fan may retry at once. */
             502: {
                 headers: {
                     [name: string]: unknown;
@@ -4892,6 +4959,15 @@ export interface operations {
             429: {
                 headers: {
                     "Retry-After": components["headers"]["RetryAfter"];
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/html": string;
+                };
+            };
+            /** @description Fault on our side. HTML, not the JSON error shape. */
+            500: {
+                headers: {
                     [name: string]: unknown;
                 };
                 content: {
@@ -6108,6 +6184,15 @@ export interface operations {
             401: components["responses"]["Unauthorized"];
             403: components["responses"]["Forbidden"];
             404: components["responses"]["NotFound"];
+            /** @description `EVENT_BUSY` - a publish, a cancel or another edit has the event locked; nothing changed, send the request again. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["Internal"];
         };
     };
@@ -6422,7 +6507,7 @@ export interface operations {
                  *           "gate_group": "N-LOWER",
                  *           "scanned_at": "2026-11-14T11:02:17Z",
                  *           "result": "ADMITTED",
-                 *           "token": "TLT1.CwvzpSfB5NfnmlcMG01eb3AAAAAAAAABAE4tTE9XRVKq3Q.b2s4c2lnbmF0dXJl"
+                 *           "token": "TLT1.AQABCw86UnweTX6aVwwbTV5vcAAAAAAAAAABTi1MT1dFUgAAAAAAAAAAAKGyw9Tl9gcY.O5024bVFl6fq-rPKjqJ15KNls5q3woLuzPEG33mc1oS0w-FSiCHxQXjhzotnEv0Wpfr78tSzzMR8KmOHMyk4Dg"
                  *         },
                  *         {
                  *           "client_scan_id": "7a2d3e4f-5b6c-4d7e-9f80-91ab2c3d4e5f",
