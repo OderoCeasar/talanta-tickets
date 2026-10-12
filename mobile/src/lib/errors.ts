@@ -42,12 +42,13 @@ const FIXED: Partial<Record<Code, string>> = {
   PAYLOAD_TOO_LARGE: "That was too much to send at once.",
   EVENT_NOT_ON_SALE: "Tickets for this event are not on sale right now.",
   SALES_CLOSED: "Ticket sales for this event have closed.",
+  EVENT_BUSY: "The organiser is updating this event. Try again in a moment.",
   HOLD_EXPIRED: "Your time to pay ran out and the seats were released. Choose seats again.",
   HOLD_NOT_ACTIVE: "These seats are no longer held for you. Choose seats again.",
   HOLD_ALREADY_BOOKED: "These seats already have a booking. Open it to continue paying.",
   BOOKING_NOT_PAYABLE: "This booking can no longer be paid for.",
-  PAYMENT_IN_PROGRESS: "A payment is already waiting for your M-Pesa PIN. Check your phone.",
-  PAYMENT_PROVIDER_UNAVAILABLE: "M-Pesa is not answering right now. No money was taken. Please try again.",
+  PAYMENT_IN_PROGRESS: "A payment for these seats is still in progress. Check your phone for the M-Pesa prompt.",
+  PAYMENT_PROVIDER_UNAVAILABLE: "Payments are not available right now. No money was taken. Try again in a moment.",
   IDEMPOTENCY_KEY_REQUIRED: "We could not start your booking. Please try again.",
   IDEMPOTENCY_KEY_REUSED: "We could not start your booking. Go back to your seats and try again.",
   MOCK_NOT_ALLOWED: "Test payments are switched off on this server.",
@@ -101,10 +102,64 @@ export function isSignedOutError(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
-/** True when trying the same request again could work (no connection, or a fault on our side). */
+/**
+ * True when an organiser's publish, cancel or edit had the event locked. Nothing changed on
+ * the server and nothing is wrong with the fan's seats: the same request works a moment later.
+ */
+export function isEventBusy(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "EVENT_BUSY";
+}
+
+/**
+ * True when trying the same request again could work: no connection, a fault on our side,
+ * a rate limit, or the event being locked for a moment by an organiser.
+ */
 export function isRetryable(error: unknown): boolean {
   if (!(error instanceof ApiError)) return true;
-  return error.status === 0 || error.status >= 500 || error.status === 429;
+  return error.status === 0 || error.status >= 500 || error.status === 429 || error.code === "EVENT_BUSY";
+}
+
+/**
+ * Whether a failed query should be sent again by itself. A wrong request stays wrong, so only
+ * connection trouble and server faults are retried (twice). A 401 gets one more go: by the
+ * time it reaches here the client has either refreshed the session or dropped a dead token,
+ * and a public read (events, seat maps) then answers without one.
+ */
+export function shouldRetryQuery(failureCount: number, error: unknown): boolean {
+  if (error instanceof ApiError) {
+    if (error.status === 401) return failureCount < 1;
+    if (error.status !== 0 && error.status < 500) return false;
+  }
+  return failureCount < 2;
+}
+
+/**
+ * Why a hold cannot be paid for any more, from a failed `POST /bookings` or STK start.
+ * `too_late` is the server refusing to start a payment with under two minutes left: the
+ * hold is still `ACTIVE` but a prompt could not be answered in time. `ended` is a hold that
+ * ran out, was released, or whose booking is closed. Null for every other error.
+ */
+export function holdEnded(error: unknown): "too_late" | "ended" | null {
+  if (!(error instanceof ApiError)) return null;
+  if (error.code === "HOLD_EXPIRED") {
+    return has(error.details, "hold_status") && error.details.hold_status === "ACTIVE" ? "too_late" : "ended";
+  }
+  if (error.code === "HOLD_NOT_ACTIVE") return "ended";
+  return null;
+}
+
+/** The line shown on the seat map after checkout sent the fan back. */
+export function backToMapMessage(reason: "too_late" | "ended"): string {
+  return reason === "too_late"
+    ? "There was too little time left to pay, so the seats were released. Choose your seats again for a fresh 10 minutes."
+    : "Your time to pay ran out, so the seats were released. Choose your seats again.";
+}
+
+/** The payment a `PAYMENT_IN_PROGRESS` answer names, so the app can follow it. Null otherwise. */
+export function livePaymentId(error: unknown): number | null {
+  if (!(error instanceof ApiError) || error.code !== "PAYMENT_IN_PROGRESS") return null;
+  const d = error.details;
+  return has(d, "payment_id") && typeof d.payment_id === "number" ? d.payment_id : null;
 }
 
 export type PaymentTone = "success" | "waiting" | "failed" | "refund";
@@ -115,43 +170,76 @@ export interface PaymentOutcome {
   body: string;
   /** Whether "Try again" makes sense (the caller still checks the hold is alive). */
   canRetry: boolean;
+  /** The payment may still change (a live one, or a `TIMEOUT` M-Pesa can settle late): keep asking. */
+  unsettled: boolean;
 }
 
-/** What a payment's state means to the fan, in plain words. */
+const REFUND_NO_SEATS: PaymentOutcome = {
+  tone: "refund",
+  title: "We could not give you these seats",
+  body: "We received your payment but could not give you these seats. You will be refunded. You do not need to do anything.",
+  canRetry: false,
+  unsettled: false,
+};
+
+const REFUND_WRONG_AMOUNT: PaymentOutcome = {
+  tone: "refund",
+  title: "The amount paid was wrong",
+  body: "M-Pesa sent a different amount from the price of your seats, so no tickets were issued. You will be refunded. You do not need to do anything.",
+  canRetry: false,
+  unsettled: false,
+};
+
+/**
+ * What a payment's state means to the fan, in plain words. Three fields decide it, in this
+ * order (the table is in the contract under the STK operation):
+ *
+ * 1. `booking_status`. `REFUND_REQUIRED`/`REFUNDED` means money arrived and bought nothing,
+ *    whatever `status` says: a wrong amount is a `FAILED` payment, seats that were gone is a
+ *    `SUCCESS` one. `PAID` means tickets, even when this payment is not the one that paid.
+ * 2. `status`. `SUCCESS` alone never means tickets.
+ * 3. `failure_reason`, for the wording of a failure.
+ */
 export function paymentOutcome(payment: Pick<Schemas["Payment"], "status" | "failure_reason" | "booking_status">): PaymentOutcome {
-  if (payment.booking_status === "REFUND_REQUIRED" || payment.booking_status === "REFUNDED") {
+  const { status, failure_reason: reason, booking_status: booking } = payment;
+
+  if (booking === "REFUND_REQUIRED" || booking === "REFUNDED") return reason === "wrong_amount" ? REFUND_WRONG_AMOUNT : REFUND_NO_SEATS;
+  // Defensive: the server always pairs `wrong_amount` with `REFUND_REQUIRED`, but the money did arrive.
+  if (reason === "wrong_amount") return REFUND_WRONG_AMOUNT;
+  if (booking === "PAID") return { tone: "success", title: "Payment received", body: "Your tickets are ready.", canRetry: false, unsettled: false };
+
+  if (status === "SUCCESS") {
+    // Paid, but the booking read is a moment behind (or closed): never promise tickets here.
+    return { tone: "waiting", title: "Payment received", body: "We are checking your seats. This takes a moment.", canRetry: false, unsettled: true };
+  }
+  if (status === "INITIATED" || status === "PENDING") {
+    return { tone: "waiting", title: "Check your phone", body: "Enter your M-Pesa PIN on the prompt we sent to your phone.", canRetry: false, unsettled: true };
+  }
+  if (status === "REVERSED") {
+    return { tone: "refund", title: "Payment reversed", body: "M-Pesa returned this payment to you. No tickets were issued.", canRetry: false, unsettled: false };
+  }
+
+  // The booking can no longer be paid for (its hold ran out): a failed payment has no retry.
+  const canRetry = booking === "PENDING_PAYMENT";
+  if (status === "TIMEOUT") {
     return {
-      tone: "refund",
-      title: payment.failure_reason === "wrong_amount" ? "The amount paid was wrong" : "We could not give you these seats",
-      body:
-        payment.failure_reason === "wrong_amount"
-          ? "M-Pesa sent a different amount from the price of your seats, so no tickets were issued. Your money will be refunded. You do not need to do anything."
-          : "Your payment arrived after the seats had been released, so no tickets were issued. Your money will be refunded. You do not need to do anything.",
-      canRetry: false,
+      tone: "failed",
+      title: "M-Pesa has not answered",
+      body: "We did not hear back from M-Pesa about this payment. If money left your account, you will get your tickets or a refund once M-Pesa tells us.",
+      canRetry,
+      unsettled: true,
     };
   }
-  if (payment.status === "SUCCESS") {
-    if (payment.booking_status === "PAID") return { tone: "success", title: "Payment received", body: "Your tickets are ready.", canRetry: false };
-    return { tone: "waiting", title: "Payment received", body: "We are getting your tickets ready.", canRetry: false };
-  }
-  if (payment.status === "INITIATED" || payment.status === "PENDING") {
-    return { tone: "waiting", title: "Check your phone", body: "Enter your M-Pesa PIN on the prompt we sent to your phone.", canRetry: false };
-  }
-  if (payment.status === "REVERSED") {
-    return { tone: "refund", title: "Payment reversed", body: "M-Pesa returned this payment to you. No tickets were issued.", canRetry: false };
-  }
-  switch (payment.failure_reason) {
+  switch (reason) {
     case "cancelled":
-      return { tone: "failed", title: "Payment cancelled", body: "You cancelled the M-Pesa prompt. No money was taken.", canRetry: true };
+      return { tone: "failed", title: "Payment cancelled", body: "You cancelled the M-Pesa prompt. No money was taken.", canRetry, unsettled: false };
     case "wrong_pin":
-      return { tone: "failed", title: "Wrong PIN", body: "The M-Pesa PIN was not right. No money was taken.", canRetry: true };
+      return { tone: "failed", title: "Wrong PIN", body: "The M-Pesa PIN was not right. No money was taken.", canRetry, unsettled: false };
     case "insufficient_funds":
-      return { tone: "failed", title: "Not enough money", body: "There is not enough in this M-Pesa account. Top up, or use another number.", canRetry: true };
+      return { tone: "failed", title: "Not enough money", body: "There is not enough in this M-Pesa account. Top up, or use another number.", canRetry, unsettled: false };
     case "timeout":
-      return { tone: "failed", title: "Payment timed out", body: "The M-Pesa prompt was not answered in time. No money was taken.", canRetry: true };
-    case "wrong_amount":
-      return { tone: "refund", title: "The amount paid was wrong", body: "No tickets were issued. Your money will be refunded.", canRetry: false };
+      return { tone: "failed", title: "Payment timed out", body: "The M-Pesa prompt was not answered in time. No money was taken.", canRetry, unsettled: false };
     default:
-      return { tone: "failed", title: "Payment did not go through", body: "M-Pesa could not complete the payment. If any money left your account, M-Pesa will return it.", canRetry: true };
+      return { tone: "failed", title: "Payment did not go through", body: "M-Pesa could not complete the payment. If any money left your account, M-Pesa will return it.", canRetry, unsettled: false };
   }
 }

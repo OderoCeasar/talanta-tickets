@@ -6,10 +6,11 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { ActivityIndicator, Alert, BackHandler, Pressable, StyleSheet, Text, View } from "react-native";
 
 import type { Schemas } from "../../src/api/client";
-import { createBooking, fetchBooking, isLivePayment, keys, startStkPush, useBooking, useHold, usePayment, useReleaseHold } from "../../src/api/queries";
+import { createBooking, fetchBooking, isLivePayment, keys, startStkPush, useBooking, useEvent, useHold, usePayment, useReleaseHold } from "../../src/api/queries";
 import { clearStoredCheckout, readStoredCheckout, writeStoredCheckout, type StoredCheckout } from "../../src/api/storage";
+import { checkoutAmounts } from "../../src/lib/checkout";
 import { formatCountdown, isUrgent, remainingMs } from "../../src/lib/countdown";
-import { errorMessage, paymentOutcome } from "../../src/lib/errors";
+import { errorMessage, holdEnded, isEventBusy, isRetryable, livePaymentId, paymentOutcome } from "../../src/lib/errors";
 import { formatKes } from "../../src/lib/money";
 import { formatPhone, formatPhoneLocal, normalisePhone } from "../../src/lib/phone";
 import { formatDateTime } from "../../src/lib/time";
@@ -17,6 +18,7 @@ import { useAppActive } from "../../src/lib/useAppActive";
 import { useNow } from "../../src/lib/useNow";
 import { useSession } from "../../src/session";
 import { useBookingFlow } from "../../src/store/bookingFlow";
+import { standTitle } from "../../src/lib/labels";
 import { palette, radius, space, type } from "../../src/theme";
 import { Banner, Button, Card, ErrorState, Field, Icon, Loading, Screen } from "../../src/ui";
 
@@ -25,6 +27,20 @@ const MOCK_OUTCOMES: MockOutcome[] = ["success", "insufficient_funds", "wrong_pi
 
 function has<K extends string>(details: unknown, key: K): details is Record<K, unknown> {
   return typeof details === "object" && details !== null && key in details;
+}
+
+/** The booking for a hold: made with the checkout's key, or the one the hold already has. */
+async function bookingFor(record: StoredCheckout): Promise<Schemas["Booking"]> {
+  try {
+    // The same key again answers with the same booking, so a retry never makes a second one.
+    return await createBooking(record.holdId, record.idempotencyKey);
+  } catch (error) {
+    // The hold was booked under a key this phone no longer has: use that booking.
+    if (error instanceof ApiError && error.code === "HOLD_ALREADY_BOOKED" && has(error.details, "booking_reference")) {
+      return fetchBooking(String(error.details.booking_reference));
+    }
+    throw error;
+  }
 }
 
 export default function CheckoutScreen() {
@@ -37,7 +53,6 @@ export default function CheckoutScreen() {
   const hold = useHold(holdId);
   const release = useReleaseHold();
   const syncHold = useBookingFlow((s) => s.syncHold);
-  const setHoldExpiry = useBookingFlow((s) => s.setHoldExpiry);
   const clearHold = useBookingFlow((s) => s.clearHold);
   const holdExpiresAt = useBookingFlow((s) => s.holdExpiresAt);
   const serverOffset = useBookingFlow((s) => s.serverOffsetMs);
@@ -46,14 +61,21 @@ export default function CheckoutScreen() {
   // One idempotency key per checkout. It is normally made when the hold is created; if the
   // phone has none for this hold (storage was cleared), a new one is made here, once.
   const [checkout, setCheckout] = useState<StoredCheckout | null>(null);
-  const eventId = hold.data?.event_id;
+  const holdData = hold.data;
+  const eventId = holdData?.event_id;
+  // An ended hold answers with no seats, so the block to go back to is remembered from
+  // the last answer that had them.
+  const lastBlockId = useRef<number | undefined>(undefined);
+  const heldBlockId = holdData?.seats[0]?.location.block_id;
+  if (heldBlockId !== undefined) lastBlockId.current = heldBlockId;
+
   useEffect(() => {
     if (eventId === undefined) return;
     let cancelled = false;
     void readStoredCheckout().then(async (stored) => {
       let record = stored && stored.holdId === holdId ? stored : null;
       if (!record) {
-        record = { holdId, eventId, idempotencyKey: Crypto.randomUUID(), bookingReference: null };
+        record = { holdId, eventId, blockId: heldBlockId, idempotencyKey: Crypto.randomUUID(), bookingReference: null };
         await writeStoredCheckout(record);
       }
       if (!cancelled) setCheckout(record);
@@ -61,10 +83,9 @@ export default function CheckoutScreen() {
     return () => {
       cancelled = true;
     };
-  }, [holdId, eventId]);
+  }, [holdId, eventId, heldBlockId]);
 
   // ------------------------------------------------------------------ hold and countdown
-  const holdData = hold.data;
   useEffect(() => {
     if (holdData && holdData.status === "ACTIVE") syncHold(holdData.expires_at, holdData.remaining_seconds);
   }, [holdData, syncHold]);
@@ -78,53 +99,21 @@ export default function CheckoutScreen() {
   }, [appActive, refetchHold]);
 
   // ------------------------------------------------------------------ booking
+  // There is no booking until the fan taps Pay: someone who only looks at the total must not
+  // leave a pending booking behind. Before that, everything shown comes from the hold.
   const reference = holdData?.booking_reference ?? checkout?.bookingReference ?? null;
   const booking = useBooking(reference);
-
-  const ensureBooking = useMutation({
-    mutationFn: async (record: StoredCheckout) => {
-      try {
-        return await createBooking(record.holdId, record.idempotencyKey);
-      } catch (error) {
-        // The hold was booked under a key this phone no longer has: use that booking.
-        if (error instanceof ApiError && error.code === "HOLD_ALREADY_BOOKED" && has(error.details, "booking_reference")) {
-          return fetchBooking(String(error.details.booking_reference));
-        }
-        throw error;
-      }
-    },
-    onSuccess: async (b, record) => {
-      qc.setQueryData(keys.booking(b.reference), b);
-      if (b.hold_expires_at) setHoldExpiry(b.hold_expires_at);
-      const next = { ...record, bookingReference: b.reference };
-      setCheckout(next);
-      await writeStoredCheckout(next);
-    },
-  });
-
-  // The booking is made as soon as checkout opens, because only a booking carries the fee
-  // and the total; the fan must see the amount before being asked to pay it. The same key
-  // is sent again by "Pay" if this first attempt did not get through.
-  const autoBooked = useRef(false);
-  const { mutate: bookNow } = ensureBooking;
-  useEffect(() => {
-    if (autoBooked.current || !checkout || !holdData || holdData.status !== "ACTIVE" || reference) return;
-    autoBooked.current = true;
-    bookNow(checkout);
-  }, [checkout, holdData, reference, bookNow]);
-
-  const bookingData = booking.data ?? (ensureBooking.data && ensureBooking.data.reference === reference ? ensureBooking.data : undefined);
-  const bookingExpiry = bookingData?.hold_expires_at;
-  useEffect(() => {
-    if (bookingExpiry) setHoldExpiry(bookingExpiry);
-  }, [bookingExpiry, setHoldExpiry]);
+  const bookingData = booking.data;
+  const refetchBooking = booking.refetch;
+  const event = useEvent(eventId ?? 0, eventId !== undefined && !bookingData);
 
   // ------------------------------------------------------------------ payment
   const [paymentId, setPaymentId] = useState<number | null>(null);
   const latestPaymentId = bookingData?.latest_payment?.id ?? null;
-  // Reopening the app mid-payment: the booking names its latest payment; carry on polling it.
+  // Reopening the app mid-payment (or a newer attempt than the one this screen knows):
+  // the booking names its latest payment; follow that one.
   useEffect(() => {
-    if (paymentId === null && latestPaymentId !== null) setPaymentId(latestPaymentId);
+    if (latestPaymentId !== null && (paymentId === null || latestPaymentId > paymentId)) setPaymentId(latestPaymentId);
   }, [paymentId, latestPaymentId]);
   const payment = usePayment(paymentId);
   const paymentData = payment.data ?? (bookingData?.latest_payment?.id === paymentId ? bookingData?.latest_payment : undefined) ?? undefined;
@@ -138,20 +127,50 @@ export default function CheckoutScreen() {
     if (defaultPhone) setPhoneInput((current) => (current === "" ? formatPhoneLocal(defaultPhone) : current));
   }, [defaultPhone]);
 
-  const refetchBooking = booking.refetch;
+  // ------------------------------------------------------------------ leaving for the seat map
+  const leaving = useRef(false);
+  const leaveToMap = useCallback(
+    (reason: "too_late" | "ended", keepPointer: boolean) => {
+      if (leaving.current) return;
+      leaving.current = true;
+      clearHold();
+      // A payment M-Pesa has not settled can still turn into tickets or a refund: the pointer
+      // to its booking is kept so the app can say so later (see ResumeBanner).
+      if (!keepPointer) void clearStoredCheckout();
+      void qc.invalidateQueries({ queryKey: keys.myHolds });
+      const blockId = lastBlockId.current ?? checkout?.blockId ?? bookingData?.items[0]?.location.block_id;
+      const event = eventId ?? checkout?.eventId;
+      if (event !== undefined) void qc.invalidateQueries({ queryKey: ["events", event] });
+      if (event !== undefined && blockId !== undefined) {
+        router.dismissTo({ pathname: "/event/[id]/block/[blockId]", params: { id: String(event), blockId: String(blockId), expired: reason } });
+      } else if (event !== undefined) {
+        router.dismissTo({ pathname: "/event/[id]", params: { id: String(event) } });
+      } else {
+        router.dismissTo("/events");
+      }
+    },
+    [clearHold, qc, checkout, bookingData, eventId],
+  );
+
+  const { mutateAsync: releaseAsync } = release;
   const pay = useMutation({
     mutationFn: async (phone: string) => {
       if (!checkout) throw new Error("Checkout is not ready");
-      // Same key as before: if the booking already exists the server returns it (200).
-      const b = bookingData ?? (await ensureBooking.mutateAsync(checkout));
+      let b = bookingData;
+      if (!b) {
+        b = await bookingFor(checkout);
+        qc.setQueryData(keys.booking(b.reference), b);
+        const next = { ...checkout, bookingReference: b.reference };
+        setCheckout(next);
+        await writeStoredCheckout(next);
+      }
       try {
         // The mock header is sent only by development builds, and only when it is not the default.
         return await startStkPush(b.id, phone, __DEV__ && mock !== "success" ? mock : undefined);
       } catch (error) {
         // A prompt is already out for this booking (a double tap, or a second phone): follow it.
-        if (error instanceof ApiError && error.code === "PAYMENT_IN_PROGRESS" && has(error.details, "payment_id")) {
-          return { id: Number(error.details.payment_id) } as Pick<Schemas["Payment"], "id">;
-        }
+        const live = livePaymentId(error);
+        if (live !== null) return { id: live } as Pick<Schemas["Payment"], "id">;
         throw error;
       }
     },
@@ -162,11 +181,20 @@ export default function CheckoutScreen() {
       void refetchBooking();
       void refetchHold();
     },
-    onError: (error) => {
-      if (error instanceof ApiError && (error.code === "HOLD_EXPIRED" || error.code === "HOLD_NOT_ACTIVE" || error.code === "BOOKING_NOT_PAYABLE")) {
-        void refetchHold();
-        void refetchBooking();
+    onError: async (error) => {
+      const ended = holdEnded(error);
+      if (ended === "too_late" && eventId !== undefined) {
+        // Under two minutes left: no prompt can be answered in time. Give the seats up now
+        // (best effort; they lapse by themselves otherwise) and start again on the map.
+        await releaseAsync({ id: holdId, eventId }).catch(() => undefined);
+        leaveToMap("too_late", false);
+        return;
       }
+      // Whatever went wrong, the server's view of the hold and the booking is the truth: an
+      // ended hold sends the fan back to the map below; a refused M-Pesa request left a
+      // failed attempt on the booking.
+      void refetchHold();
+      void refetchBooking();
     },
   });
 
@@ -195,8 +223,10 @@ export default function CheckoutScreen() {
   // other. A final status from either wins over "still waiting" from the other.
   const bookingStatus =
     bookingData && bookingData.status !== "PENDING_PAYMENT" ? bookingData.status : (paymentData?.booking_status ?? bookingData?.status);
+  const outcome = paymentData
+    ? paymentOutcome({ status: paymentData.status, failure_reason: paymentData.failure_reason, booking_status: bookingStatus ?? paymentData.booking_status })
+    : null;
   const paidReference = bookingStatus === "PAID" ? (bookingData?.reference ?? paymentData?.booking_reference ?? null) : null;
-  const leaving = useRef(false);
   useEffect(() => {
     if (!paidReference || leaving.current) return;
     leaving.current = true;
@@ -209,7 +239,8 @@ export default function CheckoutScreen() {
 
   const now = useNow(500);
   const left = remainingMs(holdExpiresAt ?? holdData?.expires_at ?? null, now, serverOffset);
-  const refundOwed = bookingStatus === "REFUND_REQUIRED" || bookingStatus === "REFUNDED";
+  // `outcome` covers a wrong amount seen on the payment before the booking read catches up.
+  const refundOwed = bookingStatus === "REFUND_REQUIRED" || bookingStatus === "REFUNDED" || outcome?.tone === "refund";
   const holdGone = holdData ? holdData.status === "EXPIRED" || holdData.status === "RELEASED" : false;
 
   // The clock reached zero: ask the server before believing it (the expiry may have been
@@ -225,21 +256,11 @@ export default function CheckoutScreen() {
   }, [holdData, left, paymentLive, holdExpiresAt, refetchHold, refetchBooking]);
 
   // The hold is over and nothing was paid: back to the seat map with a clear message.
-  const blockId = holdData?.seats[0]?.location.block_id;
-  const expiredOut = holdGone && !refundOwed && !paidReference && !paymentLive;
+  const expiredOut = holdGone && !refundOwed && !paidReference && !paymentLive && !pay.isPending;
+  const unsettled = outcome?.unsettled ?? false;
   useEffect(() => {
-    if (!expiredOut || leaving.current || eventId === undefined) return;
-    leaving.current = true;
-    clearHold();
-    void clearStoredCheckout();
-    void qc.invalidateQueries({ queryKey: keys.myHolds });
-    void qc.invalidateQueries({ queryKey: ["events", eventId] });
-    if (blockId !== undefined) {
-      router.dismissTo({ pathname: "/event/[id]/block/[blockId]", params: { id: String(eventId), blockId: String(blockId), expired: "1" } });
-    } else {
-      router.dismissTo({ pathname: "/event/[id]", params: { id: String(eventId) } });
-    }
-  }, [expiredOut, eventId, blockId, clearHold, qc]);
+    if (expiredOut) leaveToMap("ended", unsettled);
+  }, [expiredOut, unsettled, leaveToMap]);
 
   // ------------------------------------------------------------------ leaving
   const canRelease = holdData?.status === "ACTIVE" && !paymentLive && !refundOwed;
@@ -265,7 +286,7 @@ export default function CheckoutScreen() {
                 void clearStoredCheckout();
                 router.back();
               },
-              onError: (error) => Alert.alert("We could not release the seats", errorMessage(error)),
+              onError: (error) => Alert.alert(isEventBusy(error) ? "Your seats are still held" : "We could not release the seats", errorMessage(error)),
             },
           ),
       },
@@ -304,26 +325,49 @@ export default function CheckoutScreen() {
   }
   if (paidReference || expiredOut) return <>{header}<Loading label={paidReference ? "Getting your tickets…" : "Going back to the seat map…"} /></>;
 
-  const seats = holdData.seats;
-  const first = seats[0]?.location;
-  const outcome = paymentData ? paymentOutcome({ status: paymentData.status, failure_reason: paymentData.failure_reason, booking_status: bookingStatus ?? paymentData.booking_status }) : null;
+  const amounts = checkoutAmounts(holdData, bookingData);
+  // Only a refund owed can leave nothing to show for a moment (hold ended, booking still loading).
+  if (amounts.source === "none") {
+    if (booking.isError) return <>{header}<ErrorState error={booking.error} onRetry={() => void booking.refetch()} title="We could not load your booking" /></>;
+    return <>{header}<Loading label="Loading your booking…" /></>;
+  }
+
+  const first = amounts.lines[0]?.location;
+  const count = amounts.lines.length;
+  const total = amounts.totalCents;
+  const eventInfo = bookingData?.event ?? event.data ?? null;
   const failed = outcome?.tone === "failed";
-  const total = bookingData?.total_cents ?? null;
   const urgent = isUrgent(left) && !paymentLive;
-  const waiting = paymentLive || pay.isPending;
+  // Disabled from the tap until the payment has a final answer, so it cannot be sent twice.
+  const waiting = paymentLive || pay.isPending || outcome?.tone === "waiting";
+  const payError = pay.isError ? pay.error : null;
+  const canPayAgain = left > 0 && !waiting;
 
   return (
     <Screen
       footer={
         refundOwed ? (
-          <Button title="Back to events" onPress={() => { void clearStoredCheckout(); router.dismissTo("/events"); }} testID="refund-done" />
+          <Button
+            title="Back to events"
+            loading={release.isPending}
+            testID="refund-done"
+            onPress={async () => {
+              // The server can leave the hold (and its seats) in place after a payment that
+              // has to be refunded. Nothing more can be paid on it, so give the seats back
+              // now instead of letting them sit out the clock. Best effort.
+              if (holdData.status === "ACTIVE") await releaseAsync({ id: holdId, eventId: holdData.event_id }).catch(() => undefined);
+              leaving.current = true;
+              clearHold();
+              void clearStoredCheckout();
+              router.dismissTo("/events");
+            }}
+          />
         ) : (
           <>
             <Button
-              title={waiting ? "Waiting for M-Pesa…" : failed ? `Try again · ${total !== null ? formatKes(total) : ""}` : total !== null ? `Pay ${formatKes(total)} with M-Pesa` : "Pay with M-Pesa"}
+              title={waiting ? "Waiting for M-Pesa…" : failed || payError ? `Try again · ${formatKes(total)}` : `Pay ${formatKes(total)} with M-Pesa`}
               onPress={onPay}
-              // Disabled from the tap until the payment has a final answer, so it cannot be sent twice.
-              disabled={waiting || left <= 0 || !checkout || (failed && !outcome?.canRetry)}
+              disabled={waiting || left <= 0 || !checkout || (failed && !payError && !outcome?.canRetry)}
               loading={pay.isPending}
               icon={waiting ? undefined : "lock"}
               testID="pay"
@@ -342,7 +386,7 @@ export default function CheckoutScreen() {
             <Text style={[type.label, { color: urgent ? palette.error : palette.warning }]}>{paymentLive ? "Your seats are safe while you pay" : "Your seats are held for"}</Text>
             {holdData.extended ? <Text style={type.small}>We added time so your payment can finish.</Text> : null}
           </View>
-          <Text style={[styles.clock, { color: urgent ? palette.error : palette.warning }]} testID="countdown" maxFontSizeMultiplier={1.3}>
+          <Text style={[type.clock, { color: urgent ? palette.error : palette.warning }]} testID="countdown" maxFontSizeMultiplier={1.3}>
             {formatCountdown(left)}
           </Text>
         </View>
@@ -351,66 +395,81 @@ export default function CheckoutScreen() {
       {paymentLive ? (
         <Card style={styles.waiting} >
           <ActivityIndicator size="large" color={palette.emeraldInk} />
-          <Text style={[type.h2, styles.center]} testID="payment-waiting">Check your phone</Text>
-          <Text style={[type.body, styles.center]}>
-            We sent an M-Pesa prompt to {formatPhone(paymentData?.phone)}. Enter your PIN to pay{total !== null ? ` ${formatKes(total)}` : ""}.
-          </Text>
+          <Text style={[type.h2, styles.center]} testID="payment-waiting">{paymentData?.result_desc ? "Checking with M-Pesa" : "Check your phone"}</Text>
+          {paymentData?.result_desc ? (
+            // The server could not tell whether M-Pesa got the request ("Do not pay again
+            // yet"): its own words are shown instead of promising a prompt.
+            <Text style={[type.body, styles.center]} testID="payment-checking">{paymentData.result_desc}</Text>
+          ) : (
+            <Text style={[type.body, styles.center]}>
+              We sent an M-Pesa prompt to {formatPhone(paymentData?.phone)}. Enter your PIN to pay {formatKes(total)}.
+            </Text>
+          )}
           <Text style={[type.small, styles.center]}>This page updates by itself. You can leave the app to enter your PIN and come back.</Text>
         </Card>
       ) : null}
 
-      {outcome && !paymentLive && outcome.tone !== "success" && !pay.isPending ? (
-        <Banner tone={outcome.tone === "waiting" ? "info" : "error"} title={outcome.title} testID="payment-outcome">
-          {`${outcome.body}${failed && left > 0 ? " Your seats are still held: you can try again." : ""}`}
+      {/* One message at a time: why the last tap on Pay was refused wins over the outcome of an earlier payment. */}
+      {payError ? (
+        <Banner
+          tone={isEventBusy(payError) ? "warning" : "error"}
+          title={isEventBusy(payError) ? "One moment" : payError instanceof ApiError && payError.code === "PAYMENT_PROVIDER_UNAVAILABLE" ? "Payments are not available right now" : undefined}
+          action={isRetryable(payError) && canPayAgain ? "Try again" : undefined}
+          onAction={onPay}
+          testID="pay-error"
+        >
+          {payError instanceof ApiError && payError.code === "PAYMENT_PROVIDER_UNAVAILABLE"
+            ? "No money was taken. Your seats are still held: try again in a moment."
+            : isEventBusy(payError)
+              ? `${errorMessage(payError)} Your seats are still held.`
+              : errorMessage(payError)}
         </Banner>
-      ) : null}
-      {pay.isError ? <Banner tone="error" testID="pay-error">{errorMessage(pay.error)}</Banner> : null}
-      {ensureBooking.isError && !pay.isError ? (
-        <Banner tone="error" action="Try again" onAction={() => checkout && ensureBooking.mutate(checkout)}>
-          {errorMessage(ensureBooking.error)}
+      ) : outcome && !paymentLive && outcome.tone !== "success" && !pay.isPending ? (
+        <Banner tone={outcome.tone === "waiting" ? "info" : "error"} title={outcome.title} testID="payment-outcome">
+          {`${outcome.body}${failed && outcome.canRetry && left > 0 ? " Your seats are still held: you can try again." : ""}`}
         </Banner>
       ) : null}
 
       <Card>
-        <Text style={type.overline}>{bookingData?.event.competition ?? "Your seats"}</Text>
-        <Text style={type.h2}>{bookingData?.event.title ?? (first ? `${first.stand_name} · ${first.block_label}` : "Your seats")}</Text>
-        {bookingData ? <Text style={type.muted}>{formatDateTime(bookingData.event.kickoff_at)} · {bookingData.event.venue_name}</Text> : null}
+        <Text style={type.overline}>{eventInfo?.competition ?? "Your seats"}</Text>
+        <Text style={type.h2}>{eventInfo?.title ?? (first ? `${standTitle(first.stand_name, first.tier)} · ${first.block_label}` : "Your seats")}</Text>
+        {eventInfo ? <Text style={type.muted}>{formatDateTime(eventInfo.kickoff_at)} · {eventInfo.venue_name}</Text> : null}
         {first ? (
           <Text style={type.muted}>
-            {first.stand_name} · {first.block_label} · Gate {first.gate_group}
+            {standTitle(first.stand_name, first.tier)} · {first.block_label} · Gate {first.gate_group}
           </Text>
         ) : null}
         <View style={styles.rule} />
-        {seats.map((s) => (
-          <View key={s.event_seat_id} style={styles.line}>
+        {amounts.lines.map((line) => (
+          <View key={line.eventSeatId} style={styles.line}>
             <View style={styles.fill}>
               <Text style={type.body}>
-                Row {s.location.row_label}, seat {s.location.seat_number}
+                Row {line.location.row_label}, seat {line.location.seat_number}
               </Text>
               <Text style={type.small}>
-                {s.category_name}
-                {s.location.seat_type === "RESTRICTED_VIEW" ? " · restricted view" : s.location.seat_type === "ACCESSIBLE" ? " · wheelchair space" : s.location.seat_type === "COMPANION" ? " · companion seat" : ""}
+                {line.categoryName}
+                {line.location.seat_type === "RESTRICTED_VIEW" ? " · restricted view" : line.location.seat_type === "ACCESSIBLE" ? " · wheelchair space" : line.location.seat_type === "COMPANION" ? " · companion seat" : ""}
               </Text>
             </View>
-            <Text style={type.body}>{formatKes(bookingData?.items.find((i) => i.event_seat_id === s.event_seat_id)?.unit_price_cents ?? s.price_cents)}</Text>
+            <Text style={type.body}>{formatKes(line.priceCents)}</Text>
           </View>
         ))}
         <View style={styles.rule} />
         <View style={styles.line}>
           <Text style={[type.muted, styles.fill]}>
-            {seats.length} ticket{seats.length === 1 ? "" : "s"}
+            {count} ticket{count === 1 ? "" : "s"}
           </Text>
-          <Text style={type.body} testID="subtotal">{formatKes(bookingData?.subtotal_cents ?? holdData.subtotal_cents)}</Text>
+          <Text style={type.body} testID="subtotal">{formatKes(amounts.subtotalCents)}</Text>
         </View>
         <View style={styles.line}>
           <Text style={[type.muted, styles.fill]}>Booking fee</Text>
-          {bookingData ? <Text style={type.body} testID="fee">{bookingData.fee_cents === 0 ? "None" : formatKes(bookingData.fee_cents)}</Text> : <ActivityIndicator color={palette.emeraldInk} />}
+          <Text style={type.body} testID="fee">{amounts.feeCents === 0 ? "None" : formatKes(amounts.feeCents)}</Text>
         </View>
         <View style={styles.line}>
           <Text style={[type.h3, styles.fill]}>Total</Text>
-          {total !== null ? <Text style={type.h2} testID="total">{formatKes(total)}</Text> : <ActivityIndicator color={palette.emeraldInk} />}
+          <Text style={type.price} testID="total">{formatKes(total)}</Text>
         </View>
-        {bookingData ? <Text style={type.small}>Booking reference {bookingData.reference}</Text> : null}
+        {bookingData ? <Text style={type.small} testID="booking-reference">Booking reference {bookingData.reference}</Text> : null}
       </Card>
 
       {refundOwed ? null : (
@@ -454,7 +513,6 @@ const styles = StyleSheet.create({
   backIcon: { transform: [{ rotate: "180deg" }] },
   countdown: { flexDirection: "row", alignItems: "center", gap: space.md, padding: space.md, borderRadius: radius.md, borderWidth: 1, backgroundColor: palette.warningBg, borderColor: palette.warningBorder },
   countdownUrgent: { backgroundColor: palette.errorBg, borderColor: palette.errorBorder },
-  clock: { fontSize: 28, fontWeight: "800", fontVariant: ["tabular-nums"] },
   waiting: { alignItems: "center", gap: space.md, paddingVertical: space.xl },
   rule: { height: StyleSheet.hairlineWidth, backgroundColor: palette.grey300, marginVertical: space.xs },
   line: { flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: 3 },
@@ -463,5 +521,5 @@ const styles = StyleSheet.create({
   devOptions: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
   devOption: { paddingHorizontal: 10, minHeight: 32, justifyContent: "center", borderRadius: radius.pill, borderWidth: 1, borderColor: palette.warningBorder, backgroundColor: palette.white },
   devOptionOn: { backgroundColor: palette.warning, borderColor: palette.warning },
-  devOptionText: { fontSize: 12, fontWeight: "600", color: palette.warning },
+  devOptionText: { ...type.chip, color: palette.warning },
 });

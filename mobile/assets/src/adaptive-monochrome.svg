@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Android themed-icon layer: only alpha is used, so structure comes from transparent gaps. Same geometry as the foreground. -->
+  <g transform="translate(512 512) scale(0.96)" fill="none" stroke="#064E3B">
+    <!-- outer stand -->
+    <ellipse rx="269" ry="193" stroke-width="42"/>
+    <!-- inner stand -->
+    <ellipse rx="199" ry="133" stroke-width="26"/>
+    <!-- pitch: solid, with the halfway line cut out as a transparent gap -->
+    <path fill="#064E3B" stroke="none" fill-rule="evenodd" d="M-88-64h79v128h-79a20 20 0 0 1-20-20v-88a20 20 0 0 1 20-20ZM9-64h79a20 20 0 0 1 20 20v88a20 20 0 0 1-20 20h-79Z"/>
+  </g>
+</svg>

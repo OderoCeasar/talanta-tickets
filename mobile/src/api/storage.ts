@@ -39,13 +39,16 @@ export const readStoredTickets = () => readJson<StoredTickets>(TICKETS_KEY);
 export const writeStoredTickets = (value: StoredTickets) => writeJson(TICKETS_KEY, value);
 
 /**
- * The checkout in progress. `idempotencyKey` is made once per hold and sent again on every
- * retry of `POST /bookings`, including after the app was killed between the request and its
- * answer.
+ * The checkout in progress. `idempotencyKey` is made once per hold and sent with every
+ * `POST /bookings` for it: the first when the fan taps Pay, and every retry after that,
+ * including after the app was killed between the request and its answer.
+ * `bookingReference` is null until that first Pay.
  */
 export interface StoredCheckout {
   holdId: number;
   eventId: number;
+  /** The block the seats are in, to go back to when the hold ends (an ended hold lists no seats). */
+  blockId?: number;
   idempotencyKey: string;
   bookingReference: string | null;
 }

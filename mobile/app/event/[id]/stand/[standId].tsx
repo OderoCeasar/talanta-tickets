@@ -6,7 +6,8 @@ import Svg, { Polygon, Text as SvgText } from "react-native-svg";
 import { useStandBlocks } from "../../../../src/api/queries";
 import { boundsOf, labelPoint, pointsAttr, SOLD_OUT_FILL, SOLD_OUT_STROKE, textOn } from "../../../../src/features/seatmap/overview";
 import { formatCount, formatKes } from "../../../../src/lib/money";
-import { mix, palette, space, type } from "../../../../src/theme";
+import { standTitle } from "../../../../src/lib/labels";
+import { font, mix, palette, space, type } from "../../../../src/theme";
 import { Card, Chip, EmptyState, ErrorState, Icon, Loading, Screen } from "../../../../src/ui";
 
 /** Level 2: one stand. Block outlines coloured by price tier, with availability and a price badge. */
@@ -45,9 +46,9 @@ export default function StandScreen() {
 
   return (
     <Screen refreshControl={<RefreshControl refreshing={stand.isRefetching} onRefresh={() => void stand.refetch()} tintColor={palette.emeraldInk} colors={[palette.emeraldInk]} />}>
-      <Stack.Screen options={{ title: stand.data.stand.name }} />
+      <Stack.Screen options={{ title: standTitle(stand.data.stand.name, stand.data.stand.tier) }} />
       <View>
-        <Text style={type.h2}>{stand.data.stand.name}</Text>
+        <Text style={type.h2}>{standTitle(stand.data.stand.name, stand.data.stand.tier)}</Text>
         <Text style={type.muted}>Tap a block to choose seats. Enter by gate {stand.data.stand.gate_group}.</Text>
       </View>
 
@@ -75,7 +76,7 @@ export default function StandScreen() {
               {blocks.map((b) => {
                 const [cx, cy] = labelPoint(b.outline);
                 return (
-                  <SvgText key={b.id} x={cx} y={cy + fontSize * 0.36} fontSize={fontSize} fontWeight="700" fill={b.seats_available === 0 ? palette.grey600 : textOn(fillOf(b))} textAnchor="middle" pointerEvents="none">
+                  <SvgText key={b.id} x={cx} y={cy + fontSize * 0.36} fontSize={fontSize} fontFamily={font.bodySemiBold} fill={b.seats_available === 0 ? palette.grey600 : textOn(fillOf(b))} textAnchor="middle" pointerEvents="none">
                     {shortCode(b.code)}
                   </SvgText>
                 );
