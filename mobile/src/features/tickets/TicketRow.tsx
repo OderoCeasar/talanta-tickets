@@ -2,7 +2,8 @@ import { router } from "expo-router";
 import { StyleSheet, Text, View } from "react-native";
 
 import type { Schemas } from "../../api/client";
-import { palette, radius, space, type } from "../../theme";
+import { standTitle } from "../../lib/labels";
+import { font, palette, radius, space, type } from "../../theme";
 import { Card, Chip, Icon } from "../../ui";
 
 const STATUS: Record<Schemas["TicketStatus"], { label: string; tone: "neutral" | "muted" | "error" } | null> = {
@@ -28,7 +29,7 @@ export function TicketRow({ ticket }: { ticket: Schemas["Ticket"] }) {
       <View style={styles.fill}>
         <Text style={type.h3}>{l.block_label}</Text>
         <Text style={type.muted}>
-          {l.stand_name} · Row {l.row_label} · {ticket.category_name}
+          {standTitle(l.stand_name, l.tier)} · Row {l.row_label} · {ticket.category_name}
         </Text>
         <Text style={type.small}>Gate {l.gate_group}</Text>
         {status ? <Chip label={status.label} tone={status.tone} /> : null}
@@ -42,6 +43,6 @@ const styles = StyleSheet.create({
   fill: { flex: 1, gap: 2 },
   row: { flexDirection: "row", alignItems: "center", gap: space.md },
   seat: { minWidth: 64, alignItems: "center", backgroundColor: palette.champagne, borderRadius: radius.md, paddingVertical: space.sm, paddingHorizontal: space.sm },
-  seatOver: { fontSize: 10, fontWeight: "700", letterSpacing: 1, color: palette.grey700 },
-  seatLabel: { fontSize: 20, fontWeight: "800", color: palette.emeraldInk },
+  seatOver: { fontFamily: font.bodySemiBold, fontSize: 10, letterSpacing: 1, color: palette.grey700 },
+  seatLabel: { ...type.price },
 });

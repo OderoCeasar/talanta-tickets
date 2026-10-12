@@ -1,6 +1,7 @@
 import { unwrap } from "@talanta/shared";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { AlertIcon, ChartIcon } from "./icons";
 import { StadiumPlan } from "./StadiumPlan";
 import { Alert, Card, LoadFailed, SkeletonRows, StateBlock, Swatch } from "./ui";
@@ -79,6 +80,7 @@ export function SalesDashboard({ event }: { event: AdminEvent }) {
   return (
     <>
       <RefundsCard eventId={event.id} summary={summary} />
+      <OpenAlertsNote eventId={event.id} count={summary.open_alert_count} />
 
       {sales.isError && (
         <Alert tone="warning" title="The figures have stopped updating">
@@ -209,6 +211,18 @@ function Kpi({ label, value, note, hero }: { label: string; value: string; note:
   );
 }
 
+/** How many alerts of this event nobody has acknowledged yet, with the way to them. */
+function OpenAlertsNote({ eventId, count }: { eventId: number; count: number }) {
+  if (!(count > 0)) return null;
+  return (
+    <Alert tone="warning" title={count === 1 ? "1 alert for this event needs a look" : `${formatCount(count)} alerts for this event need a look`}>
+      <p>
+        A payment went wrong and nobody has acknowledged it yet. <Link to={`/alerts?event=${eventId}`}>Open the alerts</Link>
+      </p>
+    </Alert>
+  );
+}
+
 function RefundsCard({ eventId, summary }: { eventId: number; summary: SalesSummary }) {
   const count = summary.refund_required_count;
   const bookings = useQuery({
@@ -248,8 +262,15 @@ function RefundsCard({ eventId, summary }: { eventId: number; summary: SalesSumm
       <div className="card__body stack">
         <p className="small">
           These people paid, but did not get (or no longer have) their seats. Someone has to send each of them their money
-          back. Sending and ticking off refunds from this page comes with the payments milestone; for now this is the list
-          to work from.
+          back by hand in the M-Pesa portal, then mark the refund as paid back.
+        </p>
+        <p className="row">
+          <Link className="btn btn--primary btn--small" to={`/refunds?event=${eventId}`}>
+            Open the refund queue
+          </Link>
+          <Link className="btn btn--secondary btn--small" to={`/alerts?event=${eventId}`}>
+            See this event's alerts
+          </Link>
         </p>
       </div>
       <div className="card__body card__body--flush">
@@ -345,7 +366,8 @@ function SalesChart({
   const innerHeight = CHART.height - CHART.top - CHART.bottom;
   const slot = points.length > 0 ? innerWidth / points.length : innerWidth;
   const barWidth = Math.max(1.5, Math.min(28, slot - 2));
-  const labelEvery = Math.max(1, Math.ceil(points.length / 6));
+  // Five labels at most: a sixth makes "10 Oct, 02:00" run into its neighbour on the hourly chart.
+  const labelEvery = Math.max(1, Math.ceil(points.length / 5));
   const active = hover !== null ? points[hover] : undefined;
 
   return (

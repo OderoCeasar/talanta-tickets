@@ -5,7 +5,7 @@ import { useCategories, useEvent } from "../../../src/api/queries";
 import { ResumeBanner } from "../../../src/features/booking/ResumeBanner";
 import { formatCount, formatKes } from "../../../src/lib/money";
 import { formatDate, formatDateTime, formatTime } from "../../../src/lib/time";
-import { palette, radius, space, type } from "../../../src/theme";
+import { font, palette, radius, space, type } from "../../../src/theme";
 import { Banner, Button, Card, Chip, ErrorState, Icon, Loading, Screen } from "../../../src/ui";
 
 export default function EventScreen() {
@@ -116,8 +116,8 @@ const styles = StyleSheet.create({
   hero: { backgroundColor: palette.emeraldInk, borderRadius: radius.lg, padding: space.xl, gap: space.sm, alignItems: "center" },
   heroOver: { ...type.overline, color: palette.champagne, textAlign: "center" },
   teams: { alignItems: "center", gap: 2 },
-  team: { fontSize: 26, lineHeight: 32, fontWeight: "800", color: palette.white, textAlign: "center" },
-  vs: { fontSize: 14, fontWeight: "700", color: palette.champagne, letterSpacing: 2, textTransform: "uppercase" },
+  team: { ...type.display, textAlign: "center" },
+  vs: { fontFamily: font.bodySemiBold, fontSize: 14, color: palette.champagne, letterSpacing: 2, textTransform: "uppercase" },
   heroChips: { marginTop: space.xs },
   fact: { flexDirection: "row", gap: space.md, alignItems: "flex-start", paddingVertical: 4 },
   factIcon: { width: 34, height: 34, borderRadius: 17, backgroundColor: palette.champagne, alignItems: "center", justifyContent: "center" },

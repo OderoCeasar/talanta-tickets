@@ -23,8 +23,12 @@ async function read(key: string): Promise<string | null> {
 export function loadTokens(): Promise<void> {
   if (!loaded) {
     loaded = Promise.all([read(ACCESS_KEY), read(REFRESH_KEY)]).then(([a, r]) => {
-      accessToken = a;
+      // An access token with no refresh token beside it (a half-finished write or sign-out)
+      // is a dead token: the app counts as signed out, and sending it would turn every
+      // public read into a 401 that nothing could ever refresh.
+      accessToken = r ? a : null;
       refreshToken = r;
+      if (a && !r) void SecureStore.deleteItemAsync(ACCESS_KEY).catch(() => undefined);
     });
   }
   return loaded;

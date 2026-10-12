@@ -6,7 +6,7 @@ import { Pressable, StyleSheet, Text, View } from "react-native";
 
 import { useBestAvailable, useCategories, useEvent } from "../../../src/api/queries";
 import { writeStoredCheckout } from "../../../src/api/storage";
-import { errorMessage } from "../../../src/lib/errors";
+import { errorMessage, isEventBusy, isRetryable } from "../../../src/lib/errors";
 import { formatCount, formatKes } from "../../../src/lib/money";
 import { useNow } from "../../../src/lib/useNow";
 import { useSession } from "../../../src/session";
@@ -50,8 +50,8 @@ export default function BestAvailableScreen() {
       {
         onSuccess: async (hold) => {
           syncHold(hold.expires_at, hold.remaining_seconds);
-          await writeStoredCheckout({ holdId: hold.id, eventId, idempotencyKey: Crypto.randomUUID(), bookingReference: null });
           const blockId = hold.seats[0]?.location.block_id;
+          await writeStoredCheckout({ holdId: hold.id, eventId, blockId, idempotencyKey: Crypto.randomUUID(), bookingReference: null });
           if (blockId === undefined) return;
           // Show the seats on the map first; checkout is one tap from there.
           router.replace({ pathname: "/event/[id]/block/[blockId]", params: { id, blockId: String(blockId), found: "1" } });
@@ -93,7 +93,7 @@ export default function BestAvailableScreen() {
               <Text style={type.muted}>
                 {quantity} × {chosen.name}
               </Text>
-              <Text style={type.h3} testID="best-total">{formatKes(chosen.price_cents * quantity)}</Text>
+              <Text style={type.price} testID="best-total">{formatKes(chosen.price_cents * quantity)}</Text>
             </View>
           ) : null}
           <Button
@@ -112,7 +112,17 @@ export default function BestAvailableScreen() {
         <Text style={type.muted}>Choose a price and how many. We find seats next to each other in one row and hold them while you pay.</Text>
       </View>
 
-      {best.isError ? <Banner tone="error" testID="best-error">{errorMessage(best.error)}</Banner> : null}
+      {best.isError ? (
+        <Banner
+          tone={isEventBusy(best.error) ? "warning" : "error"}
+          testID="best-error"
+          // The organiser is updating the event, or the network dropped: the same choice can be sent again.
+          action={isRetryable(best.error) && cooldown === 0 && !best.isPending ? "Try again" : undefined}
+          onAction={find}
+        >
+          {errorMessage(best.error)}
+        </Banner>
+      ) : null}
 
       {available.length === 0 ? (
         <Banner title="Sold out">There are no seats left for this event.</Banner>
@@ -172,5 +182,5 @@ const styles = StyleSheet.create({
   stepper: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", paddingVertical: space.sm },
   step: { width: 52, height: 52, borderRadius: 26, borderWidth: 1.5, borderColor: palette.emeraldInk, alignItems: "center", justifyContent: "center" },
   stepOff: { opacity: 0.35 },
-  quantity: { fontSize: 32, fontWeight: "800", color: palette.emeraldInk, minWidth: 60, textAlign: "center" },
+  quantity: { ...type.price, fontSize: 32, lineHeight: 40, minWidth: 60, textAlign: "center" },
 });

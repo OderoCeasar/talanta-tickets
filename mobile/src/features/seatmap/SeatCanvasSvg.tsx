@@ -3,7 +3,7 @@ import { PixelRatio, StyleSheet } from "react-native";
 import Animated, { useAnimatedStyle } from "react-native-reanimated";
 import Svg, { Path, Text as SvgText } from "react-native-svg";
 
-import { palette } from "../../theme";
+import { font, palette } from "../../theme";
 import { dotsPath, rectsPath, type SeatBatch, type SeatScene } from "./layers";
 import type { SeatGeometry } from "./model";
 import type { PanZoom } from "./usePanZoom";
@@ -60,7 +60,7 @@ export function SeatCanvasSvg({ geometry, scene, panZoom }: Props) {
     <Animated.View style={[styles.layer, { width, height }, style]}>
       <Svg width={width} height={height} viewBox={`0 0 ${geometry.width} ${geometry.height}`}>
         {geometry.rowLabels.map((label, r) => (
-          <SvgText key={r} x={geometry.rowLabelX[r]} y={geometry.rowLabelY[r]! + fontSize * 0.36} fontSize={fontSize} fontWeight="700" fill={palette.grey600} textAnchor="middle">
+          <SvgText key={r} x={geometry.rowLabelX[r]} y={geometry.rowLabelY[r]! + fontSize * 0.36} fontSize={fontSize} fontFamily={font.bodySemiBold} fill={palette.grey600} textAnchor="middle">
             {label}
           </SvgText>
         ))}

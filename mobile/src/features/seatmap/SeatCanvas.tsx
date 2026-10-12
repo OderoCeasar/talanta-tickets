@@ -138,5 +138,5 @@ const styles = StyleSheet.create({
     borderColor: palette.grey300,
     ...shadow.card,
   },
-  renderer: { position: "absolute", right: space.sm, fontSize: 10, color: palette.grey400 },
+  renderer: { ...type.small, position: "absolute", right: space.sm, fontSize: 10, lineHeight: 14, color: palette.grey400 },
 });

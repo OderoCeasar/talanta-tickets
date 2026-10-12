@@ -42,7 +42,17 @@
   --shadow-card: 0 1px 2px rgb(6 78 59 / 6%), 0 8px 24px -12px rgb(6 78 59 / 18%);
   --focus-ring: 0 0 0 3px color-mix(in srgb, var(--emerald-ink) 28%, transparent);
 
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  /* Type. The font files are bundled (see fonts.css): nothing is fetched from another site.
+     Inter is for everything that is read or pressed; Plus Jakarta Sans is for headings, the
+     brand name and the big figures. The "… Fallback" faces are a local font resized to the
+     web font's width, so text barely moves when the web font arrives. */
+  --font-body: "Inter Variable", "Inter Fallback", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", Arial, sans-serif;
+  --font-heading: "Plus Jakarta Sans Variable", "Plus Jakarta Sans Fallback", ui-sans-serif, system-ui, -apple-system,
+    "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  font-family: var(--font-body);
   font-size: 16px;
   line-height: 1.5;
   color: var(--grey-900);
@@ -61,29 +71,67 @@ body {
   min-width: 320px;
 }
 
+/* Browsers give form controls their own font; make them use the page's. Classes below set
+   sizes and weights on top of this. */
+button,
+input,
+select,
+textarea,
+optgroup {
+  font: inherit;
+}
+
+/* The weights in use are Inter 400, 500 and 600, so "bold" text is 600 and never a
+   synthesised weight. */
+strong,
+b {
+  font-weight: 600;
+}
+
 h1,
 h2,
 h3,
+h4,
 p {
   margin: 0;
 }
 
 h1,
 h2,
-h3 {
+h3,
+h4 {
+  font-family: var(--font-heading);
   color: var(--emerald-ink);
-  letter-spacing: -0.015em;
+  /* Plus Jakarta Sans is already set tight and its space is narrow: at heavy weights the
+     words of a heading run together unless they are given a little room. */
+  letter-spacing: 0;
+  word-spacing: 0.08em;
   line-height: 1.2;
 }
 
 h1 {
   font-size: 1.625rem;
-  font-weight: 700;
+  font-weight: 800;
 }
 
 h2 {
   font-size: 1.125rem;
-  font-weight: 650;
+  font-weight: 700;
+}
+
+h4 {
+  font-size: 0.875rem;
+  font-weight: 600;
+}
+
+/* Money and counts line up in columns and do not shuffle sideways when they refresh. */
+.num,
+.table td,
+.rowtable td,
+.badge,
+.chart__tick,
+.chart__readout {
+  font-variant-numeric: tabular-nums;
 }
 
 a {
@@ -101,7 +149,7 @@ summary:focus-visible {
 
 code,
 .mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
 }
 
 .muted {
@@ -334,7 +382,7 @@ code,
 }
 
 .input--code {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 1.375rem;
   letter-spacing: 0.35em;
   text-align: center;
@@ -559,7 +607,7 @@ code,
 }
 
 .alert__title {
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .chip {
@@ -570,7 +618,7 @@ code,
   border: 1px solid;
   border-radius: 999px;
   font-size: 0.75rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.02em;
   white-space: nowrap;
 }
@@ -691,7 +739,8 @@ code,
 }
 
 .state__title {
-  font-weight: 650;
+  font-family: var(--font-heading);
+  font-weight: 600;
   color: var(--emerald-ink);
 }
 
@@ -758,7 +807,7 @@ code,
   padding: 0.5rem 0.75rem;
   border-bottom: 1px solid var(--grey-200);
   font-size: 0.75rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
   text-align: left;
@@ -854,7 +903,7 @@ code,
     content: attr(data-label);
     flex: none;
     font-size: 0.75rem;
-    font-weight: 650;
+    font-weight: 600;
     letter-spacing: 0.04em;
     text-transform: uppercase;
     color: var(--grey-600);
@@ -893,7 +942,7 @@ code,
 }
 
 .copybox .input {
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-family: var(--font-mono);
   font-size: 0.8125rem;
   text-overflow: ellipsis;
   background: var(--white);
@@ -922,6 +971,19 @@ code,
   border-radius: var(--radius-lg);
   box-shadow: 0 24px 64px -16px rgb(6 78 59 / 45%);
   color: inherit;
+}
+
+/* A long question on a small phone: the text scrolls, the two buttons stay in reach, and
+   the dialog opens showing its first line (focus goes to a button, which is not in the
+   part that scrolls). */
+.dialog[open] {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100dvh - 2rem);
+}
+
+.dialog__body {
+  overflow-y: auto;
 }
 
 .dialog::backdrop {
@@ -988,9 +1050,9 @@ code,
 
 .brand__name {
   display: block;
+  font-family: var(--font-heading);
   font-size: 1.0625rem;
-  font-weight: 700;
-  letter-spacing: -0.01em;
+  font-weight: 800;
   line-height: 1.15;
 }
 
@@ -1026,7 +1088,7 @@ code,
 .nav__label {
   padding: 0.75rem 0.75rem 0.375rem;
   font-size: 0.6875rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   opacity: 0.55;
@@ -1040,7 +1102,7 @@ code,
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius);
   color: color-mix(in srgb, var(--champagne) 82%, var(--emerald-ink));
-  font-weight: 550;
+  font-weight: 500;
   text-decoration: none;
 }
 
@@ -1057,7 +1119,7 @@ code,
 .nav__link[aria-current="page"] {
   background: var(--champagne);
   color: var(--emerald-ink);
-  font-weight: 650;
+  font-weight: 600;
 }
 
 .sidebar__user {
@@ -1087,12 +1149,12 @@ code,
   background: var(--champagne);
   color: var(--emerald-ink);
   font-size: 0.8125rem;
-  font-weight: 700;
+  font-weight: 600;
   flex: none;
 }
 
 .usercard__name {
-  font-weight: 650;
+  font-weight: 600;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1242,9 +1304,8 @@ code,
 .auth__pitch h2 {
   color: var(--champagne);
   font-size: 2rem;
-  font-weight: 700;
+  font-weight: 800;
   line-height: 1.15;
-  letter-spacing: -0.02em;
 }
 
 .auth__pitch p {
@@ -1298,7 +1359,7 @@ code,
 }
 
 .invite-summary__email {
-  font-weight: 650;
+  font-weight: 600;
   color: var(--emerald-ink);
   overflow-wrap: anywhere;
 }
@@ -1372,7 +1433,8 @@ code,
   display: flex;
   gap: 0.5rem;
   align-items: center;
-  font-weight: 650;
+  font-family: var(--font-heading);
+  font-weight: 700;
   color: var(--emerald-ink);
 }
 
@@ -1392,7 +1454,7 @@ code,
 
 .deflist dd {
   margin: 0;
-  font-weight: 550;
+  font-weight: 500;
   overflow-wrap: anywhere;
 }
 
@@ -1487,8 +1549,9 @@ code,
 
 h3,
 .subhead {
+  font-family: var(--font-heading);
   font-size: 0.9375rem;
-  font-weight: 650;
+  font-weight: 700;
 }
 
 .plainlist {
@@ -1546,7 +1609,7 @@ h3,
   background: var(--error);
   color: var(--white);
   font-size: 0.8125rem;
-  font-weight: 700;
+  font-weight: 600;
   vertical-align: middle;
 }
 
@@ -1609,7 +1672,7 @@ h3,
   padding: 0;
   margin-bottom: 0.625rem;
   font-size: 0.75rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
   color: var(--grey-600);
@@ -1639,7 +1702,7 @@ select.input {
   min-height: 2.75rem;
   display: flex;
   align-items: center;
-  font-weight: 550;
+  font-weight: 500;
 }
 
 .choice-group--stacked {
@@ -1826,7 +1889,7 @@ select.input {
 }
 
 .problems__title {
-  font-weight: 650;
+  font-weight: 600;
   color: var(--warning);
 }
 
@@ -1902,8 +1965,9 @@ select.input {
 
 .plan__stand-label {
   fill: var(--grey-600);
+  font-family: var(--font-heading);
   font-size: 54px;
-  font-weight: 650;
+  font-weight: 700;
   letter-spacing: 0.04em;
   pointer-events: none;
 }
@@ -2214,16 +2278,16 @@ select.input {
 
 .kpi__label {
   font-size: 0.75rem;
-  font-weight: 650;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   opacity: 0.8;
 }
 
 .kpi__value {
+  font-family: var(--font-heading);
   font-size: 1.625rem;
-  font-weight: 700;
-  letter-spacing: -0.02em;
+  font-weight: 800;
   line-height: 1.2;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
@@ -2282,7 +2346,7 @@ select.input {
   background: var(--ink-100);
   color: var(--emerald-ink);
   font-size: 0.6875rem;
-  font-weight: 700;
+  font-weight: 600;
 }
 
 .card--attention {
@@ -2356,6 +2420,7 @@ select.input {
 
 .chart__tick {
   fill: var(--grey-600);
+  font-family: var(--font-body);
   font-size: 11px;
 }
 
@@ -2461,8 +2526,9 @@ select.input {
 }
 
 .eventcard__title {
+  font-family: var(--font-heading);
   font-size: 1.0625rem;
-  font-weight: 650;
+  font-weight: 700;
   color: var(--emerald-ink);
   line-height: 1.25;
   overflow-wrap: anywhere;
@@ -2481,6 +2547,7 @@ select.input {
 }
 
 .eventcard__number {
+  font-family: var(--font-heading);
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
@@ -2494,4 +2561,96 @@ select.input {
 .eventcard__warn {
   color: var(--error);
   font-weight: 600;
+}
+
+/* ---------- Alerts and refunds ---------- */
+
+/* A badge carries hidden words for screen readers ("3 open alerts"). They are absolutely
+   placed, so the badge anchors them: inside the scrolling tab row they would otherwise sit
+   out in the page and make a phone scroll sideways. */
+.nav__badge,
+.tabs__badge {
+  position: relative;
+}
+
+.nav__badge {
+  margin-left: auto;
+}
+
+.card__header h2 .badge {
+  margin-left: 0.5rem;
+}
+
+.card--attention h2 .badge {
+  margin-left: 0;
+}
+
+/* On the selected (champagne) nav item the badge keeps its red, which still reads. */
+.tabs__badge {
+  margin-left: 0.375rem;
+  min-width: 1.25rem;
+  height: 1.25rem;
+  font-size: 0.75rem;
+}
+
+/* The dot on the phone's Menu button: something in the closed menu is waiting. */
+.menudot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: var(--error);
+  box-shadow: 0 0 0 2px var(--champagne);
+}
+
+.chip--alert-refund {
+  border-color: var(--error-border);
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.chip--alert-check {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning);
+}
+
+.alertrow__message {
+  display: block;
+  max-width: 34rem;
+  margin: 0.375rem 0 0.25rem;
+  font-weight: 400;
+}
+
+/* Two lines in one table cell, kept together when the table turns into cards on a phone. */
+.cellstack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.125rem;
+  min-width: 0;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.alertrow__where {
+  min-width: 9rem;
+}
+
+.table__actions--stack {
+  flex-wrap: wrap;
+}
+
+.card__inset {
+  padding: 0 1.25rem 0.75rem;
+}
+
+@container (max-width: 640px) {
+  .cellstack {
+    align-items: flex-end;
+  }
+
+  .alertrow__where {
+    min-width: 0;
+  }
 }

@@ -2,7 +2,7 @@ import { Redirect, Tabs } from "expo-router";
 import type { ColorValue } from "react-native";
 
 import { useSession } from "../../src/session";
-import { alpha, headerOptions, palette } from "../../src/theme";
+import { alpha, headerOptions, palette, type } from "../../src/theme";
 import { Icon, type IconName } from "../../src/ui";
 
 const tabIcon = (name: IconName) =>
@@ -22,7 +22,7 @@ export default function TabsLayout() {
         tabBarStyle: { backgroundColor: palette.emeraldInk, borderTopColor: palette.inkDeep },
         tabBarActiveTintColor: palette.champagne,
         tabBarInactiveTintColor: alpha(palette.champagne, 0.6),
-        tabBarLabelStyle: { fontSize: 12, fontWeight: "600" },
+        tabBarLabelStyle: type.tab,
         tabBarAllowFontScaling: false,
         sceneStyle: { backgroundColor: palette.champagne50 },
       }}

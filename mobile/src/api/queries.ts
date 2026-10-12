@@ -4,6 +4,7 @@
 import { ApiError, unwrap } from "@talanta/shared";
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
+import { bookingPollMs, paymentPollMs } from "../lib/checkout";
 import { api, type Schemas } from "./client";
 import { readStoredTickets, writeStoredTickets, writeStoredUser } from "./storage";
 
@@ -61,9 +62,10 @@ export function useEvents() {
   });
 }
 
-export function useEvent(eventId: number) {
+export function useEvent(eventId: number, enabled = true) {
   return useQuery({
     queryKey: keys.event(eventId),
+    enabled,
     queryFn: () => unwrap(api.GET("/events/{eventId}", { params: { path: { eventId } } })),
   });
 }
@@ -198,12 +200,24 @@ export function fetchBooking(reference: string) {
   return unwrap(api.GET("/bookings/{reference}", { params: { path: { reference } } }));
 }
 
+/**
+ * One booking. While it is unpaid and has had a payment attempt it is read again on a
+ * timer, so a screen left open, or reopened later, shows what the server says now: a live
+ * payment settles, and neither `TIMEOUT` nor `FAILED` is always the last word (M-Pesa can
+ * confirm late that the money arrived).
+ */
 export function useBooking(reference: string | null) {
   return useQuery({
     queryKey: keys.booking(reference ?? ""),
     enabled: reference !== null,
     staleTime: 0,
     queryFn: () => fetchBooking(reference as string),
+    refetchInterval: (query) => {
+      const b = query.state.data;
+      if (!b || b.status !== "PENDING_PAYMENT" || !b.latest_payment) return false;
+      return bookingPollMs(b.latest_payment.status);
+    },
+    refetchIntervalInBackground: false,
   });
 }
 
@@ -218,14 +232,17 @@ export function startStkPush(bookingId: number, phone: string, mockOutcome?: Sch
 
 export const isLivePayment = (status: Schemas["PaymentStatus"]) => status === "INITIATED" || status === "PENDING";
 
-/** Polls a payment every two seconds until its status is final (the contract's suggestion). */
+/**
+ * Polls a payment every two seconds while it is live (the contract's suggestion), and slowly
+ * while it is `TIMEOUT`, which M-Pesa can still turn into `SUCCESS` or `FAILED`.
+ */
 export function usePayment(paymentId: number | null) {
   return useQuery({
     queryKey: keys.payment(paymentId ?? 0),
     enabled: paymentId !== null,
     staleTime: 0,
     queryFn: () => unwrap(api.GET("/payments/{paymentId}", { params: { path: { paymentId: paymentId as number } } })),
-    refetchInterval: (query) => (query.state.data && !isLivePayment(query.state.data.status) ? false : 2000),
+    refetchInterval: (query) => paymentPollMs(query.state.data?.status),
     refetchIntervalInBackground: false,
   });
 }
