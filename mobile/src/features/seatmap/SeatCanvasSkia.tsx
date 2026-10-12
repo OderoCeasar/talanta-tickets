@@ -1,8 +1,9 @@
-import { Canvas, Group, matchFont, PaintStyle, Picture, Skia, StrokeCap, StrokeJoin } from "@shopify/react-native-skia";
+import { Canvas, Group, PaintStyle, Picture, Skia, StrokeCap, StrokeJoin, useFont, type SkFont } from "@shopify/react-native-skia";
 import { useMemo } from "react";
-import { Platform, StyleSheet } from "react-native";
+import { StyleSheet } from "react-native";
 import { useDerivedValue } from "react-native-reanimated";
 
+import { seatMapLabelFont } from "../../fontAssets";
 import { palette } from "../../theme";
 import type { SeatScene } from "./layers";
 import type { SeatGeometry } from "./model";
@@ -21,7 +22,7 @@ interface Props {
  * component, node or handler per seat. The picture is re-recorded only when a seat's look
  * changes; zooming and panning replay it under a transform on the UI thread.
  */
-function record(geometry: SeatGeometry, scene: SeatScene) {
+function record(geometry: SeatGeometry, scene: SeatScene, font: SkFont | null) {
   const recorder = Skia.PictureRecorder();
   const canvas = recorder.beginRecording(Skia.XYWHRect(0, 0, geometry.width, geometry.height));
   const w = geometry.seatW;
@@ -36,12 +37,15 @@ function record(geometry: SeatGeometry, scene: SeatScene) {
   stroke.setStrokeCap(StrokeCap.Round);
   stroke.setStrokeJoin(StrokeJoin.Round);
 
-  const font = matchFont({ fontFamily: Platform.select({ ios: "Helvetica", default: "sans-serif" }), fontSize: geometry.pitchX * 0.62, fontWeight: "bold" });
-  fill.setColor(Skia.Color(palette.grey600));
-  for (let r = 0; r < geometry.rowLabels.length; r++) {
-    const label = geometry.rowLabels[r]!;
-    const textWidth = font.measureText(label).width;
-    canvas.drawText(label, geometry.rowLabelX[r]! - textWidth / 2, geometry.rowLabelY[r]! + geometry.pitchX * 0.22, fill, font);
+  // Row labels use the app's own Inter (the same file the rest of the UI uses). Until the
+  // font file has been read the seats are drawn without labels, then recorded again.
+  if (font) {
+    fill.setColor(Skia.Color(palette.grey600));
+    for (let r = 0; r < geometry.rowLabels.length; r++) {
+      const label = geometry.rowLabels[r]!;
+      const textWidth = font.measureText(label).width;
+      canvas.drawText(label, geometry.rowLabelX[r]! - textWidth / 2, geometry.rowLabelY[r]! + geometry.pitchX * 0.22, fill, font);
+    }
   }
 
   for (const batch of scene.batches) {
@@ -82,7 +86,8 @@ function record(geometry: SeatGeometry, scene: SeatScene) {
 }
 
 export function SeatCanvasSkia({ geometry, scene, panZoom, width, height }: Props) {
-  const picture = useMemo(() => record(geometry, scene), [geometry, scene]);
+  const font = useFont(seatMapLabelFont, geometry.pitchX * 0.62);
+  const picture = useMemo(() => record(geometry, scene, font), [geometry, scene, font]);
   const { scale, translateX, translateY } = panZoom;
   const transform = useDerivedValue(() => [{ translateX: translateX.value }, { translateY: translateY.value }, { scale: scale.value }]);
 

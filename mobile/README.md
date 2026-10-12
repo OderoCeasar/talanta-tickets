@@ -51,6 +51,25 @@ production the field is never sent and the box never appears.
 Development builds (`__DEV__`) show a "mock outcome" picker on checkout. It sends the
 `X-Mock-Outcome` header with the STK push request. Production builds never send the header.
 
+### Fonts and icon
+
+Inter (body, labels, buttons, inputs, tab bar) and Plus Jakarta Sans (titles, headers,
+headline prices) are bundled from `@expo-google-fonts/*`; nothing is fetched at run time.
+The family names live in `src/fonts.ts`, one per weight, and text styles in `src/theme.ts`
+name a family and never set `fontWeight`. `useFonts` in `app/_layout.tsx` registers them
+(Expo Go); the `expo-font` plugin in `app.json` embeds the same files in a real build.
+
+The icon, Android adaptive layers, splash mark and favicon are rendered from the SVGs in
+`assets/src/`:
+
+```sh
+node mobile/assets/src/render.mjs                 # rewrites mobile/assets/*.png
+node mobile/assets/src/render.mjs --preview <dir> # also writes 512 px previews
+```
+
+Expo Go shows its own launcher icon; the app's icon and splash appear in a development or
+release build.
+
 ## Checks
 
 ```sh
@@ -62,7 +81,8 @@ pnpm --filter @talanta/mobile exec expo export --platform android --output-dir /
 
 The unit tests cover the code with no React Native imports: phone normalisation, money and
 Nairobi-time formatting, the hold countdown, error wording, the seat geometry and grid
-index (tap hit-testing on rotated and curved blocks), applying a poll delta to the cached
+index (tap hit-testing on rotated and curved blocks), seat labels, checkout amounts from
+the hold or the booking, payment outcomes, applying a poll delta to the cached
 block, how each seat is drawn, pan/zoom limits, and the QR matrix.
 
 ## How it is put together
@@ -84,7 +104,9 @@ src/api/                    the shared typed client, tokens, TanStack Query hook
 src/features/seatmap/       geometry + grid index, draw batches, SVG and Skia canvases, gestures, polling
 src/features/booking/       resume banner
 src/features/tickets/       QR drawing, ticket row
-src/lib/                    phone, money, time, countdown, error wording
+src/lib/                    phone, money, time, countdown, checkout amounts, error wording
+src/fonts.ts                the font family names (one per weight); src/fontAssets.ts the files
+assets/                     icon, adaptive icon layers, splash mark, favicon; assets/src the SVGs
 src/store/bookingFlow.ts    zustand: the seat selection and the hold expiry, nothing else
 src/ui/                     buttons, cards, banners, states, icons
 ```
@@ -126,8 +148,19 @@ Rules the code follows:
 - The countdown is `expires_at` minus the phone's clock, corrected by the difference the
   hold's `remaining_seconds` reveals. It is re-read from the server when the app returns to
   the foreground and when it reaches zero.
+- The total shown comes from the hold (`subtotal_cents`, `fee_cents`, `total_cents`). **No
+  booking exists until the fan taps Pay.** Once it does, the booking's amounts are shown
+  (`src/lib/checkout.ts`).
 - The idempotency key is made once, when the hold is made, and stored with the hold ID. It
-  is sent on every `POST /bookings` for that hold, including after a restart.
+  is sent on every `POST /bookings` for that hold: the first Pay, every retry, and after a
+  restart.
+- What a payment means is read from three fields in order: `booking_status`, `status`,
+  `failure_reason` (`paymentOutcome` in `src/lib/errors.ts`). `SUCCESS` alone is never
+  "tickets"; a `TIMEOUT` is polled slowly because M-Pesa can still settle it.
+- `EVENT_BUSY` (an organiser is publishing or editing) is shown as "The organiser is
+  updating this event. Try again in a moment." with a Try again that keeps the selection.
+  Under two minutes left on the hold (`HOLD_EXPIRED` with `hold_status: ACTIVE`) releases the
+  seats and returns to the map with a line saying why.
 - After a restart the app asks `GET /me/holds` (seats still held) and
   `GET /bookings/{reference}` (the last checkout's booking) and shows what the server says.
 

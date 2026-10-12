@@ -8,7 +8,7 @@ import { ResumeBanner } from "../../src/features/booking/ResumeBanner";
 import { errorMessage } from "../../src/lib/errors";
 import { formatKes } from "../../src/lib/money";
 import { dateTile, daysUntil, formatTime } from "../../src/lib/time";
-import { palette, radius, space, type } from "../../src/theme";
+import { font, palette, radius, space, type } from "../../src/theme";
 import { Banner, Button, Card, Chip, EmptyState, ErrorState, Icon, Loading } from "../../src/ui";
 
 type Event = Schemas["Event"];
@@ -109,9 +109,9 @@ const styles = StyleSheet.create({
   cardBody: { flex: 1, gap: 4 },
   cardFoot: { flexDirection: "row", alignItems: "center", justifyContent: "space-between", marginTop: space.xs, gap: space.sm },
   tile: { minWidth: 58, borderRadius: radius.md, backgroundColor: palette.emeraldInk, alignItems: "center", paddingVertical: space.sm, paddingHorizontal: space.sm },
-  tileMonth: { fontSize: 11, fontWeight: "700", letterSpacing: 1, color: palette.champagne },
-  tileDay: { fontSize: 24, lineHeight: 28, fontWeight: "800", color: palette.white },
-  tileWeekday: { fontSize: 11, fontWeight: "600", color: palette.champagne300 },
+  tileMonth: { fontFamily: font.bodySemiBold, fontSize: 11, letterSpacing: 1, color: palette.champagne },
+  tileDay: { fontFamily: font.headingExtraBold, fontSize: 24, lineHeight: 28, color: palette.white },
+  tileWeekday: { fontFamily: font.bodySemiBold, fontSize: 11, color: palette.champagne300 },
   more: { padding: space.lg },
   end: { textAlign: "center", padding: space.md },
 });
