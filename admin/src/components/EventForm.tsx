@@ -6,6 +6,7 @@ import { describeError, isCode, splitFieldErrors } from "../lib/errors";
 import { fromNairobiInput, toNairobiInput } from "../lib/format";
 import { formatCount, formatKes } from "../lib/money";
 import { keys, STATUS_LABELS, useTemplates, useVenues, type AdminEvent } from "../lib/queries";
+import { venueProblem } from "../lib/venueChoice";
 import { Alert, Button, SelectField, Swatch, TextField } from "./ui";
 
 const FIELDS = [
@@ -115,6 +116,10 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
 
   const venues = useVenues();
   const venueId = event?.venue_id ?? venueChoice ?? venues.data?.items[0]?.id;
+  const noVenue =
+    creating && venueId === undefined
+      ? venueProblem({ isError: venues.isError, isSuccess: venues.isSuccess, count: venues.data?.items.length ?? 0 })
+      : null;
   const templates = useTemplates(creating ? venueId : undefined);
   // Until the organiser chooses, the first saved template is offered: it is the quick way.
   const chosenTemplate = templateId === undefined ? (templates.data?.items[0]?.id ?? null) : templateId;
@@ -154,14 +159,16 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
     formEvent.preventDefault();
     if (save.isPending || lockedReason) return;
     const { errors, body } = readForm(values);
-    if (creating && venueId === undefined) errors.venue_id = "Pick the venue.";
+    if (noVenue) errors.venue_id = noVenue.message;
     setLocal(errors);
     if (Object.keys(errors).length > 0) return;
     save.mutate(body);
   }
 
   const { fields, other } = splitFieldErrors(save.error, FIELDS);
-  const errorFor = (field: FieldName) => local[field] ?? fields[field] ?? null;
+  // The venue's own message is worked out fresh, so it goes away the moment the venue arrives.
+  const errorFor = (field: FieldName) =>
+    field === "venue_id" && local.venue_id ? (noVenue?.message ?? null) : (local[field] ?? fields[field] ?? null);
   const formError =
     save.error && Object.keys(fields).length === 0
       ? describeError(save.error, {
@@ -173,6 +180,7 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
         })
       : null;
   const disabled = Boolean(lockedReason);
+  const venueMissing = noVenue?.missing ?? false;
 
   return (
     <form className="stack" onSubmit={submit} noValidate>
@@ -206,9 +214,15 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
         ) : (
           <div className="field">
             <span className="field__label">Venue</span>
-            <p className="field__static">
-              {event?.venue_name ?? venues.data?.items[0]?.name ?? (venues.isError ? "Could not load the venue" : "Loading…")}
-            </p>
+            <p className="field__static">{event?.venue_name ?? venues.data?.items[0]?.name ?? noVenue?.label}</p>
+            {venues.isError && creating && (
+              <p className="field__hint">
+                {describeError(venues.error)}{" "}
+                <button type="button" className="link-button" onClick={() => venues.refetch()}>
+                  Try again
+                </button>
+              </p>
+            )}
             {errorFor("venue_id") && <p className="field__error" role="alert">{errorFor("venue_id")}</p>}
           </div>
         )}
@@ -279,6 +293,13 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
         </div>
       )}
 
+      {venueMissing && (
+        <Alert tone="warning">
+          An event needs a venue, and this site has none yet. Ask the site admin to load the stadium's layout. You can create
+          events once it is there.
+        </Alert>
+      )}
+
       {formError && (
         <Alert tone="error">
           {formError}
@@ -296,7 +317,7 @@ export function EventForm({ event, lockedReason, onSaved }: EventFormProps) {
       )}
 
       <div className="form-actions">
-        <Button type="submit" loading={save.isPending} disabled={disabled}>
+        <Button type="submit" loading={save.isPending} disabled={disabled || venueMissing}>
           {creating ? (save.isPending ? "Creating draft…" : "Create draft event") : save.isPending ? "Saving…" : "Save changes"}
         </Button>
         {creating ? (
