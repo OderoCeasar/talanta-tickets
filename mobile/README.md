@@ -40,6 +40,12 @@ export ANDROID_HOME=$HOME/Android/Sdk
 $ANDROID_HOME/emulator/emulator -avd Medium_Phone_API_36.1 -no-window -no-audio -no-boot-anim &
 ```
 
+### Seeing the welcome slides again
+
+They show once per phone, to someone signed out, and the flag survives sign-out. To see them
+as a new fan would, clear the app's storage (`adb shell pm clear host.exp.exponent` in Expo
+Go), or open Profile → "How Talanta Tickets works".
+
 ### Signing in without SMS
 
 When the API is not in production, `POST /auth/otp/request` returns the code as `dev_code`.
@@ -89,6 +95,8 @@ block, how each seat is drawn, pan/zoom limits, and the QR matrix.
 
 ```
 app/                        expo-router screens
+  index.tsx                 where the app opens (src/lib/startRoute.ts): welcome, events or gate
+  welcome.tsx               four swipeable slides on first launch; Profile replays them
   (tabs)/events|tickets|profile
   sign-in.tsx               phone number, then the 6-digit code
   event/[id]/index.tsx      event detail
@@ -105,14 +113,15 @@ app/                        expo-router screens
 src/api/                    the shared typed client, tokens, TanStack Query hooks, small local storage
 src/features/seatmap/       geometry + grid index, draw batches, SVG and Skia canvases, gestures, polling
 src/features/booking/       resume banner
-src/features/tickets/       QR drawing, ticket row
+src/features/tickets/       QR drawing, ticket row, upcoming/past grouping
+src/features/welcome/       the welcome slides' drawings (SVG, no image files)
 src/features/gate/          ticket check (token, verdict), manifest, scanner, upload queue: pure;
                             sqlStore (SQLite), device (API calls), GateProvider (screen state)
 src/lib/                    phone, money, time, countdown, checkout amounts, error wording
 src/fonts.ts                the font family names (one per weight); src/fontAssets.ts the files
 assets/                     icon, adaptive icon layers, splash mark, favicon; assets/src the SVGs
 src/store/bookingFlow.ts    zustand: the seat selection and the hold expiry, nothing else
-src/ui/                     buttons, cards, banners, states, icons
+src/ui/                     buttons, cards, banners, states, icons, the Seats → Pay → Tickets step bar
 ```
 
 ## Gate mode

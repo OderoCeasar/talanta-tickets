@@ -45,10 +45,11 @@ export default function RootLayout() {
       <QueryClientProvider client={queryClient}>
         <SafeAreaProvider>
           <SessionProvider>
-            {/* Light icons: every header sits on Emerald Ink. */}
-            <StatusBar style="light" />
+            {/* Dark icons: headers sit on the page colour. Screens on Emerald Ink (welcome) set their own. */}
+            <StatusBar style="dark" />
             <Stack screenOptions={{ ...headerOptions, headerBackButtonDisplayMode: "minimal", contentStyle: { backgroundColor: palette.champagne50 } }}>
               <Stack.Screen name="index" options={{ headerShown: false }} />
+              <Stack.Screen name="welcome" options={{ headerShown: false, gestureEnabled: false, animation: "fade" }} />
               <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
               <Stack.Screen name="sign-in" options={{ title: "Sign in", presentation: "modal" }} />
               {/* Gate mode has its own stack (and its own headers) in app/gate/_layout.tsx. */}

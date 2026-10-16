@@ -8,7 +8,7 @@ import { boundsOf, labelPoint, pointsAttr, priceTints, SOLD_OUT_STROKE, textOn }
 import { formatCount, formatKes } from "../../../src/lib/money";
 import { standTitle } from "../../../src/lib/labels";
 import { font, palette, space, type } from "../../../src/theme";
-import { Card, Chip, EmptyState, ErrorState, Icon, Loading, Screen } from "../../../src/ui";
+import { Button, Card, Chip, EmptyState, ErrorState, FlowSteps, Icon, Loading, Screen } from "../../../src/ui";
 
 /** Level 1: the stadium. Eight or so stand polygons, tinted by cheapest available price. */
 export default function StadiumScreen() {
@@ -34,9 +34,10 @@ export default function StadiumScreen() {
 
   return (
     <Screen refreshControl={<RefreshControl refreshing={map.isRefetching} onRefresh={() => void map.refetch()} tintColor={palette.emeraldInk} colors={[palette.emeraldInk]} />}>
+      <FlowSteps step={1} />
       <View>
-        <Text style={type.h2}>{event.data?.title ?? venue.name}</Text>
-        <Text style={type.muted}>Tap a stand to see its blocks. Darker stands cost more; grey stands are sold out.</Text>
+        <Text style={type.h2}>Where do you want to sit?</Text>
+        <Text style={type.muted}>{event.data?.title ? `${event.data.title}. ` : ""}Tap a stand. Darker stands cost more; grey ones are sold out.</Text>
       </View>
 
       {stands.length === 0 ? (
@@ -93,6 +94,9 @@ export default function StadiumScreen() {
               );
             })}
           </View>
+
+          {/* For a fan who does not mind where exactly: skip the map. */}
+          <Button title="Not sure? Let us pick the best seats" icon="sparkle" variant="secondary" onPress={() => router.replace({ pathname: "/event/[id]/best", params: { id } })} testID="map-best-available" />
         </>
       )}
     </Screen>

@@ -2,26 +2,40 @@ import { router } from "expo-router";
 import { useCallback, useMemo, useState } from "react";
 import { RefreshControl, StyleSheet, Text, View } from "react-native";
 
-import type { Schemas } from "../../src/api/client";
 import { useOfflineTickets, useTickets } from "../../src/api/queries";
 import { ResumeBanner } from "../../src/features/booking/ResumeBanner";
+import { groupTickets, type TicketGroup } from "../../src/features/tickets/groups";
 import { TicketRow } from "../../src/features/tickets/TicketRow";
 import { isSignedOutError } from "../../src/lib/errors";
-import { formatDateTime } from "../../src/lib/time";
+import { dateTile, formatDateTime, formatTime } from "../../src/lib/time";
 import { useSession } from "../../src/session";
-import { palette, space, type } from "../../src/theme";
-import { Banner, EmptyState, ErrorState, Loading, Screen } from "../../src/ui";
+import { font, palette, radius, space, type } from "../../src/theme";
+import { Banner, EmptyState, ErrorState, Loading, Screen, SectionTitle } from "../../src/ui";
 
-type Ticket = Schemas["Ticket"];
-
-function groupByEvent(tickets: readonly Ticket[]): { event: Ticket["event"]; tickets: Ticket[] }[] {
-  const groups = new Map<number, { event: Ticket["event"]; tickets: Ticket[] }>();
-  for (const t of tickets) {
-    let g = groups.get(t.event.id);
-    if (!g) groups.set(t.event.id, (g = { event: t.event, tickets: [] }));
-    g.tickets.push(t);
-  }
-  return [...groups.values()];
+function EventGroup({ group, past }: { group: TicketGroup; past?: boolean }) {
+  const e = group.event;
+  const tile = dateTile(e.kickoff_at);
+  const n = group.tickets.length;
+  return (
+    <View style={[styles.group, past && styles.past]}>
+      <View style={styles.groupHead}>
+        <View style={[styles.tile, past && styles.tilePast]}>
+          <Text style={styles.tileMonth} maxFontSizeMultiplier={1.3}>{tile.month}</Text>
+          <Text style={styles.tileDay} maxFontSizeMultiplier={1.3}>{tile.day}</Text>
+        </View>
+        <View style={styles.fill}>
+          <Text style={type.h3}>{e.title}</Text>
+          <Text style={type.small}>
+            {formatTime(e.kickoff_at)} · {e.venue_name} · {n} ticket{n === 1 ? "" : "s"}
+          </Text>
+          {e.status === "CANCELLED" ? <Text style={[type.label, { color: palette.error }]}>This event was cancelled.</Text> : null}
+        </View>
+      </View>
+      {group.tickets.map((t) => (
+        <TicketRow key={t.id} ticket={t} />
+      ))}
+    </View>
+  );
 }
 
 export default function TicketsScreen() {
@@ -41,7 +55,7 @@ export default function TicketsScreen() {
   // The server's answer when there is one; otherwise the copy saved on the phone.
   const usingOffline = !live.data && !!offline.data;
   const tickets = live.data ?? offline.data?.items;
-  const groups = useMemo(() => groupByEvent(tickets ?? []), [tickets]);
+  const { upcoming, past } = useMemo(() => groupTickets(tickets ?? [], Date.now()), [tickets]);
 
   if (status === "loading") return <Loading />;
   if (status === "signedOut") {
@@ -65,29 +79,36 @@ export default function TicketsScreen() {
         </Banner>
       ) : null}
 
-      {groups.length === 0 ? (
-        <EmptyState icon="ticket" title="No tickets yet" body="When you buy tickets they appear here, and stay on this phone so they open without internet." action="Browse events" onAction={() => router.navigate("/events")} />
+      {upcoming.length === 0 && past.length === 0 ? (
+        <EmptyState icon="ticket" title="No tickets yet" body="When you buy tickets they appear here, and stay on this phone so they open without internet." action="Find a match" onAction={() => router.navigate("/events")} />
       ) : (
-        groups.map((g) => (
-          <View key={g.event.id} style={styles.group}>
-            <View>
-              {g.event.competition ? <Text style={type.overline}>{g.event.competition}</Text> : null}
-              <Text style={type.h2}>{g.event.title}</Text>
-              <Text style={type.muted}>
-                {formatDateTime(g.event.kickoff_at)} · {g.event.venue_name}
-              </Text>
-              {g.event.status === "CANCELLED" ? <Text style={[type.label, { color: palette.error }]}>This event was cancelled.</Text> : null}
-            </View>
-            {g.tickets.map((t) => (
-              <TicketRow key={t.id} ticket={t} />
-            ))}
-          </View>
-        ))
+        <>
+          {upcoming.length > 0 ? (
+            <Text style={styles.hint}>Tap a ticket to show its QR code at the gate. Each person needs their own.</Text>
+          ) : (
+            <Banner title="No upcoming matches">Your past tickets are below.</Banner>
+          )}
+          {upcoming.map((g) => (
+            <EventGroup key={g.event.id} group={g} />
+          ))}
+          {past.length > 0 ? <SectionTitle title="Past events" /> : null}
+          {past.map((g) => (
+            <EventGroup key={g.event.id} group={g} past />
+          ))}
+        </>
       )}
     </Screen>
   );
 }
 
 const styles = StyleSheet.create({
+  fill: { flex: 1 },
+  hint: { ...type.muted },
   group: { gap: space.sm },
+  past: { opacity: 0.7 },
+  groupHead: { flexDirection: "row", alignItems: "center", gap: space.md, marginTop: space.xs },
+  tile: { width: 48, borderRadius: radius.md, backgroundColor: palette.emeraldInk, alignItems: "center", paddingVertical: 6 },
+  tilePast: { backgroundColor: palette.grey600 },
+  tileMonth: { fontFamily: font.bodySemiBold, fontSize: 10, letterSpacing: 1, color: palette.champagne },
+  tileDay: { fontFamily: font.headingExtraBold, fontSize: 20, lineHeight: 24, color: palette.white },
 });

@@ -1,19 +1,24 @@
 import { Redirect } from "expo-router";
+import { useEffect, useState } from "react";
 
-import { isGateRole } from "../src/features/gate/roles";
+import { readWelcomeSeen } from "../src/api/storage";
+import { startRoute } from "../src/lib/startRoute";
 import { useSession } from "../src/session";
 import { Loading, Screen } from "../src/ui";
 
 export default function Index() {
   const { status, user } = useSession();
-  if (status === "loading") {
-    return (
-      <Screen scroll={false}>
-        <Loading label="Opening Talanta Tickets…" />
-      </Screen>
-    );
-  }
+  const [welcomeSeen, setWelcomeSeen] = useState<boolean | null>(null);
+  useEffect(() => {
+    void readWelcomeSeen().then(setWelcomeSeen);
+  }, []);
+
   // Gate staff use the same app but never see the fan screens.
-  if (status === "signedIn" && isGateRole(user?.role)) return <Redirect href="/gate" />;
-  return <Redirect href="/events" />;
+  const route = startRoute({ status, role: user?.role, welcomeSeen });
+  if (route) return <Redirect href={route} />;
+  return (
+    <Screen scroll={false}>
+      <Loading label="Opening Talanta Tickets…" />
+    </Screen>
+  );
 }

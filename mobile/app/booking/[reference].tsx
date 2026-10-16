@@ -8,7 +8,7 @@ import { paymentOutcome } from "../../src/lib/errors";
 import { formatKes } from "../../src/lib/money";
 import { formatDateTime } from "../../src/lib/time";
 import { palette, space, type } from "../../src/theme";
-import { Banner, Button, Card, ErrorState, Icon, Loading, Screen } from "../../src/ui";
+import { Banner, Button, Card, ErrorState, FlowSteps, Icon, Loading, Screen } from "../../src/ui";
 
 /** One booking as the server has it now: the tickets once paid, otherwise what became of the payment. */
 export default function BookingScreen() {
@@ -40,6 +40,7 @@ export default function BookingScreen() {
 
   return (
     <Screen footer={<Button title="Go to my tickets" onPress={done} testID="go-to-tickets" />}>
+      {paid ? <FlowSteps step={3} /> : null}
       {paid ? (
         <View style={styles.hero}>
           <View style={styles.tick}>

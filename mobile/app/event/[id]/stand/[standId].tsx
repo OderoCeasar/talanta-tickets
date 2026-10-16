@@ -8,7 +8,7 @@ import { boundsOf, labelPoint, pointsAttr, SOLD_OUT_FILL, SOLD_OUT_STROKE, textO
 import { formatCount, formatKes } from "../../../../src/lib/money";
 import { standTitle } from "../../../../src/lib/labels";
 import { font, mix, palette, space, type } from "../../../../src/theme";
-import { Card, Chip, EmptyState, ErrorState, Icon, Loading, Screen } from "../../../../src/ui";
+import { Card, Chip, EmptyState, ErrorState, FlowSteps, Icon, Loading, Screen } from "../../../../src/ui";
 
 /** Level 2: one stand. Block outlines coloured by price tier, with availability and a price badge. */
 export default function StandScreen() {
@@ -47,9 +47,10 @@ export default function StandScreen() {
   return (
     <Screen refreshControl={<RefreshControl refreshing={stand.isRefetching} onRefresh={() => void stand.refetch()} tintColor={palette.emeraldInk} colors={[palette.emeraldInk]} />}>
       <Stack.Screen options={{ title: standTitle(stand.data.stand.name, stand.data.stand.tier) }} />
+      <FlowSteps step={1} />
       <View>
-        <Text style={type.h2}>{standTitle(stand.data.stand.name, stand.data.stand.tier)}</Text>
-        <Text style={type.muted}>Tap a block to choose seats. Enter by gate {stand.data.stand.gate_group}.</Text>
+        <Text style={type.h2}>Pick a block</Text>
+        <Text style={type.muted}>{standTitle(stand.data.stand.name, stand.data.stand.tier)}, entry by gate {stand.data.stand.gate_group}. Paler blocks are nearly full.</Text>
       </View>
 
       {blocks.length === 0 ? (
