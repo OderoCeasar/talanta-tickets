@@ -20,7 +20,7 @@ import { useSession } from "../../src/session";
 import { useBookingFlow } from "../../src/store/bookingFlow";
 import { standTitle } from "../../src/lib/labels";
 import { palette, radius, space, type } from "../../src/theme";
-import { Banner, Button, Card, ErrorState, Field, Icon, Loading, Screen } from "../../src/ui";
+import { Banner, Button, Card, ErrorState, Field, FlowSteps, Icon, Loading, Screen } from "../../src/ui";
 
 type MockOutcome = Schemas["MockOutcome"];
 const MOCK_OUTCOMES: MockOutcome[] = ["success", "insufficient_funds", "wrong_pin", "user_cancel", "timeout", "wrong_amount", "no_callback", "late_callback", "duplicate_callback"];
@@ -310,9 +310,7 @@ export default function CheckoutScreen() {
         headerBackVisible: false,
         headerLeft: () => (
           <Pressable onPress={confirmLeave} accessibilityRole="button" accessibilityLabel="Leave checkout" hitSlop={12} style={styles.back} testID="leave-checkout">
-            <View style={styles.backIcon}>
-              <Icon name="chevron" color={palette.champagne} size={22} />
-            </View>
+            <Icon name="back" color={palette.emeraldInk} size={22} />
           </Pressable>
         ),
       }}
@@ -378,6 +376,7 @@ export default function CheckoutScreen() {
       }
     >
       {header}
+      {refundOwed ? null : <FlowSteps step={2} />}
 
       {refundOwed ? null : (
         <View style={[styles.countdown, urgent && styles.countdownUrgent]} accessibilityRole="timer" accessibilityLabel={`${formatCountdown(left)} left to pay`}>
@@ -510,7 +509,6 @@ const styles = StyleSheet.create({
   fill: { flex: 1 },
   center: { textAlign: "center" },
   back: { minWidth: 44, minHeight: 44, justifyContent: "center" },
-  backIcon: { transform: [{ rotate: "180deg" }] },
   countdown: { flexDirection: "row", alignItems: "center", gap: space.md, padding: space.md, borderRadius: radius.md, borderWidth: 1, backgroundColor: palette.warningBg, borderColor: palette.warningBorder },
   countdownUrgent: { backgroundColor: palette.errorBg, borderColor: palette.errorBorder },
   waiting: { alignItems: "center", gap: space.md, paddingVertical: space.xl },

@@ -12,7 +12,7 @@ import { useNow } from "../../../src/lib/useNow";
 import { useSession } from "../../../src/session";
 import { useBookingFlow } from "../../../src/store/bookingFlow";
 import { palette, radius, space, type } from "../../../src/theme";
-import { Banner, Button, Card, ErrorState, Icon, Loading, Screen } from "../../../src/ui";
+import { Banner, Button, Card, ErrorState, FlowSteps, Icon, Loading, Screen } from "../../../src/ui";
 
 /** Best available: choose a category and how many; the server finds neighbouring seats. */
 export default function BestAvailableScreen() {
@@ -107,6 +107,7 @@ export default function BestAvailableScreen() {
         </>
       }
     >
+      <FlowSteps step={1} />
       <View>
         <Text style={type.h2}>Seats together, picked for you</Text>
         <Text style={type.muted}>Choose a price and how many. We find seats next to each other in one row and hold them while you pay.</Text>

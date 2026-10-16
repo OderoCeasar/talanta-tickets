@@ -9,6 +9,8 @@ import type { Schemas } from "./client";
 const USER_KEY = "talanta.user";
 const TICKETS_KEY = "talanta.tickets";
 const CHECKOUT_KEY = "talanta.checkout";
+// Belongs to the phone, not the person: kept on sign-out so the welcome slides show once.
+const WELCOME_KEY = "talanta.welcomeSeen";
 
 async function readJson<T>(key: string): Promise<T | null> {
   try {
@@ -55,6 +57,16 @@ export interface StoredCheckout {
 export const readStoredCheckout = () => readJson<StoredCheckout>(CHECKOUT_KEY);
 export const writeStoredCheckout = (value: StoredCheckout) => writeJson(CHECKOUT_KEY, value);
 export const clearStoredCheckout = () => AsyncStorage.removeItem(CHECKOUT_KEY).catch(() => undefined);
+
+/** Whether this phone has been shown the welcome slides. A storage failure counts as seen: better to skip the slides than to show them on every launch. */
+export async function readWelcomeSeen(): Promise<boolean> {
+  try {
+    return (await AsyncStorage.getItem(WELCOME_KEY)) !== null;
+  } catch {
+    return true;
+  }
+}
+export const writeWelcomeSeen = () => writeJson(WELCOME_KEY, true);
 
 /** Everything that belongs to the signed-in person. Called on sign-out. */
 export async function clearUserStorage(): Promise<void> {

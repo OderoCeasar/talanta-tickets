@@ -4,7 +4,8 @@ import { palette } from "../theme";
 
 export type IconName =
   | "calendar" | "ticket" | "user" | "chevron" | "check" | "warning" | "info" | "wheelchair" | "clock"
-  | "pin" | "phone" | "plus" | "minus" | "fit" | "close" | "offline" | "seat" | "sparkle" | "gate" | "lock";
+  | "pin" | "phone" | "plus" | "minus" | "fit" | "close" | "offline" | "seat" | "sparkle" | "gate" | "lock"
+  | "arrow" | "back" | "help" | "logout" | "shield" | "map" | "home";
 
 interface Props {
   name: IconName;
@@ -36,6 +37,13 @@ export function Icon({ name, size = 20, color = palette.emeraldInk }: Props) {
       {name === "seat" && (<><Rect x="6" y="4" width="12" height="10" rx="2.5" {...stroke} /><Path d="M4.5 12v5.500h15V12M7 17.500V20M17 17.500V20" {...stroke} /></>)}
       {name === "sparkle" && <Path d="M12 3.500l1.8 5.2 5.2 1.8-5.2 1.800L12 17.500l-1.8-5.2-5.2-1.8 5.2-1.800zM18.5 16l.7 1.8 1.8.7-1.8.7-.7 1.8-.7-1.8-1.8-.7 1.8-.7z" {...stroke} />}
       {name === "gate" && (<><Path d="M4 20V8l8-4.500L20 8v12" {...stroke} /><Path d="M9 20v-7h6v7M4 20h16" {...stroke} /></>)}
+      {name === "arrow" && <Path d="M4.5 12h15M13.5 6l6 6-6 6" {...stroke} strokeWidth={2} />}
+      {name === "back" && <Path d="M19.5 12h-15M10.5 6l-6 6 6 6" {...stroke} strokeWidth={2} />}
+      {name === "help" && (<><Circle cx="12" cy="12" r="8.5" {...stroke} /><Path d="M9.6 9.5a2.5 2.5 0 1 1 3.4 2.3c-.6.3-1 .8-1 1.5v.4M12 16.8v.3" {...stroke} /></>)}
+      {name === "logout" && (<><Path d="M14 4.5H7a2 2 0 0 0-2 2v11a2 2 0 0 0 2 2h7" {...stroke} /><Path d="M10.5 12h10M17 8.5l3.5 3.5-3.5 3.5" {...stroke} /></>)}
+      {name === "shield" && (<><Path d="M12 3.5 5 6.200v5.300c0 4.300 3 7.700 7 9 4-1.300 7-4.700 7-9V6.200z" {...stroke} /><Path d="M9 12l2.200 2.200L15.200 10" {...stroke} /></>)}
+      {name === "map" && (<><Path d="M3.5 6.500 9 4.500l6 2 5.500-2v13l-5.500 2-6-2-5.500 2z" {...stroke} /><Path d="M9 4.500v13M15 6.500v13" {...stroke} /></>)}
+      {name === "home" && (<><Path d="M4 10.500 12 4l8 6.500V19a1.500 1.500 0 0 1-1.500 1.500H5.500A1.500 1.500 0 0 1 4 19z" {...stroke} /><Path d="M9.500 20.500v-6h5v6" {...stroke} /></>)}
       {name === "lock" && (<><Rect x="5" y="10.5" width="14" height="9.5" rx="2" {...stroke} /><Path d="M8 10.500V8a4 4 0 0 1 8 0v2.5" {...stroke} /></>)}
     </Svg>
   );

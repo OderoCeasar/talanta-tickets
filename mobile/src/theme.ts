@@ -10,8 +10,8 @@ export * from "./palette";
 export const shadow = {
   card: {
     shadowColor: colors.emeraldInk,
-    shadowOpacity: 0.12,
-    shadowRadius: 12,
+    shadowOpacity: 0.07,
+    shadowRadius: 14,
     shadowOffset: { width: 0, height: 4 },
     elevation: 2,
   },
@@ -24,6 +24,8 @@ export const shadow = {
  */
 export const type = StyleSheet.create({
   /** Hero titles on a dark panel: teams, "You are going!". */
+  /** The largest title: the first words on a screen with no header ("Find your next match"). */
+  hero: { fontFamily: font.headingExtraBold, fontSize: 30, lineHeight: 36, color: palette.emeraldInk },
   display: { fontFamily: font.headingExtraBold, fontSize: 26, lineHeight: 32, color: palette.white },
   h1: { fontFamily: font.headingBold, fontSize: 26, lineHeight: 32, color: palette.emeraldInk },
   h2: { fontFamily: font.headingBold, fontSize: 20, lineHeight: 26, color: palette.emeraldInk },
@@ -46,10 +48,14 @@ export const type = StyleSheet.create({
   mono: { fontFamily: "monospace", fontSize: 15, color: palette.grey900 },
 });
 
-/** Header options shared by every stack and tab navigator. */
+/**
+ * Header options shared by every stack and tab navigator. Headers sit on the page colour so a
+ * screen reads as one surface; Emerald Ink is kept for the things that matter on it (the hero,
+ * the main button), which then stand out.
+ */
 export const headerOptions = {
-  headerStyle: { backgroundColor: palette.emeraldInk },
-  headerTintColor: palette.champagne,
-  headerTitleStyle: { fontFamily: font.headingBold, color: palette.champagne },
+  headerStyle: { backgroundColor: palette.champagne50 },
+  headerTintColor: palette.emeraldInk,
+  headerTitleStyle: { fontFamily: font.headingBold, fontSize: 18, color: palette.emeraldInk },
   headerShadowVisible: false,
 };

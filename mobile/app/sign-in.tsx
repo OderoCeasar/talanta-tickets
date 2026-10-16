@@ -2,15 +2,15 @@ import { ApiError, fieldErrors, unwrap } from "@talanta/shared";
 import { useMutation } from "@tanstack/react-query";
 import { router } from "expo-router";
 import { useEffect, useRef, useState } from "react";
-import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, View } from "react-native";
+import { KeyboardAvoidingView, Platform, Pressable, StyleSheet, Text, TextInput, View } from "react-native";
 
 import { api } from "../src/api/client";
 import { errorMessage } from "../src/lib/errors";
 import { formatPhone, normalisePhone } from "../src/lib/phone";
 import { useNow } from "../src/lib/useNow";
 import { useSession } from "../src/session";
-import { palette, radius, space, type } from "../src/theme";
-import { Banner, Button, Card, Field, Screen } from "../src/ui";
+import { font, palette, radius, space, type } from "../src/theme";
+import { Banner, Button, Field, Icon, Screen } from "../src/ui";
 
 interface CodeStep {
   phone: string;
@@ -81,10 +81,18 @@ export default function SignInScreen() {
   return (
     <KeyboardAvoidingView style={styles.fill} behavior={Platform.OS === "ios" ? "padding" : undefined}>
       <Screen>
+        <View style={styles.intro}>
+          <View style={styles.badge}>
+            <Icon name={step === null ? "phone" : "lock"} size={28} color={palette.champagne} />
+          </View>
+          <Text style={type.h1} accessibilityRole="header">{step === null ? "Sign in with your phone" : "Enter the code"}</Text>
+          <Text style={type.muted}>
+            {step === null ? "We will text you a 6-digit code. No password needed." : `We sent a 6-digit code to ${formatPhone(step.phone)}.`}
+          </Text>
+        </View>
+
         {step === null ? (
-          <Card>
-            <Text style={type.h2}>Sign in with your phone</Text>
-            <Text style={type.muted}>We will text you a 6-digit code. No password needed.</Text>
+          <>
             <Field
               label="Phone number"
               testID="phone-input"
@@ -95,6 +103,7 @@ export default function SignInScreen() {
               }}
               error={phoneError}
               hint="For example 0712 345 678"
+              placeholder="0712 345 678"
               keyboardType="phone-pad"
               autoComplete="tel"
               textContentType="telephoneNumber"
@@ -104,11 +113,9 @@ export default function SignInScreen() {
             />
             {request.isError && !phoneError ? <Banner tone="error">{errorMessage(request.error)}</Banner> : null}
             <Button title="Send code" onPress={sendCode} loading={request.isPending} testID="send-code" />
-          </Card>
+          </>
         ) : (
-          <Card>
-            <Text style={type.h2}>Enter the code</Text>
-            <Text style={type.muted}>We sent a 6-digit code to {formatPhone(step.phone)}.</Text>
+          <>
             {step.devCode ? (
               <View style={styles.dev} testID="dev-code">
                 <Text style={styles.devLabel}>DEVELOPMENT ONLY</Text>
@@ -120,19 +127,7 @@ export default function SignInScreen() {
                 </Pressable>
               </View>
             ) : null}
-            <Field
-              label="Code"
-              testID="code-input"
-              value={code}
-              onChangeText={(t) => setCode(t.replace(/[^0-9]/g, "").slice(0, 6))}
-              keyboardType="number-pad"
-              autoComplete="sms-otp"
-              textContentType="oneTimeCode"
-              maxLength={6}
-              autoFocus
-              style={styles.codeInput}
-              error={verify.isError ? errorMessage(verify.error) : null}
-            />
+            <CodeBoxes code={code} onChange={setCode} error={verify.isError ? errorMessage(verify.error) : null} busy={verify.isPending} />
             <Button
               title="Sign in"
               onPress={() => verify.mutate({ phone: step.phone, code })}
@@ -141,20 +136,67 @@ export default function SignInScreen() {
               testID="verify-code"
             />
             {request.isError ? <Banner tone="error">{errorMessage(request.error)}</Banner> : null}
-            <Button
-              title={resendIn > 0 ? `Send a new code in ${resendIn}s` : "Send a new code"}
-              variant="ghost"
-              disabled={resendIn > 0}
-              loading={request.isPending}
-              onPress={() => request.mutate(step.phone)}
-              testID="resend-code"
-            />
-            <Button title="Use a different number" variant="ghost" onPress={() => setStep(null)} />
-          </Card>
+            <View style={styles.links}>
+              <Button
+                title={resendIn > 0 ? `New code in ${resendIn}s` : "Send a new code"}
+                variant="ghost"
+                disabled={resendIn > 0}
+                loading={request.isPending}
+                onPress={() => request.mutate(step.phone)}
+                testID="resend-code"
+                style={styles.link1}
+              />
+              <Button title="Change number" variant="ghost" onPress={() => setStep(null)} style={styles.link1} />
+            </View>
+          </>
         )}
-        <Text style={[type.small, styles.footnote]}>Signing in is only needed to hold seats and to see your tickets.</Text>
+        <View style={styles.footnote}>
+          <Icon name="shield" size={16} color={palette.grey600} />
+          <Text style={[type.small, styles.fill]}>You can browse matches without signing in. You only need it to hold seats and to see your tickets.</Text>
+        </View>
       </Screen>
     </KeyboardAvoidingView>
+  );
+}
+
+const CODE_LENGTH = 6;
+
+/**
+ * The code as six boxes. One real (invisible) input sits on top, so the keyboard, paste and the
+ * phone's SMS autofill all behave as they would on a plain field.
+ */
+function CodeBoxes({ code, onChange, error, busy }: { code: string; onChange: (code: string) => void; error: string | null; busy: boolean }) {
+  const [focused, setFocused] = useState(true);
+  return (
+    <View style={styles.codeField}>
+      <View style={styles.boxes}>
+        {Array.from({ length: CODE_LENGTH }, (_, i) => {
+          const active = focused && !busy && (i === code.length || (i === CODE_LENGTH - 1 && code.length === CODE_LENGTH));
+          return (
+            <View key={i} style={[styles.box, code[i] ? styles.boxFilled : null, active && styles.boxActive, error ? styles.boxError : null]}>
+              <Text style={styles.boxDigit} maxFontSizeMultiplier={1.3}>{code[i] ?? ""}</Text>
+            </View>
+          );
+        })}
+        <TextInput
+          accessibilityLabel="Code"
+          accessibilityHint="Six digits from the text message"
+          testID="code-input"
+          value={code}
+          onChangeText={(t) => onChange(t.replace(/[^0-9]/g, "").slice(0, CODE_LENGTH))}
+          onFocus={() => setFocused(true)}
+          onBlur={() => setFocused(false)}
+          keyboardType="number-pad"
+          autoComplete="sms-otp"
+          textContentType="oneTimeCode"
+          maxLength={CODE_LENGTH}
+          autoFocus
+          caretHidden
+          style={styles.hiddenInput}
+        />
+      </View>
+      {error ? <Text style={[type.small, { color: palette.error }]} accessibilityRole="alert">{error}</Text> : null}
+    </View>
   );
 }
 
@@ -165,6 +207,18 @@ const styles = StyleSheet.create({
   devLabel: { ...type.overline, color: palette.warning },
   devCode: { ...type.mono, letterSpacing: 2 },
   devButton: { alignSelf: "flex-start", minHeight: 36, justifyContent: "center" },
-  codeInput: { ...type.mono, fontSize: 26, letterSpacing: 8, textAlign: "center" },
-  footnote: { textAlign: "center" },
+  intro: { gap: space.sm, marginTop: space.sm },
+  badge: { width: 56, height: 56, borderRadius: 28, backgroundColor: palette.emeraldInk, alignItems: "center", justifyContent: "center", marginBottom: space.xs },
+  codeField: { gap: space.sm },
+  boxes: { flexDirection: "row", gap: space.sm },
+  box: { flex: 1, height: 58, borderRadius: radius.md, borderWidth: 1.5, borderColor: palette.grey300, backgroundColor: palette.white, alignItems: "center", justifyContent: "center" },
+  boxFilled: { borderColor: palette.ink400 },
+  boxActive: { borderColor: palette.emeraldInk, borderWidth: 2 },
+  boxError: { borderColor: palette.error },
+  boxDigit: { fontFamily: font.headingBold, fontSize: 24, color: palette.grey900 },
+  // Covers the boxes so a tap anywhere on them opens the keyboard; its own text is invisible.
+  hiddenInput: { position: "absolute", left: 0, right: 0, top: 0, bottom: 0, color: "transparent", opacity: 0.02, fontSize: 1 },
+  links: { flexDirection: "row", justifyContent: "space-between", gap: space.sm },
+  link1: { flex: 1, minHeight: 44, paddingHorizontal: space.sm },
+  footnote: { flexDirection: "row", gap: space.sm, alignItems: "flex-start", marginTop: space.md },
 });

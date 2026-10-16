@@ -6,7 +6,7 @@ import { ResumeBanner } from "../../../src/features/booking/ResumeBanner";
 import { formatCount, formatKes } from "../../../src/lib/money";
 import { formatDate, formatDateTime, formatTime } from "../../../src/lib/time";
 import { font, palette, radius, space, type } from "../../../src/theme";
-import { Banner, Button, Card, Chip, ErrorState, Icon, Loading, Screen } from "../../../src/ui";
+import { Banner, Button, Card, Chip, ErrorState, Icon, Loading, Screen, SectionTitle } from "../../../src/ui";
 
 export default function EventScreen() {
   const { id } = useLocalSearchParams<{ id: string }>();
@@ -31,8 +31,8 @@ export default function EventScreen() {
       footer={
         onSale ? (
           <>
-            <Button title="Choose seats on the map" icon="seat" onPress={() => router.push({ pathname: "/event/[id]/map", params: { id } })} testID="choose-seats" />
-            <Button title="Best available" icon="sparkle" variant="secondary" onPress={() => router.push({ pathname: "/event/[id]/best", params: { id } })} testID="best-available" />
+            <Button title="Choose your seats" icon="seat" onPress={() => router.push({ pathname: "/event/[id]/map", params: { id } })} testID="choose-seats" />
+            <Button title="Or let us pick the best seats" icon="sparkle" variant="ghost" onPress={() => router.push({ pathname: "/event/[id]/best", params: { id } })} testID="best-available" style={styles.quiet} />
           </>
         ) : undefined
       }
@@ -50,16 +50,17 @@ export default function EventScreen() {
         ) : (
           <Text style={styles.team}>{e.title}</Text>
         )}
+        <Text style={styles.heroWhen}>{formatDate(e.kickoff_at)} · {formatTime(e.kickoff_at)}</Text>
         <View style={styles.heroChips}>
           {soldOut ? <Chip label="Sold out" tone="muted" /> : e.status === "PUBLISHED" ? <Chip label="On sale soon" tone="warning" /> : e.status === "CANCELLED" ? <Chip label="Cancelled" tone="error" /> : e.status === "COMPLETED" ? <Chip label="Finished" tone="muted" /> : <Chip label="On sale" />}
         </View>
       </View>
 
-      <Card>
-        <Fact icon="calendar" label="Kickoff" value={`${formatDate(e.kickoff_at)}\n${formatTime(e.kickoff_at)} East Africa Time`} />
-        {e.gates_open_at ? <Fact icon="clock" label="Gates open" value={formatTime(e.gates_open_at)} /> : null}
+      <Card style={styles.facts}>
+        <Fact icon="clock" label="Kickoff" value={`${formatTime(e.kickoff_at)} EAT`} />
+        <Fact icon="gate" label="Gates open" value={e.gates_open_at ? formatTime(e.gates_open_at) : "To be confirmed"} />
         <Fact icon="pin" label="Venue" value={e.venue_name} />
-        <Fact icon="ticket" label="Tickets" value={`Up to ${e.max_tickets_per_user} per person`} />
+        <Fact icon="ticket" label="Limit" value={`${e.max_tickets_per_user} per person`} />
       </Card>
 
       {e.status === "PUBLISHED" ? (
@@ -71,7 +72,7 @@ export default function EventScreen() {
       {e.status === "CANCELLED" ? <Banner tone="error" title="This event was cancelled">If you bought tickets, you will be refunded.</Banner> : null}
       {onSale && e.sales_close_at ? <Text style={type.small}>Sales close {formatDateTime(e.sales_close_at)}.</Text> : null}
 
-      <Text style={type.h2}>Tickets and prices</Text>
+      <SectionTitle title="Prices" />
       {categories.isPending ? (
         <Loading label="Loading prices…" />
       ) : categories.isError ? (
@@ -93,19 +94,47 @@ export default function EventScreen() {
           ))}
         </Card>
       )}
+
+      {onSale ? (
+        <>
+          <SectionTitle title="How buying works" />
+          <Card>
+            <HowStep n={1} title="Choose your seats" body="Pick a stand, then tap the seats you want." />
+            <HowStep n={2} title="Pay with M-Pesa" body="Your seats are held for 10 minutes while you pay." />
+            <HowStep n={3} title="Show your ticket" body="It is saved on your phone and works without internet." last />
+          </Card>
+        </>
+      ) : null}
     </Screen>
   );
 }
 
-function Fact({ icon, label, value }: { icon: "calendar" | "clock" | "pin" | "ticket"; label: string; value: string }) {
+function HowStep({ n, title, body, last }: { n: number; title: string; body: string; last?: boolean }) {
+  return (
+    <View style={styles.how}>
+      <View style={styles.howRail}>
+        <View style={styles.howDot}>
+          <Text style={styles.howNumber}>{n}</Text>
+        </View>
+        {last ? null : <View style={styles.howLine} />}
+      </View>
+      <View style={[styles.fill, !last && styles.howBody]}>
+        <Text style={type.label}>{title}</Text>
+        <Text style={type.small}>{body}</Text>
+      </View>
+    </View>
+  );
+}
+
+function Fact({ icon, label, value }: { icon: "gate" | "clock" | "pin" | "ticket"; label: string; value: string }) {
   return (
     <View style={styles.fact}>
       <View style={styles.factIcon}>
-        <Icon name={icon} size={18} />
+        <Icon name={icon} size={16} />
       </View>
       <View style={styles.fill}>
         <Text style={type.small}>{label}</Text>
-        <Text style={type.body}>{value}</Text>
+        <Text style={type.label}>{value}</Text>
       </View>
     </View>
   );
@@ -118,9 +147,18 @@ const styles = StyleSheet.create({
   teams: { alignItems: "center", gap: 2 },
   team: { ...type.display, textAlign: "center" },
   vs: { fontFamily: font.bodySemiBold, fontSize: 14, color: palette.champagne, letterSpacing: 2, textTransform: "uppercase" },
+  heroWhen: { ...type.body, color: palette.champagne, textAlign: "center", marginTop: space.xs },
   heroChips: { marginTop: space.xs },
-  fact: { flexDirection: "row", gap: space.md, alignItems: "flex-start", paddingVertical: 4 },
-  factIcon: { width: 34, height: 34, borderRadius: 17, backgroundColor: palette.champagne, alignItems: "center", justifyContent: "center" },
+  facts: { flexDirection: "row", flexWrap: "wrap", rowGap: space.md, gap: 0 },
+  fact: { width: "50%", flexDirection: "row", gap: space.sm, alignItems: "center", paddingRight: space.sm },
+  factIcon: { width: 32, height: 32, borderRadius: 16, backgroundColor: palette.champagne, alignItems: "center", justifyContent: "center" },
+  quiet: { minHeight: 44, paddingVertical: space.xs },
+  how: { flexDirection: "row", gap: space.md },
+  howRail: { alignItems: "center", width: 26 },
+  howDot: { width: 26, height: 26, borderRadius: 13, backgroundColor: palette.emeraldInk, alignItems: "center", justifyContent: "center" },
+  howNumber: { fontFamily: font.bodySemiBold, fontSize: 13, color: palette.champagne },
+  howLine: { flex: 1, width: 2, backgroundColor: palette.ink200, marginVertical: 2 },
+  howBody: { paddingBottom: space.md },
   categories: { gap: 0, paddingVertical: space.xs },
   category: { flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md },
   categoryBorder: { borderTopWidth: StyleSheet.hairlineWidth, borderTopColor: palette.grey300 },

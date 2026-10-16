@@ -16,7 +16,7 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 import { errorMessage } from "../lib/errors";
-import { palette, radius, shadow, space, type } from "../theme";
+import { font, palette, radius, shadow, space, type } from "../theme";
 import { Icon, type IconName } from "./Icon";
 
 export { Icon } from "./Icon";
@@ -84,7 +84,8 @@ export function Row({ children, style }: { children: ReactNode; style?: StylePro
 interface ButtonProps {
   title: string;
   onPress: () => void;
-  variant?: "primary" | "secondary" | "ghost" | "danger";
+  /** `light` is the main button on an Emerald Ink panel. */
+  variant?: "primary" | "secondary" | "ghost" | "danger" | "light";
   disabled?: boolean;
   loading?: boolean;
   icon?: IconName;
@@ -95,6 +96,7 @@ interface ButtonProps {
 export function Button({ title, onPress, variant = "primary", disabled, loading, icon, testID, style }: ButtonProps) {
   const off = disabled || loading;
   const fg = variant === "primary" ? palette.champagne : variant === "danger" ? palette.error : palette.emeraldInk;
+  const ripple = variant === "primary" ? palette.inkSoft : variant === "light" ? palette.champagne300 : palette.ink100;
   return (
     <Pressable
       testID={testID}
@@ -102,10 +104,11 @@ export function Button({ title, onPress, variant = "primary", disabled, loading,
       disabled={off}
       accessibilityRole="button"
       accessibilityState={{ disabled: !!off, busy: !!loading }}
-      android_ripple={{ color: variant === "primary" ? palette.inkSoft : palette.ink100 }}
+      android_ripple={{ color: ripple }}
       style={({ pressed }) => [
         styles.button,
         variant === "primary" && styles.buttonPrimary,
+        variant === "light" && styles.buttonLight,
         variant === "secondary" && styles.buttonSecondary,
         variant === "danger" && styles.buttonDanger,
         off && styles.buttonOff,
@@ -116,6 +119,79 @@ export function Button({ title, onPress, variant = "primary", disabled, loading,
       {loading ? <ActivityIndicator color={fg} /> : icon ? <Icon name={icon} color={fg} size={18} /> : null}
       <Text style={[styles.buttonText, { color: fg }]}>{title}</Text>
     </Pressable>
+  );
+}
+
+// ---------------------------------------------------------------------------- flow
+
+const STEPS = ["Seats", "Pay", "Tickets"] as const;
+
+/**
+ * Where the fan is in a purchase: choose seats, pay, get tickets. Shown at the top of each
+ * buying screen so nobody wonders how many more steps there are.
+ */
+export function FlowSteps({ step }: { step: 1 | 2 | 3 }) {
+  return (
+    <View style={styles.steps} accessible accessibilityLabel={`Step ${step} of ${STEPS.length}: ${STEPS[step - 1]}`}>
+      {STEPS.map((name, i) => {
+        const n = i + 1;
+        const done = n < step;
+        const current = n === step;
+        return (
+          <View key={name} style={styles.stepItem}>
+            {/* Half a line each side of the circle, touching it, never under it. */}
+            <View style={styles.stepTrack}>
+              <View style={[styles.stepLine, n <= step && styles.stepLineOn, i === 0 && styles.stepLineNone]} />
+              <View style={[styles.stepDot, (done || current) && styles.stepDotOn]}>
+                {done ? <Icon name="check" size={12} color={palette.champagne} /> : <Text style={[styles.stepNumber, current && styles.stepNumberOn]} maxFontSizeMultiplier={1.2}>{n}</Text>}
+              </View>
+              <View style={[styles.stepLine, n < step && styles.stepLineOn, i === STEPS.length - 1 && styles.stepLineNone]} />
+            </View>
+            <Text style={[styles.stepName, (done || current) && styles.stepNameOn]} maxFontSizeMultiplier={1.3}>{name}</Text>
+          </View>
+        );
+      })}
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------------------- lists
+
+/** One tappable line in a settings-style list: icon, title, optional detail, chevron. */
+export function ListRow({ icon, title, detail, onPress, tone = "default", testID, last }: { icon: IconName; title: string; detail?: string; onPress: () => void; tone?: "default" | "danger"; testID?: string; last?: boolean }) {
+  const fg = tone === "danger" ? palette.error : palette.emeraldInk;
+  return (
+    <Pressable
+      onPress={onPress}
+      accessibilityRole="button"
+      accessibilityLabel={detail ? `${title}. ${detail}` : title}
+      android_ripple={{ color: palette.ink100 }}
+      testID={testID}
+      style={({ pressed }) => [styles.listRow, !last && styles.listRowBorder, pressed && styles.cardPressed]}
+    >
+      <View style={[styles.listIcon, tone === "danger" && { backgroundColor: palette.errorBg }]}>
+        <Icon name={icon} size={18} color={fg} />
+      </View>
+      <View style={styles.fill}>
+        <Text style={[type.label, { color: tone === "danger" ? palette.error : palette.grey900 }]}>{title}</Text>
+        {detail ? <Text style={type.small}>{detail}</Text> : null}
+      </View>
+      {tone === "danger" ? null : <Icon name="chevron" size={18} color={palette.grey400} />}
+    </Pressable>
+  );
+}
+
+/** A small heading above a group of cards, with an optional action on the right. */
+export function SectionTitle({ title, action, onAction }: { title: string; action?: string; onAction?: () => void }) {
+  return (
+    <View style={styles.sectionTitle}>
+      <Text style={[type.h3, styles.fill]} accessibilityRole="header">{title}</Text>
+      {action && onAction ? (
+        <Pressable onPress={onAction} accessibilityRole="button" hitSlop={12}>
+          <Text style={[type.label, { color: palette.emeraldInk }]}>{action}</Text>
+        </Pressable>
+      ) : null}
+    </View>
   );
 }
 
@@ -272,7 +348,7 @@ const styles = StyleSheet.create({
   cardPressed: { backgroundColor: palette.ink50 },
   row: { flexDirection: "row", alignItems: "center", gap: space.sm, flexWrap: "wrap" },
   button: {
-    minHeight: 50,
+    minHeight: 52,
     borderRadius: radius.md,
     paddingHorizontal: space.lg,
     paddingVertical: space.md,
@@ -283,6 +359,7 @@ const styles = StyleSheet.create({
     overflow: "hidden",
   },
   buttonPrimary: { backgroundColor: palette.emeraldInk },
+  buttonLight: { backgroundColor: palette.champagne },
   buttonSecondary: { backgroundColor: palette.white, borderWidth: 1.5, borderColor: palette.emeraldInk },
   buttonDanger: { backgroundColor: palette.white, borderWidth: 1.5, borderColor: palette.errorBorder },
   buttonOff: { opacity: 0.5 },
@@ -319,6 +396,22 @@ const styles = StyleSheet.create({
     gap: space.md,
     maxHeight: "85%",
   },
+  steps: { flexDirection: "row", alignItems: "flex-start" },
+  stepItem: { flex: 1, alignItems: "stretch", gap: 4 },
+  stepTrack: { flexDirection: "row", alignItems: "center" },
+  stepLine: { flex: 1, height: 2, backgroundColor: palette.grey300 },
+  stepLineNone: { backgroundColor: "transparent" },
+  stepLineOn: { backgroundColor: palette.emeraldInk },
+  stepDot: { width: 24, height: 24, borderRadius: 12, alignItems: "center", justifyContent: "center", backgroundColor: palette.white, borderWidth: 2, borderColor: palette.grey300 },
+  stepDotOn: { backgroundColor: palette.emeraldInk, borderColor: palette.emeraldInk },
+  stepNumber: { fontFamily: font.bodySemiBold, fontSize: 12, color: palette.grey600 },
+  stepNumberOn: { color: palette.champagne },
+  stepName: { fontFamily: font.bodyMedium, fontSize: 12, color: palette.grey600, textAlign: "center" },
+  stepNameOn: { fontFamily: font.bodySemiBold, color: palette.emeraldInk },
+  listRow: { flexDirection: "row", alignItems: "center", gap: space.md, paddingVertical: space.md, paddingHorizontal: space.lg, minHeight: 60 },
+  listRowBorder: { borderBottomWidth: StyleSheet.hairlineWidth, borderBottomColor: palette.grey200 },
+  listIcon: { width: 36, height: 36, borderRadius: 18, alignItems: "center", justifyContent: "center", backgroundColor: palette.champagne },
+  sectionTitle: { flexDirection: "row", alignItems: "center", gap: space.sm, marginTop: space.xs },
   sheetHandle: { alignSelf: "center", width: 44, height: 5, borderRadius: 3, backgroundColor: palette.grey300 },
   sheetBody: { gap: space.md, paddingBottom: space.sm },
 });

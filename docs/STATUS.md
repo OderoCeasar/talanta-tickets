@@ -20,6 +20,8 @@ One line each. Updated at the end of every milestone. Test counts are in `docs/T
 - M10 Gate mode, backend (branch `backend/gate`): gate events, manifest with a change marker, scan upload where the server decides each result. A ticket bought through the API scanned ADMITTED, then DUPLICATE; wrong gate and a tampered token were refused. Full manifest for 59,568 tickets is 1.29 MB gzipped.
 - M11: whole backend suite green on `backend/gate` (22 packages); load test written and run (`make loadtest`); README rewritten; results in `docs/TEST_REPORT.md`.
 
+- Mobile welcome slides and redesign (branch `mobile/onboarding-redesign`): four swipeable slides on first launch (once per phone, replayable from Profile), light headers and tab bar, a Seats → Pay → Tickets step bar, a featured next match on Home, six-box sign-in code, tickets split into upcoming and past. Ran on an Android 16 emulator against the local API: slides, Home, event, stadium, stand, block, sign-in, checkout, a mock payment to "You are going!", My tickets and Profile. Holds, checkout and payment logic unchanged.
+
 ## Partly done
 
 - M8: smooth zoom and pan on the largest block is not proven and pinch was not exercised (emulator only, no real phone); no installable build was made, so the icon was not seen on a launcher. Not run on the emulator: hold expiry back to the map, paying with under 2 minutes left, payments unavailable, a timed-out payment settling late, tickets offline, large system font. The app stopped responding to taps once during the run and the cause was not established.
